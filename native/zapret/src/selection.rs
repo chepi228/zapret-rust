@@ -1,0 +1,3157 @@
+use crate::{
+    App, VERSION, cli::TestArgs, interrupt, maintenance, runtime_file, snapshot::Snapshot,
+};
+use anyhow::{Context, Result, bail, ensure};
+use chrono::{Local, Utc};
+use regex::Regex;
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+use std::{
+    collections::{BTreeMap, BTreeSet, HashMap},
+    ffi::OsString,
+    fs,
+    io::Write,
+    path::{Path, PathBuf},
+    thread,
+    time::{Duration, Instant},
+};
+use zapret_core::{
+    ComposeOptions, Coverage, ProbeState, RankRow, Settings, Strategy, TestRank, atomic_write,
+    compose, list_strategies, prepare_runtime, read_settings, save_settings, sha256,
+    test_result_context_with_identity, transfer_state,
+};
+use zapret_platform::{ControlGuard, OwnedChild, RunOptions};
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Target {
+    #[serde(alias = "Group")]
+    pub group: String,
+    #[serde(alias = "Name")]
+    pub name: String,
+    #[serde(alias = "Url")]
+    pub url: String,
+    #[serde(default, alias = "Post")]
+    pub post: bool,
+}
+
+impl Target {
+    pub(crate) fn key(&self) -> String {
+        format!("{}|{}|{}", self.group, self.name, self.url)
+    }
+    pub(crate) fn id(&self) -> String {
+        sha256(self.key().as_bytes())
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct Row {
+    pub group: String,
+    pub name: String,
+    pub url: String,
+    pub state: String,
+    pub code: String,
+    pub exit: i32,
+    pub up: f64,
+    pub down: f64,
+    pub conn_ms: f64,
+    pub tls_ms: f64,
+    pub dns_ms: f64,
+    pub first_byte_ms: f64,
+    pub total_ms: f64,
+    pub started_utc: String,
+    pub observed_utc: String,
+    pub started_ms: f64,
+    pub observed_ms: f64,
+    pub body_bytes: usize,
+    pub body_limit: usize,
+    pub target_reached: bool,
+    pub body_complete: bool,
+    pub termination: String,
+    pub tries: usize,
+    pub flaky: bool,
+    pub raw: Value,
+}
+
+impl Row {
+    fn key(&self) -> String {
+        format!("{}|{}|{}", self.group, self.name, self.url)
+    }
+}
+
+fn read_targets(root: &Path) -> Result<Vec<Target>> {
+    read_targets_with_suite(root, &root.join("tools/dpi-suite.json"))
+}
+
+pub(crate) fn read_targets_with_suite(root: &Path, suite: &Path) -> Result<Vec<Target>> {
+    let mut targets = Vec::new();
+    if suite.is_file() {
+        let values: Vec<Value> =
+            serde_json::from_slice(&zapret_core::read_bounded(suite, 1024 * 1024)?)?;
+        for value in values {
+            if let Some(host) = value["host"].as_str() {
+                targets.push(Target {
+                    group: "DPI".into(),
+                    name: format!(
+                        "{} {}",
+                        value["id"].as_str().unwrap_or(""),
+                        value["provider"].as_str().unwrap_or("")
+                    )
+                    .trim()
+                    .to_owned(),
+                    url: format!("https://{host}/"),
+                    post: true,
+                });
+            }
+        }
+    }
+    for line in zapret_core::read_text(&root.join("tools/targets.txt"), 1024 * 1024)?.lines() {
+        let Some((identity, url)) = line.trim().split_once('=') else {
+            continue;
+        };
+        let Some((group, name)) = identity.trim().split_once('.') else {
+            continue;
+        };
+        if group.is_empty() || !group.bytes().all(|b| b.is_ascii_alphanumeric()) {
+            continue;
+        }
+        if name.is_empty() || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
+            continue;
+        }
+        targets.push(Target {
+            group: group.into(),
+            name: name.into(),
+            url: url.trim().into(),
+            post: false,
+        });
+    }
+    let mut unique = BTreeSet::new();
+    ensure!(
+        !targets.is_empty()
+            && targets.len() <= 256
+            && targets.iter().all(|target| unique.insert(target.key())),
+        "Набор адресов пуст, слишком велик или содержит дубликаты"
+    );
+    Ok(targets)
+}
+
+fn number(value: &Value, key: &str) -> f64 {
+    value[key].as_f64().unwrap_or(0.)
+}
+
+fn convert(target: &Target, value: Value, started: chrono::DateTime<Utc>) -> Result<Row> {
+    let observation: zapret_net::Observation = serde_json::from_value(value.clone())
+        .context("Worker вернул неполную или некорректную запись")?;
+    ensure!(
+        value["version"] == 1 && value["id"] == target.id() && value["url"] == target.url,
+        "Некорректная идентичность результата worker"
+    );
+    let termination = value["termination"]
+        .as_str()
+        .context("Нет причины завершения пробы")?
+        .to_owned();
+    ensure!(
+        !matches!(termination.as_str(), "Deadline" | "Cancelled"),
+        "Пакет проб прерван, частичный результат не оценивается"
+    );
+    let bytes = value["body_bytes"]
+        .as_u64()
+        .context("Неизвестен объём тела")? as usize;
+    let limit = value["body_limit"]
+        .as_u64()
+        .context("Неизвестен лимит тела")? as usize;
+    ensure!(
+        limit == 65536 && bytes <= limit,
+        "Неверный бюджет тела в результате"
+    );
+    let reached = value["target_reached"] == true;
+    let complete = value["body_complete"] == true;
+    ensure!(
+        !reached || bytes == limit,
+        "Достижение бюджета не подтверждено байтами"
+    );
+    ensure!(
+        termination != "Complete" || complete,
+        "Завершённый ответ не подтверждён"
+    );
+    ensure!(
+        termination != "BodyLimit" || reached,
+        "Остановка по бюджету не подтверждена"
+    );
+    ensure!(
+        observation.received_body_bytes >= bytes
+            && observation.request_body_bytes_provided <= observation.post_bytes,
+        "Некорректный объём передачи worker"
+    );
+    ensure!(
+        observation.total_ms.is_finite()
+            && observation.total_ms >= 0.
+            && [
+                observation.dns_ms,
+                observation.tcp_ms,
+                observation.tls_ms,
+                observation.headers_ms,
+                observation.started_ms
+            ]
+            .into_iter()
+            .flatten()
+            .all(|number| number.is_finite() && number >= 0.),
+        "Некорректные часы worker"
+    );
+    ensure!(
+        observation
+            .status_code
+            .is_none_or(|code| (100..=999).contains(&code)),
+        "Некорректный HTTP-код worker"
+    );
+    ensure!(
+        observation.status_code.is_none()
+            || !target.url.starts_with("https://")
+            || (observation.certificate_validated && observation.tls_ms.is_some()),
+        "HTTPS-ответ без проверки сертификата"
+    );
+    let code = value["status_code"]
+        .as_u64()
+        .map_or("000".into(), |code| format!("{code:03}"));
+    let exit = match termination.as_str() {
+        "Complete" => 0,
+        "BodyLimit" => 23,
+        "DnsFailure" => 6,
+        "TcpFailure" => 7,
+        "TlsFailure" => 35,
+        "Timeout" => 28,
+        _ => 56,
+    };
+    let up = number(&value, "request_body_bytes_provided");
+    let down = value["received_body_bytes"]
+        .as_f64()
+        .unwrap_or(bytes as f64);
+    let state = match transfer_state(&code, Some(exit), up, down, target.post, reached) {
+        ProbeState::Ok => "OK",
+        ProbeState::Fail => "FAIL",
+        ProbeState::Freeze => "FREEZE",
+        ProbeState::Na => "NA",
+    }
+    .to_owned();
+    let dns = number(&value, "dns_ms");
+    let tcp = dns + number(&value, "tcp_ms");
+    let tls = if value["tls_ms"].is_number() {
+        tcp + number(&value, "tls_ms")
+    } else {
+        0.
+    };
+    let start_ms = number(&value, "started_ms");
+    let total = number(&value, "total_ms");
+    Ok(Row {
+        group: target.group.clone(),
+        name: target.name.clone(),
+        url: target.url.clone(),
+        state,
+        code,
+        exit,
+        up,
+        down,
+        conn_ms: tcp,
+        tls_ms: tls,
+        dns_ms: dns,
+        first_byte_ms: if value["tls_ms"].is_number() {
+            tls
+        } else {
+            tcp
+        } + number(&value, "headers_ms"),
+        total_ms: total,
+        started_utc: (started + chrono::Duration::microseconds((start_ms * 1000.) as i64))
+            .to_rfc3339(),
+        observed_utc: Utc::now().to_rfc3339(),
+        started_ms: start_ms,
+        observed_ms: start_ms + total,
+        body_bytes: bytes,
+        body_limit: limit,
+        target_reached: reached,
+        body_complete: complete,
+        termination,
+        tries: 1,
+        flaky: false,
+        raw: value,
+    })
+}
+
+struct RunContext<'a> {
+    app: &'a App,
+    snapshot: &'a Snapshot,
+    network_key: String,
+    native_hash: &'a str,
+    journal: PathBuf,
+    deadline: Option<Instant>,
+    clock_origin: f64,
+    approved_games: BTreeSet<String>,
+    details: bool,
+}
+impl RunContext<'_> {
+    fn assert_current(&self) -> Result<()> {
+        interrupt::check()?;
+        ensure!(
+            self.deadline
+                .is_none_or(|deadline| Instant::now() < deadline),
+            "Превышен общий лимит сравнения 30 минут"
+        );
+        ensure!(
+            game_snapshot(self.app)?.is_subset(&self.approved_games),
+            "Во время измерения запущена новая игра"
+        );
+        crate::ensure_snapshot_current(self.snapshot)?;
+        let current = self.app.platform("network", json!({}))?;
+        ensure!(
+            current["known"] == true && current["key"] == self.network_key,
+            "Подключение изменилось во время измерения"
+        );
+        Ok(())
+    }
+}
+
+fn probe_batch(
+    context: &RunContext<'_>,
+    targets: &[Target],
+    parallel: usize,
+    timeout_ms: u64,
+    engine: &mut Option<OwnedChild>,
+    metadata: &Value,
+    attempt: usize,
+) -> Result<Vec<Row>> {
+    context.assert_current()?;
+    let deadline = batch_budget(targets.len(), parallel, timeout_ms)?;
+    let mut input = Vec::new();
+    for target in targets {
+        let control = metadata["Stage"]
+            .as_str()
+            .is_some_and(|stage| stage.starts_with("control-"));
+        serde_json::to_writer(
+            &mut input,
+            &json!({"version":1,"id":target.id(),"url":target.url,"timeout_ms":timeout_ms,
+            "body_limit":65536,"post_bytes":if target.post&&!control {65536}else{0},
+            "method":if control {"HEAD"}else if target.post {"POST"}else{"GET"}}),
+        )?;
+        input.push(b'\n');
+    }
+    let executable = std::env::current_exe()?;
+    let started = Utc::now();
+    let batch_started = zapret_platform::monotonic_ms()?;
+    let mut worker = OwnedChild::spawn(
+        &executable,
+        &[
+            "probe".into(),
+            "--parallel".into(),
+            parallel.to_string().into(),
+            "--deadline-ms".into(),
+            deadline.to_string().into(),
+        ],
+        &RunOptions {
+            cwd: Some(context.snapshot.root().into()),
+            timeout: Duration::from_millis(deadline + 5000),
+            stdin: Some(input),
+            max_output_bytes: 16 * 1024 * 1024,
+            ..Default::default()
+        },
+    )?;
+    let mut checked = Instant::now();
+    let waiting_started = Instant::now();
+    let mut progress_at = Instant::now();
+    while worker.is_running()? {
+        interrupt::check()?;
+        if let Some(engine) = engine.as_mut() {
+            ensure!(
+                engine.is_running()?,
+                "Тестовый движок завершился во время проб"
+            );
+        }
+        if checked.elapsed() >= Duration::from_secs(1) {
+            context.assert_current()?;
+            checked = Instant::now();
+        }
+        if progress_at.elapsed() >= Duration::from_secs(5) {
+            crate::selection_ui::detail(
+                context.app,
+                context.details,
+                &format!(
+                    "  Ожидаю пакет ответов ({} адресов), прошло {} с…",
+                    targets.len(),
+                    waiting_started.elapsed().as_secs()
+                ),
+            )?;
+            progress_at = Instant::now();
+        }
+        worker.wait_for_exit(Duration::from_millis(20))?;
+    }
+    let output = worker.finish()?;
+    ensure!(
+        !output.timed_out && !output.output_truncated && output.exit_code == 0,
+        "Worker не завершил пакет\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let mut rows = parse_observations(targets, &output.stdout, started)?;
+    align_observations(
+        &mut rows,
+        context.clock_origin,
+        batch_started,
+        zapret_platform::monotonic_ms()?,
+    )?;
+    let mut journal = Journal::open(&context.journal)?;
+    for row in &rows {
+        let mut record = metadata.clone();
+        record["Attempt"] = json!(attempt);
+        record["ObservedUtc"] = json!(Utc::now().to_rfc3339());
+        let object = record
+            .as_object_mut()
+            .context("Метаданные журнала должны быть объектом")?;
+        for (key, value) in serde_json::to_value(row)?
+            .as_object()
+            .context("Строка журнала")?
+        {
+            object.insert(key.clone(), value.clone());
+        }
+        journal.append(&record)?;
+    }
+    drop(journal);
+    context.assert_current()?;
+    engine_alive(engine)?;
+    Ok(rows)
+}
+
+fn batch_budget(count: usize, parallel: usize, timeout_ms: u64) -> Result<u64> {
+    ensure!(
+        (1..=256).contains(&count)
+            && (1..=64).contains(&parallel)
+            && (1..=60000).contains(&timeout_ms),
+        "Неверный бюджет проб"
+    );
+    let budget = count.div_ceil(parallel) as u64 * (timeout_ms + 1000) + 5000;
+    ensure!(
+        budget <= 1_800_000,
+        "Один пакет проб превышает 30 минут. Увеличьте --parallel или уменьшите --timeout-ms"
+    );
+    Ok(budget)
+}
+
+fn align_observations(
+    rows: &mut [Row],
+    origin: f64,
+    batch_started: f64,
+    batch_finished: f64,
+) -> Result<()> {
+    for row in rows {
+        let start = row.raw["started_monotonic_ms"]
+            .as_f64()
+            .context("Worker не подтвердил общие монотонные часы")?;
+        let end = row.raw["finished_monotonic_ms"]
+            .as_f64()
+            .context("Worker не подтвердил общие монотонные часы")?;
+        ensure!(
+            start.is_finite()
+                && end.is_finite()
+                && start >= batch_started
+                && end >= start
+                && end <= batch_finished,
+            "Монотонные часы пробы выходят за границы пакета"
+        );
+        row.started_ms = start - origin;
+        row.observed_ms = end - origin;
+    }
+    Ok(())
+}
+
+fn engine_budget(count: usize, arguments: &TestArgs, warmup: bool) -> Result<u64> {
+    let main = batch_budget(count, arguments.parallel(), arguments.timeout_ms)?;
+    let retry = batch_budget(count, arguments.retry_parallel(), arguments.timeout_ms)?;
+    Ok((main + retry + if warmup { main } else { 0 } + 30000).max(120000))
+}
+
+fn engine_alive(engine: &mut Option<OwnedChild>) -> Result<()> {
+    if let Some(child) = engine {
+        ensure!(
+            child.is_running()?,
+            "Тестовый движок завершился до подтверждения измерений"
+        );
+    }
+    Ok(())
+}
+
+fn stop_trial(mut engine: Option<OwnedChild>) -> Result<()> {
+    engine_alive(&mut engine)?;
+    if let Some(mut child) = engine {
+        child.terminate()?;
+        let output = child.finish()?;
+        ensure!(!output.timed_out, "Истёк срок работы тестового движка");
+    }
+    Ok(())
+}
+
+pub(crate) fn parse_observations(
+    targets: &[Target],
+    bytes: &[u8],
+    started: chrono::DateTime<Utc>,
+) -> Result<Vec<Row>> {
+    let map: HashMap<_, _> = targets.iter().map(|target| (target.id(), target)).collect();
+    ensure!(map.len() == targets.len(), "Повторная цель worker");
+    let mut rows = Vec::new();
+    let mut seen = BTreeSet::new();
+    for line in std::str::from_utf8(bytes)?
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+    {
+        let value: Value = serde_json::from_str(line)?;
+        let id = value["id"].as_str().context("Нет id результата")?;
+        ensure!(seen.insert(id.to_owned()), "Повторный результат worker");
+        let target = map.get(id).context("Посторонний результат worker")?;
+        rows.push(convert(target, value, started)?);
+    }
+    ensure!(
+        rows.len() == targets.len(),
+        "Worker вернул неполный пакет проб"
+    );
+    Ok(rows)
+}
+
+struct Journal {
+    output: fs::File,
+    size: u64,
+    bytes: Vec<u8>,
+}
+
+impl Journal {
+    fn open(path: &Path) -> Result<Self> {
+        let mut options = fs::OpenOptions::new();
+        options.create(true).append(true);
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            // Each run owns its journal. Other processes can tail it while this
+            // batch writes, but cannot change the length used for its budget.
+            options.share_mode(1);
+        }
+        let output = options.open(path)?;
+        let size = output.metadata()?.len();
+        Ok(Self {
+            output,
+            size,
+            bytes: Vec::new(),
+        })
+    }
+
+    fn append(&mut self, record: &Value) -> Result<()> {
+        self.bytes.clear();
+        serde_json::to_writer(&mut self.bytes, record)?;
+        self.bytes.push(b'\n');
+        let size = self.size.saturating_add(self.bytes.len() as u64);
+        ensure!(size <= 64 * 1024 * 1024, "Журнал измерения превысил бюджет");
+        self.output.write_all(&self.bytes)?;
+        self.output.flush()?;
+        self.size = size;
+        Ok(())
+    }
+}
+
+fn merge_retry(rows: &mut [Row], retry: &[Row]) {
+    for row in rows {
+        let Some(next) = retry.iter().find(|next| next.key() == row.key()) else {
+            continue;
+        };
+        row.tries = 2;
+        if next.state != "OK" {
+            if row.state != "OK" && next.state == "FREEZE" {
+                row.state = "FREEZE".into();
+            }
+            continue;
+        }
+        if row.state == "OK" {
+            row.tls_ms = row.tls_ms.min(next.tls_ms);
+            row.conn_ms = row.conn_ms.min(next.conn_ms);
+        } else {
+            let mut replacement = next.clone();
+            replacement.tries = 2;
+            replacement.flaky = true;
+            *row = replacement;
+        }
+    }
+}
+
+fn baseline(rows: &[Row]) -> BTreeMap<String, f64> {
+    let mut result = BTreeMap::<String, f64>::new();
+    for row in rows
+        .iter()
+        .filter(|row| row.group == "Clean" && row.state == "OK")
+    {
+        result
+            .entry(row.name.clone())
+            .and_modify(|value| *value = value.min(row.tls_ms))
+            .or_insert(row.tls_ms);
+    }
+    result
+}
+
+fn availability(rows: &[Row]) -> Value {
+    let targets: Vec<_> = rows
+        .iter()
+        .filter(|row| row.group != "Clean" && row.state != "NA")
+        .collect();
+    json!({"ok":targets.iter().filter(|row|row.state=="OK").count(),"total":targets.len()})
+}
+
+fn summary(id: &str, rows: &[Row], clean: &BTreeMap<String, f64>) -> RankRow {
+    let mut result = RankRow {
+        id: id.into(),
+        ..Default::default()
+    };
+    for row in rows.iter().filter(|row| row.state != "NA") {
+        *result.group_totals.entry(row.group.clone()).or_default() += 1;
+        let points = if row.state == "OK" {
+            if row.flaky { 0.5 } else { 1. }
+        } else {
+            0.
+        };
+        *result.groups.entry(row.group.clone()).or_default() += points;
+        if row.group != "Clean" {
+            result.ok += points;
+            result.total += 1;
+            result.freeze += usize::from(row.state == "FREEZE");
+        } else if id != "0"
+            && clean
+                .get(&row.name)
+                .is_some_and(|before| row.state != "OK" || row.tls_ms > *before + 500.)
+        {
+            result.harm += 1;
+        }
+    }
+    result.score = result.ok - result.harm as f64;
+    result
+}
+
+fn family(strategy: &Strategy) -> String {
+    let tuning = Regex::new(r":(pos|repeats|blob|host|seqovl|seqovl_pattern)=[^:]+")
+        .expect("constant regex");
+    let sni = Regex::new(r"([=,])sni=[^,:]+").expect("constant regex");
+    let mut parts = vec!["family-tcp-v1".to_owned()];
+    for section in ["general", "google", "discord_media", "ipset_tcp"] {
+        let actual = if strategy.sections.contains_key(section) {
+            section
+        } else {
+            "general"
+        };
+        parts.push(format!(
+            "{section}@{}",
+            strategy.section_family(actual, "general")
+        ));
+        let mut previous = None;
+        for line in strategy.section(actual, "general") {
+            if line.starts_with("--lua-desync=") {
+                let normalized = tuning.replace_all(line, ":${1}=*");
+                let normalized = sni.replace_all(&normalized, "${1}sni=*").into_owned();
+                if previous.as_ref() != Some(&normalized) {
+                    parts.push(normalized.clone());
+                }
+                previous = Some(normalized);
+            } else {
+                parts.push(line.clone());
+                previous = None;
+            }
+        }
+    }
+    sha256(parts.join("\n").as_bytes())
+}
+
+fn shuffle<T>(values: &mut [T], seed: &mut u64) {
+    for index in (1..values.len()).rev() {
+        *seed ^= *seed << 13;
+        *seed ^= *seed >> 7;
+        *seed ^= *seed << 17;
+        values.swap(index, (*seed as usize) % (index + 1));
+    }
+}
+
+fn final_check(expected: &[Row], actual: &[Row]) -> Result<()> {
+    ensure!(
+        expected.iter().any(|row| row.state == "OK"),
+        "Нет подтверждённых адресов для финальной проверки"
+    );
+    let actual: HashMap<_, _> = actual.iter().map(|row| (row.key(), row)).collect();
+    let mut reported = BTreeSet::new();
+    let mut targets = Vec::new();
+    let mut reasons = Vec::new();
+    for row in expected.iter().filter(|row| row.state == "OK") {
+        let key = row.key();
+        let reason = match actual.get(&key) {
+            Some(next)
+                if next.state == "OK"
+                    && (row.group != "Clean" || next.tls_ms <= row.tls_ms + 500.) =>
+            {
+                continue;
+            }
+            Some(next) if next.termination == "TlsFailure" => {
+                format!("сбой TLS после подключения TCP за {:.0} мс", next.conn_ms)
+            }
+            Some(next) => format!(
+                "{} (TCP {:.0} мс, TLS {:.0} мс, ранее TLS {:.0} мс)",
+                next.state, next.conn_ms, next.tls_ms, row.tls_ms
+            ),
+            None => "адрес отсутствует в финальном пакете".into(),
+        };
+        if reported.insert(key) {
+            let target = format!("{}/{}", row.group, row.name);
+            reasons.push(format!("{target} — {reason}"));
+            targets.push(target);
+        }
+    }
+    ensure!(
+        targets.is_empty(),
+        "Финальная комбинация не подтвердила {}: {}",
+        targets.join(", "),
+        reasons.join(". ")
+    );
+    Ok(())
+}
+
+fn final_reference(working: &[Row], measured: &[Row], baseline: &[Row]) -> Vec<Row> {
+    // Preserve stable working DPI coverage. A retry-only synthetic success is
+    // already scored as flaky; it must not become a mandatory regression veto.
+    // User services and ordinary sites also retain their independently measured requirements.
+    working
+        .iter()
+        .filter(|row| row.group != "DPI" || !row.flaky)
+        .chain(measured.iter().filter(|row| row.group != "DPI"))
+        .chain(baseline.iter().filter(|row| row.group == "Clean"))
+        .cloned()
+        .collect()
+}
+
+fn accept_candidate(
+    validation: Result<()>,
+    commit: impl FnOnce() -> Result<()>,
+) -> Result<Option<String>> {
+    if let Err(error) = validation {
+        return Ok(Some(format!("{error:#}")));
+    }
+    commit()?;
+    Ok(None)
+}
+
+fn learning_key(
+    context: &zapret_core::TestResultContext,
+    arguments: &TestArgs,
+    targets: &[Target],
+) -> Result<String> {
+    let retry_parallel = arguments.retry_parallel();
+    Ok(sha256(
+        format!(
+            "native-quick-learning-v1-connect-v2\n{}\n{}\n{}\n{}\n{retry_parallel}\n{}",
+            context.network_key,
+            context.inputs_hash,
+            arguments.timeout_ms,
+            arguments.parallel(),
+            serde_json::to_string(targets)?
+        )
+        .as_bytes(),
+    ))
+}
+
+fn updates_quick_history(arguments: &TestArgs) -> bool {
+    // A full run with a different request budget would replace the quick cache.
+    !arguments.report_only
+        && (!arguments.full
+            || (arguments.parallel() == TestArgs::QUICK_PARALLEL
+                && arguments.retry_parallel() == TestArgs::QUICK_RETRY_PARALLEL))
+}
+
+fn strategy_hashes(all: &[Strategy]) -> Result<BTreeMap<String, String>> {
+    all.iter()
+        .map(|strategy| Ok((strategy.id.clone(), strategy.fingerprint()?)))
+        .collect()
+}
+
+fn timing_summary(rows: &[Row], elapsed_ms: f64) -> Value {
+    let successful: Vec<_> = rows
+        .iter()
+        .filter(|row| row.state == "OK" && row.group != "Clean")
+        .collect();
+    let average = |get: fn(&Row) -> f64| {
+        let values: Vec<_> = successful
+            .iter()
+            .map(|row| get(row))
+            .filter(|v| v.is_finite() && *v >= 0.)
+            .collect();
+        if values.is_empty() {
+            Value::Null
+        } else {
+            json!(values.iter().sum::<f64>() / values.len() as f64)
+        }
+    };
+    json!({"overall":crate::selection_latency::overall_timing(&probe_details(rows)),"tcp_ms":average(|r|r.conn_ms),"tls_ms":average(|r|r.tls_ms),"elapsed_ms":elapsed_ms,
+        "retries":rows.iter().filter(|r|r.tries>1).count(),"flaky":rows.iter().filter(|r|r.flaky).count()})
+}
+
+fn probe_details(rows: &[Row]) -> Vec<Value> {
+    rows.iter()
+        .map(|r| {
+            json!({"group":r.group,"name":r.name,"state":r.state,"code":r.code,
+        "url":r.url,"remote_address":r.raw["remote_address"],"certificate_validated":r.raw["certificate_validated"],
+        "dns_ms":r.dns_ms,"tcp_ms":r.conn_ms,"tls_ms":r.tls_ms,"first_byte_ms":r.first_byte_ms,"total_ms":r.total_ms,
+        "body_bytes":r.body_bytes,"body_limit":r.body_limit,"body_complete":r.body_complete,"target_reached":r.target_reached,"post_bytes":r.raw["post_bytes"],
+        "tries":r.tries,"flaky":r.flaky,"up":r.up,"down":r.down,"termination":r.termination})
+        })
+        .collect()
+}
+
+fn save_report(app: &App, report: &mut Value) -> Result<()> {
+    let id = report["run_id"]
+        .as_str()
+        .context("Нет идентификатора проверки")?
+        .to_owned();
+    ensure!(
+        id.len() == 32
+            && id
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+        "Некорректный идентификатор проверки"
+    );
+    let text_path = runtime_file(&app.root, &format!("test-native-{id}.txt"))?;
+    let json_path = runtime_file(&app.root, &format!("test-native-{id}.json"))?;
+    report["report_file"] = json!(text_path);
+    report["report_json"] = json!(json_path);
+    let text = crate::selection_ui::result_text(report).context("Нет результата для отчёта")?;
+    report["text_sha256"] = json!(sha256(text.as_bytes()));
+    let mut bytes = serde_json::to_vec_pretty(report)?;
+    if bytes.len() > 16 * 1024 * 1024 {
+        report["details"] = Value::Null;
+        report["details_complete"] = json!(false);
+        bytes = serde_json::to_vec_pretty(report)?;
+    }
+    ensure!(
+        bytes.len() <= 16 * 1024 * 1024,
+        "Сводка проверки превышает размер отчёта"
+    );
+    atomic_write(&text_path, text.as_bytes())?;
+    atomic_write(&json_path, &bytes)?;
+    atomic_write(&runtime_file(&app.root, "test-native-last.json")?, &bytes)?;
+    atomic_write(&runtime_file(&app.root, "test-last.txt")?, text.as_bytes())?;
+    if report["quality_eligible"] == true {
+        if let Some(best) = report["best"]["id"].as_str() {
+            atomic_write(
+                &runtime_file(&app.root, "test-best.txt")?,
+                format!("{best}\r\n").as_bytes(),
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn game_identities(value: &Value) -> Result<BTreeSet<String>> {
+    value
+        .as_array()
+        .context("Неизвестен список работающих игр")?
+        .iter()
+        .map(|row| {
+            let identity = &row["identity"];
+            ensure!(
+                identity["pid"].as_u64().is_some_and(|pid| pid > 0)
+                    && identity["created_filetime"]
+                        .as_u64()
+                        .is_some_and(|time| time > 0)
+                    && identity["executable"]
+                        .as_str()
+                        .is_some_and(|path| !path.is_empty()),
+                "Не удалось подтвердить идентичность работающей игры"
+            );
+            Ok(serde_json::to_string(identity)?)
+        })
+        .collect()
+}
+
+pub(crate) fn game_snapshot(app: &App) -> Result<BTreeSet<String>> {
+    game_identities(&app.platform("games", json!({}))?)
+}
+
+pub(crate) struct Restore<'a> {
+    pub(crate) app: &'a App,
+    pub(crate) needed: bool,
+    pub(crate) approved_games: BTreeSet<String>,
+}
+impl Restore<'_> {
+    pub(crate) fn finish(&mut self) -> Result<Option<Value>> {
+        if self.needed {
+            self.needed = false;
+            if !game_snapshot(self.app)?.is_subset(&self.approved_games) {
+                let message = "После начала автотеста запущена новая игра. Прежний обход нужно запустить пунктом 1 после закрытия игры.";
+                atomic_write(
+                    &runtime_file(&self.app.root, "test-restore-pending.txt")?,
+                    message.as_bytes(),
+                )?;
+                bail!("{message}");
+            }
+            return self
+                .app
+                .platform("start", json!({"game_approved":true}))
+                .map(Some);
+        }
+        Ok(None)
+    }
+}
+impl Drop for Restore<'_> {
+    fn drop(&mut self) {
+        if let Err(error) = self.finish() {
+            eprintln!("Не удалось восстановить рабочий обход: {error:#}");
+        }
+    }
+}
+
+fn launch(
+    context: &RunContext<'_>,
+    settings: &Settings,
+    alt: &str,
+    final_mode: bool,
+    lifetime: u64,
+) -> Result<OwnedChild> {
+    let args = prepare_trial_command(context, settings, alt, final_mode)?;
+    start_trial(context.snapshot.root(), &args, lifetime)
+}
+
+fn prepare_trial_inputs(root: &Path, settings: &Settings) -> Result<()> {
+    reset_trial_autolist(root)?;
+    prepare_runtime(root, settings)
+}
+
+fn prepare_trial_command(
+    context: &RunContext<'_>,
+    settings: &Settings,
+    alt: &str,
+    final_mode: bool,
+) -> Result<Vec<String>> {
+    let root = context.snapshot.root();
+    prepare_trial_inputs(root, settings)?;
+    let options = ComposeOptions {
+        alt: Some(alt.into()),
+        no_auto: !final_mode,
+        ipset_mode: if final_mode { None } else { Some("any".into()) },
+        persistence: false,
+        network_key: Some(context.network_key.clone()),
+        native_identity: Some(context.native_hash.into()),
+        ..Default::default()
+    };
+    zapret_core::checked_command_line(root, &compose(root, settings, &options)?)
+}
+
+fn start_trial(root: &Path, arguments: &[String], lifetime: u64) -> Result<OwnedChild> {
+    maintenance::check_engine_args(root, arguments)?;
+    for _ in 0..3 {
+        let mut child = OwnedChild::spawn(
+            &root.join("bin/winws2.exe"),
+            &arguments.iter().map(OsString::from).collect::<Vec<_>>(),
+            &RunOptions {
+                cwd: Some(root.join("bin")),
+                timeout: Duration::from_millis(lifetime),
+                ..Default::default()
+            },
+        )?;
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_secs(2) {
+            interrupt::check()?;
+            if !child.is_running()? {
+                break;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        if child.is_running()? {
+            return Ok(child);
+        }
+        let output = child.finish()?;
+        eprintln!(
+            "Движок завершился при старте: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        thread::sleep(Duration::from_millis(700));
+    }
+    bail!("Движок не запустился после трёх попыток")
+}
+
+fn capture_trial_autolist(root: &Path) -> Result<()> {
+    let original = root.join("lists/autohostlist.txt");
+    let seed = if original.is_file() {
+        zapret_core::read_bounded(&original, 16 * 1024 * 1024)?
+    } else {
+        b"# zapret-rust automatic host list\r\n".to_vec()
+    };
+    atomic_write(&root.join("runtime/trial-autohostlist-seed.txt"), &seed)
+}
+
+fn reset_trial_autolist(root: &Path) -> Result<()> {
+    let seed = zapret_core::read_bounded(
+        &root.join("runtime/trial-autohostlist-seed.txt"),
+        16 * 1024 * 1024,
+    )?;
+    atomic_write(&root.join("lists/autohostlist.txt"), &seed)
+}
+
+fn measured(
+    context: &RunContext<'_>,
+    targets: &[Target],
+    arguments: &TestArgs,
+    engine: &mut Option<OwnedChild>,
+    metadata: &Value,
+    clean: &BTreeMap<String, f64>,
+    hopeless: &BTreeSet<String>,
+) -> Result<(Vec<Row>, bool)> {
+    let parallel = arguments.parallel();
+    crate::selection_ui::detail(
+        context.app,
+        arguments.details,
+        &format!(
+            "  Первый проход: {} адресов, одновременно {}.",
+            targets.len(),
+            parallel
+        ),
+    )?;
+    let mut rows = probe_batch(
+        context,
+        targets,
+        parallel,
+        arguments.timeout_ms,
+        engine,
+        metadata,
+        1,
+    )?;
+    let first = rows.clone();
+    let failed = rows
+        .iter()
+        .filter(|row| {
+            row.group != "Clean"
+                && matches!(row.state.as_str(), "FAIL" | "FREEZE")
+                && !hopeless.contains(&row.key())
+        })
+        .count();
+    let retry_keys: BTreeSet<_> = rows
+        .iter()
+        .filter(|row| {
+            if row.group == "Clean" {
+                matches!(row.state.as_str(), "FAIL" | "FREEZE")
+                    || clean
+                        .get(&row.name)
+                        .is_some_and(|before| row.state == "OK" && row.tls_ms > *before + 500.)
+            } else {
+                failed <= 16
+                    && matches!(row.state.as_str(), "FAIL" | "FREEZE")
+                    && !hopeless.contains(&row.key())
+            }
+        })
+        .map(Row::key)
+        .collect();
+    let retry_targets: Vec<_> = targets
+        .iter()
+        .filter(|target| retry_keys.contains(&target.key()))
+        .cloned()
+        .collect();
+    let mut eligible = first.iter().all(|row| {
+        matches!(row.state.as_str(), "OK" | "FAIL" | "FREEZE")
+            && !row.flaky
+            && (row.group != "Clean"
+                || (row.state == "OK"
+                    && row.tls_ms > 0.
+                    && clean
+                        .get(&row.name)
+                        .is_none_or(|before| row.tls_ms <= *before + 500.)))
+    });
+    if !retry_targets.is_empty() {
+        let retry_parallel = arguments.retry_parallel();
+        crate::selection_ui::detail(
+            context.app,
+            arguments.details,
+            &format!(
+                "  Повторная попытка: {} адресов, одновременно {}.",
+                retry_targets.len(),
+                retry_parallel
+            ),
+        )?;
+        thread::sleep(Duration::from_millis(250));
+        let retry = probe_batch(
+            context,
+            &retry_targets,
+            retry_parallel,
+            arguments.timeout_ms,
+            engine,
+            metadata,
+            2,
+        )?;
+        eligible &= retry.iter().all(|row| {
+            first
+                .iter()
+                .find(|first| first.key() == row.key())
+                .is_some_and(|first| first.state == row.state)
+                && (row.group != "Clean"
+                    || (row.state == "OK"
+                        && row.tls_ms > 0.
+                        && clean
+                            .get(&row.name)
+                            .is_none_or(|before| row.tls_ms <= *before + 500.)))
+        });
+        merge_retry(&mut rows, &retry);
+    }
+    Ok((rows, eligible))
+}
+
+fn controls(
+    context: &RunContext<'_>,
+    targets: &[Target],
+    arguments: &TestArgs,
+    metadata: &Value,
+    phase: &str,
+) -> Result<Vec<Row>> {
+    let mut metadata = metadata.clone();
+    metadata["Stage"] = json!(format!("control-{phase}"));
+    let mut rows = Vec::new();
+    for attempt in 1..=2 {
+        rows.extend(probe_batch(
+            context,
+            targets,
+            arguments.parallel().min(TestArgs::QUICK_RETRY_PARALLEL),
+            arguments.timeout_ms,
+            &mut None,
+            &metadata,
+            attempt,
+        )?);
+    }
+    Ok(rows)
+}
+
+fn control_failures(targets: &[Target], before: &[Row], after: &[Row]) -> Vec<String> {
+    let mut failures = Vec::new();
+    if targets.len() < 2 {
+        failures.push("Доступно меньше двух контрольных адресов.".into());
+    }
+    if before.len() != targets.len() * 2 || after.len() != targets.len() * 2 {
+        failures.push("Контрольные измерения выполнены не полностью.".into());
+    }
+    for target in targets {
+        let first: Vec<_> = before
+            .iter()
+            .filter(|row| row.key() == target.key())
+            .collect();
+        let last: Vec<_> = after
+            .iter()
+            .filter(|row| row.key() == target.key())
+            .collect();
+        if first.len() != 2 || last.len() != 2 {
+            failures.push(format!(
+                "Контрольный адрес {}: не хватает измерений.",
+                target.name
+            ));
+            continue;
+        }
+        let healthy = |rows: &[&Row]| {
+            rows.iter()
+                .all(|row| row.state == "OK" && row.tls_ms.is_finite() && row.tls_ms > 0.)
+        };
+        if !healthy(&first) {
+            failures.push(format!(
+                "Контрольный адрес {} не ответил до измерения.",
+                target.name
+            ));
+        }
+        if !healthy(&last) {
+            failures.push(format!(
+                "Контрольный адрес {} не ответил после измерения.",
+                target.name
+            ));
+        }
+        if healthy(&first)
+            && healthy(&last)
+            && (first.iter().map(|row| row.tls_ms).sum::<f64>()
+                - last.iter().map(|row| row.tls_ms).sum::<f64>())
+            .abs()
+                / 2.
+                > 500.
+        {
+            failures.push(format!(
+                "Контрольный адрес {}: время подключения изменилось более чем на 500 мс.",
+                target.name
+            ));
+        }
+    }
+    failures
+}
+
+fn qualified_scores(rows: &[RankRow], quality: &BTreeMap<String, bool>) -> Vec<RankRow> {
+    rows.iter()
+        .filter(|row| quality.get(&row.id) == Some(&true))
+        .cloned()
+        .collect()
+}
+
+fn fully_covered(base: &[Row], actual: &[Row]) -> bool {
+    let base_keys: BTreeSet<_> = base.iter().map(Row::key).collect();
+    let actual_keys: BTreeSet<_> = actual.iter().map(Row::key).collect();
+    !base.is_empty()
+        && base_keys.len() == base.len()
+        && actual_keys.len() == actual.len()
+        && base_keys == actual_keys
+        && base.iter().all(|row| {
+            matches!(row.state.as_str(), "OK" | "FAIL" | "FREEZE")
+                && !row.flaky
+                && (row.group != "Clean"
+                    || (row.state == "OK" && row.tls_ms.is_finite() && row.tls_ms > 0.))
+        })
+        && actual.iter().all(|row| {
+            row.state == "OK"
+                && !row.flaky
+                && (row.group != "Clean"
+                    || base
+                        .iter()
+                        .find(|before| before.key() == row.key())
+                        .is_some_and(|before| {
+                            row.tls_ms.is_finite()
+                                && row.tls_ms > 0.
+                                && row.tls_ms <= before.tls_ms + 500.
+                        }))
+        })
+        && actual.iter().any(|row| row.group == "Clean")
+        && actual.iter().any(|row| row.group != "Clean")
+}
+
+#[derive(Clone, Debug)]
+struct ScoreRecord {
+    date: String,
+    id: String,
+    name: String,
+    score: f64,
+    context: String,
+    fingerprint: String,
+}
+
+fn compatible_history(root: &Path) -> Result<(Vec<String>, Vec<ScoreRecord>)> {
+    let path = root.join("runtime/test-scores.txt");
+    if !path.exists() {
+        return Ok((Vec::new(), Vec::new()));
+    }
+    let text = zapret_core::read_text(&path, 8 * 1024 * 1024)?;
+    let now = Local::now().naive_local();
+    let oldest = now - chrono::Duration::days(30);
+    let mut legacy = Vec::new();
+    let mut records = Vec::new();
+    for line in text.lines().filter(|line| !line.starts_with('#')) {
+        let fields: Vec<_> = line.split('|').collect();
+        if fields.len() == 4 {
+            legacy.push(line.into());
+            continue;
+        }
+        if fields.len() != 6 {
+            continue;
+        }
+        let Ok(date) = chrono::NaiveDateTime::parse_from_str(fields[0], "%Y-%m-%d %H:%M") else {
+            continue;
+        };
+        let Ok(score) = fields[3].parse::<f64>() else {
+            continue;
+        };
+        if date < oldest || date > now + chrono::Duration::minutes(1) || !score.is_finite() {
+            continue;
+        }
+        if !fields[1].bytes().all(|b| b.is_ascii_digit())
+            || fields[1].is_empty()
+            || fields[4].is_empty()
+            || fields[4].len() > 64
+            || !fields[4]
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+            || fields[5].len() != 64
+            || !fields[5].bytes().all(|b| b.is_ascii_hexdigit())
+        {
+            continue;
+        }
+        records.push(ScoreRecord {
+            date: fields[0].into(),
+            id: fields[1].into(),
+            name: fields[2].into(),
+            score,
+            context: fields[4].into(),
+            fingerprint: fields[5].into(),
+        });
+    }
+    Ok((legacy, records))
+}
+
+type ScoreAverages = BTreeMap<String, (f64, usize)>;
+fn score_history(
+    root: &Path,
+    sums: &[RankRow],
+    all: &[Strategy],
+    context: &str,
+) -> Result<(ScoreAverages, Vec<u8>)> {
+    let (legacy, mut history) = compatible_history(root)?;
+    let date = Local::now().format("%Y-%m-%d %H:%M").to_string();
+    let mut averages = BTreeMap::new();
+    for row in sums {
+        let strategy = all
+            .iter()
+            .find(|strategy| strategy.id == row.id)
+            .context("Стратегия истории отсутствует")?;
+        let fingerprint = strategy.fingerprint()?;
+        history.push(ScoreRecord {
+            date: date.clone(),
+            id: row.id.clone(),
+            name: strategy.name.clone(),
+            score: row.score,
+            context: context.into(),
+            fingerprint: fingerprint.clone(),
+        });
+        let values: Vec<_> = history
+            .iter()
+            .rev()
+            .filter(|record| {
+                record.id == row.id
+                    && record.name == strategy.name
+                    && record.context == context
+                    && record.fingerprint.eq_ignore_ascii_case(&fingerprint)
+            })
+            .take(3)
+            .collect();
+        averages.insert(
+            row.id.clone(),
+            (
+                values.iter().map(|record| record.score).sum::<f64>() / values.len() as f64,
+                values.len(),
+            ),
+        );
+    }
+    let mut counts = BTreeMap::<(String, String, String, String), usize>::new();
+    let mut retained = Vec::new();
+    for record in history.into_iter().rev() {
+        let count = counts
+            .entry((
+                record.id.clone(),
+                record.name.clone(),
+                record.context.clone(),
+                record.fingerprint.clone(),
+            ))
+            .or_default();
+        if *count < 3 {
+            retained.push(record);
+            *count += 1;
+        }
+    }
+    retained.reverse();
+    let mut lines = vec!["# История: дата|номер|имя|балл|контекст|SHA256 стратегии".into()];
+    lines.extend(legacy);
+    lines.extend(retained.iter().map(|record| {
+        format!(
+            "{}|{}|{}|{}|{}|{}",
+            record.date, record.id, record.name, record.score, record.context, record.fingerprint
+        )
+    }));
+    Ok((averages, format!("{}\r\n", lines.join("\r\n")).into_bytes()))
+}
+
+fn read_last(app: &App) -> Result<Value> {
+    let path = runtime_file(&app.root, "test-native-last.json")?;
+    ensure!(
+        path.is_file(),
+        "Результатов ещё нет. Сначала запустите подбор."
+    );
+    let report: Value =
+        serde_json::from_slice(&zapret_core::read_bounded(&path, 16 * 1024 * 1024)?)
+            .context("Сохранённый результат повреждён. Запустите подбор заново.")?;
+    ensure!(
+        report["schema"] == 1
+            && report["best"].is_object()
+            && report["rows"].is_array()
+            && report["primary"].is_string(),
+        "Сохранённый результат повреждён. Запустите подбор заново."
+    );
+    Ok(report)
+}
+
+pub fn run(app: &App, arguments: &TestArgs) -> Result<Value> {
+    if arguments.last {
+        return read_last(app);
+    }
+    ensure!(
+        !arguments.apply || (!arguments.report_only && !arguments.keep_primary),
+        "Применение несовместимо с режимом отчёта и сохранением прежней основной"
+    );
+    ensure!(
+        (1..=10).contains(&arguments.rounds)
+            && (1..=64).contains(&arguments.parallel())
+            && (1..=60000).contains(&arguments.timeout_ms),
+        "Неверные параметры автоподбора"
+    );
+    let settings = read_settings(&app.root)?;
+    let targets = read_targets(&app.root)?;
+    let native_hash = crate::controller_hash()?;
+    let local_network = app.platform("network", json!({}))?;
+    let local_context = local_network["key"]
+        .as_str()
+        .filter(|_| local_network["known"] == true)
+        .and_then(|key| {
+            test_result_context_with_identity(&app.root, &settings, key, native_hash).ok()
+        });
+    let all = list_strategies(&app.root)?;
+    let local_rank = zapret_core::read_rank(&app.root, local_context.as_ref(), &all)?;
+    let local_cover = match (&local_rank, &local_context) {
+        (Some(rank), Some(context)) => zapret_core::read_cover(&app.root, rank, context)?,
+        _ => None,
+    };
+    let initial = zapret_core::test_strategy_ids(
+        &app.root,
+        &settings,
+        &all,
+        local_rank.as_ref(),
+        local_cover.as_ref(),
+        arguments.full,
+    )?;
+    let hashes = strategy_hashes(&all)?;
+    let cache = match &local_context {
+        Some(context) => crate::selection_learning::Cache::load(
+            &app.root,
+            &learning_key(context, arguments, &targets)?,
+        ),
+        None => crate::selection_learning::Cache::new("unknown-network"),
+    };
+    let initial = cache.plan(
+        &initial,
+        &all,
+        settings.get("alt"),
+        arguments.full,
+        &hashes,
+        Utc::now().timestamp(),
+    );
+    let plan = json!({"schema":1,"policy":"native-quick-bounded-v3","context":local_context,"targets":targets,"strategies":initial.strategies,"deferred_history":initial.deferred,"queued_candidates":initial.queued,"settings":settings,
+        "rounds":arguments.rounds,"parallel":arguments.parallel(),"retry_parallel":arguments.retry_parallel(),"timeout_ms":arguments.timeout_ms,"report_only":arguments.report_only});
+    if arguments.plan_only {
+        return Ok(plan);
+    }
+    interrupt::install()?;
+    ensure!(
+        app.platform("admin", json!({}))?["is_admin"] == true,
+        "Автоподбор требует прав администратора"
+    );
+    let approved_games = game_snapshot(app)?;
+    ensure!(
+        approved_games.is_empty()
+            || app.confirm("Запущена игра. Автоподбор временно остановит обход. Продолжить?")?,
+        "Автоподбор отложен"
+    );
+    let conflicts = app.platform("conflicts", json!({}))?;
+    let interfering = conflicts["foreign_bypass"]
+        .as_array()
+        .is_some_and(|rows| !rows.is_empty())
+        || conflicts["tun_adapters"]
+            .as_array()
+            .is_some_and(|rows| !rows.is_empty())
+        || conflicts["proxy"]["proxy"]
+            .as_str()
+            .is_some_and(|proxy| !proxy.is_empty());
+    ensure!(
+        !interfering || app.confirm("Другой обход или прокси влияет на измерения. Продолжить?")?,
+        "Автоподбор отложен"
+    );
+    ensure!(
+        zapret_core::verify_package(&app.root)?.is_empty(),
+        "Файлы движка изменены"
+    );
+    let _guard = ControlGuard::acquire(&app.root, "strategy-test")?;
+    crate::ensure_controller_current()?;
+    let network = app.platform("network", json!({}))?;
+    let key = network["key"]
+        .as_str()
+        .filter(|_| network["known"] == true)
+        .context("Неизвестен контекст сети")?
+        .to_owned();
+    let status = app.platform("status", json!({}))?;
+    ensure!(
+        status["known"] == true && status["ownership_known"] == true,
+        "Состояние рабочего обхода неизвестно"
+    );
+    let was_running = status["running"]
+        .as_bool()
+        .context("Состояние рабочего обхода неизвестно")?;
+    ensure!(
+        game_snapshot(app)?.is_subset(&approved_games),
+        "После подтверждения запущена новая игра. Автоподбор отложен"
+    );
+    let mut restore = Restore {
+        app,
+        needed: was_running,
+        approved_games: approved_games.clone(),
+    };
+    app.platform("stop", json!({"game_approved":true}))?;
+    let mut result = run_inner(app, arguments, key, approved_games);
+    if let Ok(report) = &result {
+        restore.needed |= selection_start_requested(arguments, report);
+    }
+    let restart = restore.finish();
+    if let Ok(report) = result.as_mut() {
+        if report["protocol"] != "finalists-native-v1" {
+            let actual = read_settings(&app.root)?;
+            reconcile_restart(
+                report,
+                &actual,
+                restart
+                    .as_ref()
+                    .map(|outcome| outcome.as_ref())
+                    .map_err(|error| format!("{error:#}")),
+            );
+        }
+    }
+    if restart.is_ok() && arguments.webcheck {
+        if let Ok(report) = result.as_mut() {
+            let check = zapret_net::diagnostics(&app.root, "webcheck", &json!({}));
+            report["webcheck"] = match check {
+                Ok(value) => match crate::diagnostic_report::publish(&app.root, "web", value) {
+                    Ok(value) => value,
+                    Err(error) => json!({"status":"Unknown","error":format!("{error:#}")}),
+                },
+                Err(error) => json!({"status":"Unknown","error":format!("{error:#}")}),
+            };
+        }
+    }
+    if let Ok(report) = result.as_mut() {
+        if report["protocol"] != "finalists-native-v1" {
+            save_report(app, report)?;
+        }
+    }
+    restart?;
+    result
+}
+
+fn selection_start_requested(arguments: &TestArgs, report: &Value) -> bool {
+    !arguments.report_only
+        && report["accepted"] == true
+        && (arguments.apply || report["primary_changed"] == true)
+}
+
+fn reconcile_restart(
+    report: &mut Value,
+    actual: &Settings,
+    restart: std::result::Result<Option<&Value>, String>,
+) {
+    let requested = report
+        .get("primary_requested")
+        .filter(|value| value.is_string())
+        .unwrap_or(&report["primary"])
+        .clone();
+    report["primary_requested"] = requested.clone();
+    report["primary"] = json!(actual.get("alt"));
+    match restart {
+        Ok(Some(outcome)) => {
+            report["startup"] = outcome.clone();
+            if outcome["restored"] == true || requested.as_str() != Some(actual.get("alt")) {
+                report["primary_changed"] = json!(false);
+            }
+        }
+        Ok(None) => {
+            report["startup"] = json!({"requested":false,"reason":"BypassWasStopped"});
+        }
+        Err(error) => {
+            report["startup_error"] = json!(error);
+            report["running_restored"] = json!(false);
+        }
+    }
+}
+
+fn run_inner(
+    app: &App,
+    arguments: &TestArgs,
+    network_key: String,
+    approved_games: BTreeSet<String>,
+) -> Result<Value> {
+    let test_started = Instant::now();
+    let mut snapshot = Snapshot::package(&app.root)?;
+    // Read the complete run from the pinned package, after acquiring control.
+    // Prompts before the lock may have allowed another window to change inputs.
+    let settings = read_settings(snapshot.root())?;
+    let targets = read_targets(snapshot.root())?;
+    let all = list_strategies(snapshot.root())?;
+    capture_trial_autolist(snapshot.root())?;
+    let native_hash = crate::controller_hash()?;
+    let run_id =
+        sha256(format!("{}|{}", Utc::now().to_rfc3339(), snapshot.fingerprint()).as_bytes())[..32]
+            .to_ascii_lowercase();
+    let journal = runtime_file(&app.root, &format!("test-native-{run_id}.jsonl"))?;
+    let mut random = arguments
+        .seed
+        .unwrap_or(Utc::now().timestamp_micros() as u64)
+        .max(1);
+    let context = RunContext {
+        app,
+        snapshot: &snapshot,
+        network_key: network_key.clone(),
+        native_hash,
+        journal: journal.clone(),
+        deadline: if arguments.compare_a.is_some() || arguments.compare_b.is_some() {
+            Some(Instant::now() + Duration::from_secs(1800))
+        } else {
+            None
+        },
+        clock_origin: zapret_platform::monotonic_ms()?,
+        approved_games,
+        details: arguments.details,
+    };
+    let lifetime = engine_budget(targets.len(), arguments, false)?;
+    let result_context =
+        test_result_context_with_identity(snapshot.root(), &settings, &network_key, native_hash)
+            .context("Подготовка контекста автоподбора из снимка пакета")?;
+    let rank = zapret_core::read_rank(snapshot.root(), Some(&result_context), &all)?;
+    let cover = match &rank {
+        Some(rank) => zapret_core::read_cover(snapshot.root(), rank, &result_context)?,
+        None => None,
+    };
+    let candidates = zapret_core::test_strategy_ids(
+        snapshot.root(),
+        &settings,
+        &all,
+        rank.as_ref(),
+        cover.as_ref(),
+        arguments.full,
+    )?;
+    if arguments.compare_a.is_some() || arguments.compare_b.is_some() {
+        return comparison(&context, arguments, &settings, &targets, &all, &run_id);
+    }
+    let hashes = strategy_hashes(&all)?;
+    let mut learning = crate::selection_learning::Cache::load(
+        snapshot.root(),
+        &learning_key(&result_context, arguments, &targets)?,
+    );
+    let learned_plan = learning.plan(
+        &candidates,
+        &all,
+        settings.get("alt"),
+        arguments.full,
+        &hashes,
+        Utc::now().timestamp(),
+    );
+    let candidates = learned_plan.strategies;
+    let deferred_history = learned_plan.deferred;
+    let queued_candidates = learned_plan.queued;
+    crate::selection_ui::progress(
+        app,
+        &format!(
+            "{} подбор: {} стратегий · {} адресов · Ctrl+C — отмена.",
+            if arguments.full {
+                "Расширенный"
+            } else {
+                "Быстрый"
+            },
+            candidates.len(),
+            targets.len()
+        ),
+    )?;
+    crate::selection_ui::detail(
+        app,
+        arguments.details,
+        &format!(
+            "Ожидание адреса: {} мс · одновременно: {} (повторы: {}) · кругов: {}.",
+            arguments.timeout_ms,
+            arguments.parallel(),
+            arguments.retry_parallel(),
+            arguments.rounds
+        ),
+    )?;
+    if !deferred_history.is_empty() {
+        let names: Vec<_> = all
+            .iter()
+            .filter(|s| deferred_history.contains(&s.id))
+            .map(Strategy::display_name)
+            .collect();
+        crate::selection_ui::detail(
+            app,
+            arguments.details,
+            &format!(
+                "По прошлым проверкам отложены явно слабые: {}. Полный тест проверяет все.",
+                names.join(", ")
+            ),
+        )?;
+    }
+    let mut table = BTreeMap::<String, Vec<Row>>::new();
+    let mut timings = BTreeMap::<String, Value>::new();
+    let mut failure_runs = BTreeMap::<String, usize>::new();
+    let mut eligible = BTreeMap::<String, bool>::new();
+    let mut skipped = Vec::new();
+    let mut strategy_quality = BTreeMap::<String, bool>::new();
+    let mut quality_reasons = BTreeMap::<String, BTreeSet<String>>::new();
+    let mut round_sums = BTreeMap::<String, Vec<RankRow>>::new();
+    for round in 1..=arguments.rounds {
+        if arguments.rounds > 1 {
+            crate::selection_ui::progress(app, &format!("Круг {round} из {}", arguments.rounds))?;
+        }
+        crate::selection_ui::heading(app, "Проверяю соединение без обхода…")?;
+        let baseline_started = Instant::now();
+        let mut round_ids = BTreeSet::new();
+        let metadata = json!({"Schema":1,"RunId":run_id,"Stage":"main","Round":round,"CapturedNetworkKey":network_key,"CapturedInputsHash":snapshot.fingerprint(),"NativeIdentity":native_hash});
+        let (base, base_eligible) = measured(
+            &context,
+            &targets,
+            arguments,
+            &mut None,
+            &metadata,
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+        )?;
+        let clean = baseline(&base);
+        let base_timing = timing_summary(&base, baseline_started.elapsed().as_secs_f64() * 1000.);
+        crate::selection_ui::run_summary(
+            app,
+            "Без обхода",
+            &summary("0", &base, &BTreeMap::new()),
+            &availability(&base),
+            &base_timing,
+            &base,
+            crate::selection_ui::RunState {
+                qualified: base_eligible,
+                leader: false,
+                best_score: 0.,
+                details: arguments.details,
+                position: 0,
+                total: candidates.len(),
+            },
+        )?;
+        timings.insert("0".into(), base_timing);
+        eligible.insert("0".into(), base_eligible);
+        table.insert("0".into(), base);
+        let control_targets: Vec<_> = targets
+            .iter()
+            .filter(|target| target.group == "Clean" && clean.contains_key(&target.name))
+            .take(3)
+            .cloned()
+            .collect();
+        let mut ordered = candidates.clone();
+        shuffle(&mut ordered, &mut random);
+        let mut required = BTreeSet::new();
+        required.insert(settings.get("alt").to_owned());
+        for section in ["general", "google", "discord_media", "game_tcp"] {
+            required.extend(
+                zapret_core::rotation_order(
+                    &all,
+                    settings.get("alt"),
+                    section,
+                    rank.as_ref(),
+                    cover.as_ref(),
+                )
+                .into_iter()
+                .map(|strategy| strategy.id),
+            );
+        }
+        let mut represented = BTreeSet::new();
+        let mut initial = Vec::new();
+        let mut deferred = Vec::new();
+        for strategy in ordered {
+            if arguments.full
+                || arguments.rounds > 1
+                || required.contains(&strategy.id)
+                || represented.insert(family(&strategy))
+            {
+                initial.push(strategy)
+            } else {
+                deferred.push(strategy)
+            }
+        }
+        let initial_len = initial.len();
+        let mut schedule = initial;
+        let mut index = 0;
+        while index < schedule.len() {
+            if index == initial_len && !deferred.is_empty() {
+                unreachable!("continuation is appended at boundary below")
+            }
+            let strategy = schedule[index].clone();
+            let trial_started = Instant::now();
+            crate::selection_ui::heading(
+                app,
+                &format!(
+                    "[{} / {}] {}",
+                    index + 1,
+                    candidates.len(),
+                    strategy.display_name()
+                ),
+            )?;
+            context.assert_current()?;
+            let mut metadata = metadata.clone();
+            metadata["StrategyId"] = json!(strategy.id);
+            metadata["StrategyHash"] = json!(strategy.fingerprint()?);
+            let before = controls(&context, &control_targets, arguments, &metadata, "before")?;
+            let mut engine = Some(launch(&context, &settings, &strategy.id, false, lifetime)?);
+            let hopeless: BTreeSet<_> = failure_runs
+                .iter()
+                .filter(|(_, count)| **count >= 3)
+                .map(|(key, _)| key.clone())
+                .collect();
+            let result = measured(
+                &context,
+                &targets,
+                arguments,
+                &mut engine,
+                &metadata,
+                &clean,
+                &hopeless,
+            );
+            stop_trial(engine)?;
+            let (rows, can_skip) = result?;
+            let after = controls(&context, &control_targets, arguments, &metadata, "after")?;
+            let counts = availability(&rows);
+            let run_summary = summary(&strategy.id, &rows, &clean);
+            let timing = timing_summary(&rows, trial_started.elapsed().as_secs_f64() * 1000.);
+            let failures = control_failures(&control_targets, &before, &after);
+            let stable = failures.is_empty();
+            strategy_quality
+                .entry(strategy.id.clone())
+                .and_modify(|qualified| *qualified &= stable)
+                .or_insert(stable);
+            let previous_best = table
+                .iter()
+                .filter(|(id, _)| {
+                    id.as_str() != strategy.id && strategy_quality.get(*id) == Some(&true)
+                })
+                .map(|(id, rows)| summary(id, rows, &clean).score)
+                .reduce(f64::max);
+            let confirmed = strategy_quality.get(&strategy.id) == Some(&true);
+            crate::selection_ui::run_summary(
+                app,
+                strategy.display_name(),
+                &run_summary,
+                &counts,
+                &timing,
+                &rows,
+                crate::selection_ui::RunState {
+                    qualified: confirmed,
+                    leader: confirmed
+                        && previous_best.is_none_or(|score| run_summary.score >= score),
+                    best_score: previous_best
+                        .unwrap_or(run_summary.score)
+                        .max(run_summary.score),
+                    details: arguments.details,
+                    position: index + 1,
+                    total: candidates.len(),
+                },
+            )?;
+            timings.insert(strategy.id.clone(), timing);
+            if !stable {
+                crate::selection_ui::detail(
+                    app,
+                    arguments.details,
+                    &format!("  Измерение вне выбора: {}", failures[0]),
+                )?;
+                quality_reasons
+                    .entry(strategy.id.clone())
+                    .or_default()
+                    .extend(failures);
+            }
+            for row in &rows {
+                if matches!(row.state.as_str(), "FAIL" | "FREEZE") {
+                    *failure_runs.entry(row.key()).or_default() += 1;
+                } else {
+                    failure_runs.remove(&row.key());
+                }
+            }
+            eligible.insert(strategy.id.clone(), can_skip);
+            round_ids.insert(strategy.id.clone());
+            table.insert(strategy.id.clone(), rows);
+            index += 1;
+            if index == initial_len && !deferred.is_empty() {
+                let clean_base = &table["0"];
+                let perfect = schedule
+                    .iter()
+                    .filter(|strategy| {
+                        eligible.get(&strategy.id) == Some(&true)
+                            && strategy_quality.get(&strategy.id) == Some(&true)
+                    })
+                    .find(|strategy| fully_covered(clean_base, &table[&strategy.id]));
+                let initial_complete = schedule.iter().take(initial_len).all(|strategy| {
+                    eligible.get(&strategy.id) == Some(&true)
+                        && strategy_quality.get(&strategy.id) == Some(&true)
+                });
+                if eligible["0"] && initial_complete {
+                    if let Some(winner) = perfect {
+                        let winning_family = family(winner);
+                        let mut followed = 0;
+                        for strategy in deferred.drain(..) {
+                            if family(&strategy) == winning_family && followed < 2 {
+                                schedule.push(strategy);
+                                followed += 1;
+                            } else {
+                                skipped.push(strategy.id);
+                            }
+                        }
+                        if !skipped.is_empty() {
+                            crate::selection_ui::progress(
+                                app,
+                                &format!(
+                                    "Покрытие подтверждено. Лишние варианты отложены: {}; уточняю близкие стратегии.",
+                                    skipped.len()
+                                ),
+                            )?;
+                        }
+                    } else {
+                        schedule.append(&mut deferred);
+                    }
+                } else {
+                    schedule.append(&mut deferred);
+                }
+            }
+        }
+        collect_round_summaries(&table, &round_ids, &clean, &mut round_sums)?;
+    }
+    skipped.retain(|id| !round_sums.contains_key(id));
+    skipped.sort();
+    skipped.dedup();
+    let rounds_measured: BTreeMap<_, _> = round_sums
+        .iter()
+        .map(|(id, rows)| (id.clone(), rows.len()))
+        .collect();
+    let mut sums: Vec<RankRow> = round_sums
+        .into_values()
+        .map(|values| {
+            let mut row = values.last().expect("measured round").clone();
+            row.score = values.iter().map(|row| row.score).sum::<f64>() / values.len() as f64;
+            row.ok = values.iter().map(|row| row.ok).sum::<f64>() / values.len() as f64;
+            for (group, points) in &mut row.groups {
+                *points = values
+                    .iter()
+                    .map(|row| row.groups.get(group).copied().unwrap_or(0.))
+                    .sum::<f64>()
+                    / values.len() as f64;
+            }
+            row
+        })
+        .collect();
+    ensure!(!sums.is_empty(), "Нет завершённых измерений стратегий");
+    sums.sort_by(|a, b| {
+        b.score
+            .total_cmp(&a.score)
+            .then((a.id != settings.get("alt")).cmp(&(b.id != settings.get("alt"))))
+            .then(a.freeze.cmp(&b.freeze))
+    });
+    let qualified = qualified_scores(&sums, &strategy_quality);
+    let quality_ok = !qualified.is_empty();
+    let best = qualified.first().unwrap_or(&sums[0]).clone();
+    let history_context = sha256(
+        format!(
+            "native-score-v1\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
+            result_context.network_key,
+            result_context.inputs_hash,
+            serde_json::to_string(&targets)?,
+            arguments.timeout_ms,
+            arguments.parallel(),
+            arguments.retry_parallel(),
+            arguments.full
+        )
+        .as_bytes(),
+    );
+    let (averages, history) = score_history(&app.root, &qualified, &all, &history_context)?;
+    let mut ordered_by_average = qualified.clone();
+    ordered_by_average.sort_by(|a, b| {
+        averages[&b.id]
+            .0
+            .total_cmp(&averages[&a.id].0)
+            .then((a.id != settings.get("alt")).cmp(&(b.id != settings.get("alt"))))
+            .then(a.freeze.cmp(&b.freeze))
+    });
+    let details: BTreeMap<_, _> = table
+        .iter()
+        .map(|(id, rows)| (id.clone(), probe_details(rows)))
+        .collect();
+    let use_history = app.yes && !arguments.apply;
+    let mut latency_preference = crate::selection_latency::recommend(
+        if use_history {
+            &ordered_by_average
+        } else {
+            &qualified
+        },
+        &details,
+    );
+    let proposed = if use_history {
+        ordered_by_average.first().unwrap_or(&best)
+    } else {
+        &best
+    };
+    let noise = app.yes
+        && (strategy_quality.get(settings.get("alt")) != Some(&true)
+            || averages.get(settings.get("alt")).is_some_and(|current| {
+                averages.get(&proposed.id).is_none_or(|proposed| {
+                    proposed.0 - current.0 < 2. && latency_preference.is_none()
+                })
+            }));
+    let proposed = proposed.clone();
+    let trial_best = best.clone();
+    let mut best = best;
+    let mut candidate = settings.clone();
+    let mut select = false;
+    let mut choice = if arguments.report_only {
+        "report_only"
+    } else if arguments.keep_primary {
+        "kept"
+    } else {
+        "unchanged"
+    };
+    let mut recommendation_status = if arguments.report_only || arguments.keep_primary || noise {
+        "trial_only"
+    } else {
+        "unconfirmed"
+    };
+    let base = summary("0", &table["0"], &BTreeMap::new());
+    let rank = TestRank {
+        date: Some(Local::now().format("%Y-%m-%d %H:%M").to_string()),
+        version: VERSION.into(),
+        base_ok: base.ok,
+        base_total: base.total,
+        base_groups: base.groups,
+        base_group_totals: base.group_totals,
+        rows: qualified.clone(),
+        context: Some(result_context.clone()),
+    };
+    let cover: Coverage = table
+        .iter()
+        .filter(|(id, _)| id.as_str() == "0" || strategy_quality.get(*id) == Some(&true))
+        .map(|(id, rows)| {
+            (
+                id.clone(),
+                rows.iter()
+                    .filter(|row| row.state == "OK")
+                    .map(|row| format!("{}|{}", row.group, row.name))
+                    .collect(),
+            )
+        })
+        .collect();
+    let mut accepted = false;
+    let mut validation_error = None;
+    let mut final_details = Vec::new();
+    let mut final_checks = BTreeMap::new();
+    let mut retained_check = None;
+    let update_quick_history = updates_quick_history(arguments);
+    if update_quick_history {
+        learning.observe(&sums, &strategy_quality, &hashes, Utc::now().timestamp());
+    }
+    let mut working_details = Vec::new();
+    if !arguments.report_only && quality_ok {
+        crate::selection_ui::heading(app, "Проверяю текущий рабочий режим перед применением…")?;
+        let primary = settings.get("alt");
+        let original_command = prepare_trial_command(&context, &settings, primary, true)?;
+        let mut reference_engine = Some(start_trial(snapshot.root(), &original_command, lifetime)?);
+        let reference_result = measured(
+            &context,
+            &targets,
+            arguments,
+            &mut reference_engine,
+            &json!({"Schema":1,"RunId":run_id,"Stage":"working-reference","StrategyId":settings.get("alt")}),
+            &baseline(&table["0"]),
+            &BTreeSet::new(),
+        );
+        stop_trial(reference_engine)?;
+        let (working_reference, _) = reference_result?;
+        working_details = probe_details(&working_reference);
+        zapret_core::save_rank(snapshot.root(), &rank)?;
+        zapret_core::save_cover(snapshot.root(), &cover, &result_context)?;
+        let mut check_index = 0;
+        let mut measure_final = |id: &str,
+                                 command: &[String],
+                                 retained: bool|
+         -> Result<crate::selection_decision::Check> {
+            check_index += 1;
+            context.assert_current()?;
+            let name = all
+                .iter()
+                .find(|s| s.id == id)
+                .map_or(id, Strategy::display_name);
+            let stage = if retained { "retained" } else { "final" };
+            let label = if retained {
+                format!("{name} (прежний порядок автосмены)")
+            } else {
+                name.to_owned()
+            };
+            crate::selection_ui::heading(app, &format!("Проверяю рабочий режим: {label}"))?;
+            let mut engine = Some(start_trial(snapshot.root(), command, lifetime)?);
+            let actual = measured(
+                &context,
+                &targets,
+                arguments,
+                &mut engine,
+                &json!({"Schema":1,"RunId":run_id,"Stage":stage,"StrategyId":id,"CandidateCheck":check_index}),
+                &baseline(&table["0"]),
+                &BTreeSet::new(),
+            );
+            stop_trial(engine)?;
+            let (actual, _) = actual?;
+            let measured = table
+                .get(id)
+                .context("Рабочая стратегия отсутствует в измерении")?;
+            let expected = final_reference(&working_reference, measured, &table["0"]);
+            let error = final_check(&expected, &actual)
+                .err()
+                .map(|error| format!("{error:#}"));
+            context.assert_current()?;
+            crate::selection_ui::validation_notice(
+                app,
+                &label,
+                error.as_deref(),
+                arguments.details,
+            )?;
+            Ok(crate::selection_decision::Check {
+                confirmed: error.is_none(),
+                error,
+                details: probe_details(&actual),
+            })
+        };
+        let mut primary_command_changed = false;
+        let mut validate = |id: &str| {
+            let mut checked_settings = settings.clone();
+            checked_settings.set("alt", id)?;
+            let command = prepare_trial_command(&context, &checked_settings, id, true)?;
+            if id == primary {
+                primary_command_changed = command != original_command;
+            }
+            measure_final(id, &command, false)
+        };
+        if !arguments.keep_primary && (!noise || arguments.apply) {
+            let mut order = vec![proposed.clone()];
+            order.extend(
+                (if use_history {
+                    &ordered_by_average
+                } else {
+                    &qualified
+                })
+                .iter()
+                .filter(|row| row.id != proposed.id)
+                .filter(|row| {
+                    !app.yes
+                        || arguments.apply
+                        || averages
+                            .get(settings.get("alt"))
+                            .is_some_and(|current| averages[&row.id].0 - current.0 >= 2.)
+                        || latency_preference
+                            .as_ref()
+                            .is_some_and(|_| crate::selection_latency::eligible(&proposed, row))
+                })
+                .cloned(),
+            );
+            let decision = crate::selection_decision::verified_preferred(
+                &order,
+                arguments.full,
+                &details,
+                &mut validate,
+            )?;
+            latency_preference = decision.preference;
+            final_checks = decision.checks;
+            if let Some(recommended) = decision.recommended {
+                best = recommended;
+                recommendation_status = "confirmed";
+                if best.id != settings.get("alt") {
+                    let preview = json!({"best":best,"trial_best":trial_best,"rows":sums,"primary":settings.get("alt"),"final_checks":final_checks,"connection_selection":latency_preference,"timings":timings,
+                        "strategy_names":all.iter().map(|s|(&s.id,s.display_name())).collect::<BTreeMap<_,_>>()});
+                    select = arguments.apply || crate::selection_ui::choose_primary(app, &preview)?;
+                    if select {
+                        candidate.set("alt", &best.id)?;
+                        choice = "apply";
+                    } else {
+                        choice = "kept";
+                    }
+                }
+            } else {
+                choice = "unconfirmed";
+                crate::selection_ui::detail(
+                    app,
+                    arguments.details,
+                    "Лучшие варианты не подтвердили рабочий режим. Основная стратегия сохранена.",
+                )?;
+            }
+        }
+        let selected = candidate.get("alt");
+        let checked = match final_checks.get(selected) {
+            Some(check) => check.clone(),
+            None => validate(selected)?,
+        };
+        final_checks.insert(selected.into(), checked.clone());
+        drop(validate);
+        if !checked.confirmed && selected == primary && primary_command_changed {
+            // The fresh rank can change the command even for the same primary.
+            // Recheck the saved command without publishing the rejected rank.
+            prepare_trial_inputs(snapshot.root(), &settings)?;
+            retained_check = Some(measure_final(primary, &original_command, true)?);
+        }
+        final_details = checked.details.clone();
+        if checked.confirmed && best.id == selected {
+            recommendation_status = "confirmed";
+        }
+        context.assert_current()?;
+        snapshot.release_state_pins();
+        let validation = if checked.confirmed {
+            Ok(())
+        } else {
+            Err(anyhow::anyhow!(
+                checked
+                    .error
+                    .clone()
+                    .unwrap_or_else(|| "Рабочий режим не подтверждён".into())
+            ))
+        };
+        validation_error = accept_candidate(validation, || {
+            publish(app, &settings, &candidate, &rank, &cover, &history, &all)
+        })?;
+        accepted = validation_error.is_none();
+        if let Some(error) = &validation_error {
+            crate::selection_ui::detail(
+                app,
+                arguments.details,
+                &format!(
+                    "{error}. Прежние настройки сохранены; результаты проверки доступны в отчёте."
+                ),
+            )?;
+        }
+    } else if !arguments.report_only {
+        context.assert_current()?;
+        snapshot.release_state_pins();
+    }
+    let cache_error = if update_quick_history {
+        learning
+            .save(&app.root)
+            .err()
+            .map(|error| format!("{error:#}"))
+    } else {
+        None
+    };
+    let availability: BTreeMap<_, _> = table
+        .iter()
+        .filter(|(id, _)| id.as_str() != "0")
+        .map(|(id, rows)| (id.clone(), availability(rows)))
+        .collect();
+    let mut report = json!({"schema":1,"run_id":run_id,"best":best,"trial_best":trial_best,"recommendation_status":recommendation_status,"final_checks":final_checks,"choice":choice,
+        "selection_policy":crate::selection_latency::POLICY,"connection_selection":latency_preference,
+        "primary_requested":candidate.get("alt"),"apply_requested":arguments.apply,"report_only":arguments.report_only,"presentation":if arguments.details{"detailed"}else{"compact"},"queued_candidates":queued_candidates,"rows":sums,"base":table["0"],"journal":journal,"availability":availability,
+        "timings":timings,"elapsed_ms":test_started.elapsed().as_secs_f64()*1000.,"details":details,"working_reference":working_details,"final_details":final_details,"retained_check":retained_check,"validation_error":validation_error,"cache_error":cache_error,"deferred_history":deferred_history,
+        "accepted":accepted,"quality_eligible":quality_ok,"strategy_quality":strategy_quality,"quality_reasons":quality_reasons,"averages":averages,"noise_margin":noise,"primary_changed":select&&accepted,"primary":if accepted{candidate.get("alt")}else{settings.get("alt")},
+        "skipped_ids":skipped,"rounds_measured":rounds_measured,"strategy_names":all.iter().map(|s|(&s.id,s.display_name())).collect::<BTreeMap<_,_>>(),"native_identity":native_hash,"context":result_context});
+    report["parallel"] = json!(arguments.parallel());
+    report["retry_parallel"] = json!(arguments.retry_parallel());
+    report["timeout_ms"] = json!(arguments.timeout_ms);
+    Ok(report)
+}
+
+fn collect_round_summaries(
+    table: &BTreeMap<String, Vec<Row>>,
+    measured: &BTreeSet<String>,
+    clean: &BTreeMap<String, f64>,
+    sums: &mut BTreeMap<String, Vec<RankRow>>,
+) -> Result<()> {
+    for id in measured {
+        let rows = table
+            .get(id)
+            .context("Нет измерений стратегии в текущем круге")?;
+        sums.entry(id.clone())
+            .or_default()
+            .push(summary(id, rows, clean));
+    }
+    Ok(())
+}
+
+fn publish(
+    app: &App,
+    previous: &Settings,
+    candidate: &Settings,
+    rank: &TestRank,
+    cover: &Coverage,
+    history: &[u8],
+    all: &[Strategy],
+) -> Result<()> {
+    let names = [
+        "runtime/test-rank.txt",
+        "runtime/test-cover.txt",
+        "runtime/settings.ini",
+        "runtime/test-scores.txt",
+        "runtime/tested-strategies.txt",
+    ];
+    let backups: Vec<_> = names
+        .iter()
+        .map(|name| app.root.join(name))
+        .map(|path| {
+            let bytes = match fs::read(&path) {
+                Ok(bytes) => Some(bytes),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => return Err(error.into()),
+            };
+            Ok((path, bytes))
+        })
+        .collect::<Result<_>>()?;
+    let result = (|| {
+        zapret_core::save_rank(&app.root, rank)?;
+        zapret_core::save_cover(
+            &app.root,
+            cover,
+            rank.context.as_ref().context("Контекст рейтинга")?,
+        )?;
+        if candidate != previous {
+            save_settings(&app.root, candidate)?;
+        }
+        atomic_write(&runtime_file(&app.root, "test-scores.txt")?, history)?;
+        let path = runtime_file(&app.root, "tested-strategies.txt")?;
+        let mut tested = zapret_core::list_lines(&path)?;
+        for row in &rank.rows {
+            let strategy = all
+                .iter()
+                .find(|strategy| strategy.id == row.id)
+                .context("Стратегия публикации отсутствует")?;
+            let line = format!("{}|{}", strategy.id, strategy.name);
+            if !tested.contains(&line) {
+                tested.push(line);
+            }
+        }
+        atomic_write(&path, format!("{}\r\n", tested.join("\r\n")).as_bytes())?;
+        Ok(())
+    })();
+    if result.is_err() {
+        for (path, bytes) in backups {
+            if let Some(bytes) = bytes {
+                atomic_write(&path, &bytes)?;
+            } else if path.exists() {
+                fs::remove_file(path)?;
+            }
+        }
+    }
+    result
+}
+
+fn comparison(
+    context: &RunContext<'_>,
+    arguments: &TestArgs,
+    settings: &Settings,
+    targets: &[Target],
+    all: &[Strategy],
+    run_id: &str,
+) -> Result<Value> {
+    let journal = &context.journal;
+    let a = arguments
+        .compare_a
+        .as_deref()
+        .context("Для сравнения нужны --compare-a и --compare-b")?;
+    let b = arguments
+        .compare_b
+        .as_deref()
+        .context("Для сравнения нужны --compare-a и --compare-b")?;
+    ensure!(
+        a != b && (4..=12).contains(&arguments.compare_blocks) && arguments.compare_blocks % 2 == 0,
+        "Неверные параметры сравнения"
+    );
+    ensure!(
+        [a, b].iter().all(|id| all
+            .iter()
+            .any(|strategy| strategy.id == *id && strategy.is_valid())),
+        "Стратегия сравнения отсутствует"
+    );
+    let mut rows = Vec::new();
+    let seed = arguments
+        .seed
+        .unwrap_or_else(|| Utc::now().timestamp_micros() as u64);
+    crate::selection_ui::progress(
+        context.app,
+        "Сравниваю две стратегии по очереди. Ctrl+C — остановить.",
+    )?;
+    for block in 0..arguments.compare_blocks + 2 {
+        let calibration = block == 0 || block == arguments.compare_blocks + 1;
+        let pattern = if (block + ((seed & 1) as usize)) % 2 == 0 {
+            ['A', 'B', 'B', 'A']
+        } else {
+            ['B', 'A', 'A', 'B']
+        };
+        for (position, arm) in pattern.into_iter().enumerate() {
+            let id = if calibration || arm == 'A' { a } else { b };
+            let strategy_name = all
+                .iter()
+                .find(|strategy| strategy.id == id)
+                .map(Strategy::display_name)
+                .unwrap_or(id);
+            let count = (arguments.compare_blocks + 2) * 4;
+            crate::selection_ui::progress(
+                context.app,
+                &format!("[{} / {count}] {strategy_name}", block * 4 + position + 1),
+            )?;
+            let mut engine = Some(launch(
+                context,
+                settings,
+                id,
+                false,
+                engine_budget(targets.len(), arguments, true)?,
+            )?);
+            let identity =
+                serde_json::to_value(engine.as_ref().context("Движок сравнения")?.identity())?;
+            let mut ready = context
+                .app
+                .platform("process-metrics", json!({"identity":identity}))?;
+            ready["observed_monotonic_ms"] =
+                json!(zapret_platform::monotonic_ms()? - context.clock_origin);
+            let metadata = json!({"Schema":1,"RunId":run_id,"Stage":"comparison-warmup","ComparisonBlock":block,
+                "ComparisonPosition":position,"ComparisonArm":arm,"StrategyId":id,"CapturedNetworkKey":context.network_key,
+                "CapturedInputsHash":context.snapshot.fingerprint(),"NativeIdentity":context.native_hash});
+            let warm = probe_batch(
+                context,
+                targets,
+                arguments.parallel(),
+                arguments.timeout_ms,
+                &mut engine,
+                &metadata,
+                1,
+            )?;
+            let mut warm_metrics = context
+                .app
+                .platform("process-metrics", json!({"identity":identity}))?;
+            warm_metrics["observed_monotonic_ms"] =
+                json!(zapret_platform::monotonic_ms()? - context.clock_origin);
+            let mut metadata = metadata;
+            metadata["Stage"] = json!("comparison");
+            let started_ms = zapret_platform::monotonic_ms()? - context.clock_origin;
+            let result = measured(
+                context,
+                targets,
+                arguments,
+                &mut engine,
+                &metadata,
+                &baseline(&warm),
+                &BTreeSet::new(),
+            );
+            let finished_ms = zapret_platform::monotonic_ms()? - context.clock_origin;
+            let mut end = context
+                .app
+                .platform("process-metrics", json!({"identity":identity}))?;
+            end["observed_monotonic_ms"] =
+                json!(zapret_platform::monotonic_ms()? - context.clock_origin);
+            stop_trial(engine)?;
+            let (probes, _) = result?;
+            context.assert_current()?;
+            let strategy_hash = all
+                .iter()
+                .find(|strategy| strategy.id == id)
+                .context("Стратегия сравнения отсутствует")?
+                .fingerprint()?;
+            rows.push(json!({"block":block,"position":position,"arm":arm,"calibration":calibration,"strategy_id":id,"started_ms":started_ms,"finished_ms":finished_ms,
+                "network_key":context.network_key,"inputs_hash":context.snapshot.fingerprint(),"native_hash":context.native_hash,
+                "strategy_hash":strategy_hash,"context_validated":true,
+                "probes":probes,"resources":{"ready":ready,"warm":warm_metrics,"end":end}}));
+        }
+    }
+    context.assert_current()?;
+    let assessment = crate::comparison::assess(&rows, arguments.compare_blocks)?;
+    let a_name = all
+        .iter()
+        .find(|strategy| strategy.id == a)
+        .map(Strategy::display_name)
+        .unwrap_or(a);
+    let b_name = all
+        .iter()
+        .find(|strategy| strategy.id == b)
+        .map(Strategy::display_name)
+        .unwrap_or(b);
+    let mut result = json!({"schema":1,"protocol":"finalists-native-v1","complete":true,"blocks":arguments.compare_blocks,"seed":seed,"a":a,"b":b,"a_name":a_name,"b_name":b_name,"run_id":run_id,"rows":rows,"text":assessment["text"],"assessment":assessment,"journal":journal});
+    crate::comparison::seal_record(&mut result)?;
+    let encoded = serde_json::to_vec_pretty(&result)?;
+    atomic_write(
+        &runtime_file(
+            &context.app.root,
+            &format!("comparison-native-{run_id}.json"),
+        )?,
+        &encoded,
+    )?;
+    atomic_write(
+        &runtime_file(&context.app.root, "comparison-native-last.json")?,
+        &encoded,
+    )?;
+    Ok(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn batch_journal_appends_existing_jsonl_and_leaves_prior_rows_readable_on_error() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("run.jsonl");
+        fs::write(&path, b"{\"Attempt\":1}\n").unwrap();
+        let mut journal = Journal::open(&path).unwrap();
+        journal.append(&json!({"Attempt":2})).unwrap();
+        // Exercise the limit without writing a 64 MiB fixture.
+        journal.size = 64 * 1024 * 1024;
+        assert!(journal.append(&json!({"Attempt":3})).is_err());
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            b"{\"Attempt\":1}\n{\"Attempt\":2}\n"
+        );
+    }
+
+    #[test]
+    fn previous_result_is_read_without_preparing_settings_or_controlling_the_bypass() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::create_dir(directory.path().join("runtime")).unwrap();
+        fs::write(
+            directory.path().join("runtime/settings.ini"),
+            b"not valid settings\0",
+        )
+        .unwrap();
+        let saved = json!({"schema":1,"best":{"id":"50"},"rows":[{"id":"50"}],"primary":"50"});
+        fs::write(
+            directory.path().join("runtime/test-native-last.json"),
+            serde_json::to_vec(&saved).unwrap(),
+        )
+        .unwrap();
+        let app = App {
+            root: directory.path().into(),
+            yes: false,
+            json: false,
+        };
+        let result = read_last(&app).unwrap();
+        assert_eq!(result, saved);
+        assert_eq!(
+            fs::read(directory.path().join("runtime/settings.ini")).unwrap(),
+            b"not valid settings\0"
+        );
+        fs::remove_file(directory.path().join("runtime/test-native-last.json")).unwrap();
+        assert!(
+            read_last(&app)
+                .unwrap_err()
+                .to_string()
+                .contains("Результатов ещё нет")
+        );
+    }
+    fn row(state: &str) -> Row {
+        Row {
+            group: "DPI".into(),
+            name: "host".into(),
+            url: "https://example.com/".into(),
+            state: state.into(),
+            code: "200".into(),
+            exit: 0,
+            up: 0.,
+            down: 128.,
+            conn_ms: 5.,
+            tls_ms: 10.,
+            dns_ms: 1.,
+            first_byte_ms: 12.,
+            total_ms: 15.,
+            started_utc: String::new(),
+            observed_utc: String::new(),
+            started_ms: 0.,
+            observed_ms: 15.,
+            body_bytes: 128,
+            body_limit: 65536,
+            target_reached: false,
+            body_complete: true,
+            termination: "Complete".into(),
+            tries: 1,
+            flaky: false,
+            raw: json!({}),
+        }
+    }
+    #[test]
+    fn retry_marks_recovered_results_flaky_and_final_replay_requires_actual_success() {
+        let mut rows = vec![row("FAIL")];
+        merge_retry(&mut rows, &[row("OK")]);
+        assert!(rows[0].flaky);
+        assert_eq!(summary("12", &rows, &BTreeMap::new()).score, 0.5);
+        assert!(final_check(&rows, &[row("FAIL")]).is_err());
+        assert!(final_check(&rows, &[row("OK")]).is_ok());
+    }
+
+    #[test]
+    fn final_application_compares_working_coverage_without_dropping_real_service_or_clean_regressions()
+     {
+        let mut dpi = row("OK");
+        dpi.group = "DPI".into();
+        dpi.name = "Hetzner".into();
+        let mut service = row("OK");
+        service.group = "YouTube".into();
+        service.name = "web".into();
+        let mut clean = row("OK");
+        clean.group = "Clean".into();
+        clean.name = "sony".into();
+        let isolated = vec![dpi.clone(), service.clone(), clean.clone()];
+        dpi.state = "FAIL".into();
+        dpi.tls_ms = 0.;
+        let working = vec![dpi, service, clean.clone()];
+        let expected = final_reference(&working, &isolated, &[clean]);
+        assert!(final_check(&expected, &working).is_ok());
+        let mut broken = working.clone();
+        broken[1].state = "FAIL".into();
+        assert!(final_check(&expected, &broken).is_err());
+        let mut broken = working.clone();
+        broken[2].tls_ms += 501.;
+        assert!(final_check(&expected, &broken).is_err());
+        let mut recovered = working.clone();
+        recovered[0].state = "OK".into();
+        recovered[0].tls_ms = 50.;
+        let expected = final_reference(&recovered, &isolated, &[]);
+        assert!(final_check(&expected, &working).is_err());
+    }
+
+    #[test]
+    fn flaky_oracle_reference_does_not_veto_a_working_candidate_or_hide_real_regressions() {
+        let mut oracle = row("OK");
+        oracle.name = "SG.OR-01 Oracle".into();
+        oracle.url = "https://ged.com.sg/".into();
+        oracle.conn_ms = 387.0705;
+        oracle.tls_ms = 767.0383;
+        oracle.tries = 2;
+        oracle.flaky = true;
+        let mut service = row("OK");
+        service.group = "YouTube".into();
+        service.name = "web".into();
+        let mut clean = row("OK");
+        clean.group = "Clean".into();
+        clean.name = "sony".into();
+        let working = vec![oracle.clone(), service.clone(), clean.clone()];
+        let mut measured = working.clone();
+        measured[0].flaky = false;
+        measured[0].tries = 1;
+        let mut actual = measured.clone();
+        actual[0].state = "FAIL".into();
+        actual[0].conn_ms = 402.2447;
+        actual[0].tls_ms = 801.5965;
+        actual[0].tries = 2;
+
+        let expected = final_reference(&working, &measured, std::slice::from_ref(&clean));
+        final_check(&expected, &actual).unwrap();
+        assert_eq!(availability(&actual)["ok"], 1);
+        assert_eq!(actual[0].state, "FAIL");
+
+        let mut stable_reference = working.clone();
+        stable_reference[0].flaky = false;
+        let expected = final_reference(&stable_reference, &measured, &[]);
+        assert!(final_check(&expected, &actual).is_err());
+
+        for group in ["YouTube", "Clean"] {
+            let mut reference = working.clone();
+            reference[0].group = group.into();
+            let mut regressed = actual.clone();
+            regressed[0].group = group.into();
+            let expected = final_reference(&reference, &measured, &[]);
+            assert!(final_check(&expected, &regressed).is_err());
+        }
+        let mut regressed = actual.clone();
+        regressed[1].state = "FAIL".into();
+        assert!(final_check(&final_reference(&working, &measured, &[]), &regressed).is_err());
+        let mut regressed = actual.clone();
+        regressed[2].tls_ms = clean.tls_ms + 501.;
+        assert!(final_check(&final_reference(&working, &measured, &[clean]), &regressed).is_err());
+    }
+
+    #[test]
+    fn failed_final_validation_preserves_a_rejection_without_committing_settings() {
+        let committed = std::cell::Cell::new(false);
+        let result = accept_candidate(final_check(&[row("OK")], &[row("FAIL")]), || {
+            committed.set(true);
+            Ok(())
+        });
+        assert!(!committed.get());
+        assert!(result.unwrap().unwrap().contains("Финальная комбинация"));
+        assert!(accept_candidate(Ok(()), || anyhow::bail!("write failure")).is_err());
+    }
+
+    #[test]
+    fn final_errors_identify_all_lost_targets_once_even_if_multiple_references_require_them() {
+        let mut a = row("OK");
+        a.name = "FI.HE-03 Hetzner".into();
+        let mut b = row("OK");
+        b.name = "FR.OVH-01 OVH".into();
+        let expected = vec![a.clone(), b.clone(), a.clone()];
+        a.state = "FAIL".into();
+        a.termination = "TlsFailure".into();
+        let error = final_check(&expected, &[a]).unwrap_err().to_string();
+        assert!(error.starts_with(
+            "Финальная комбинация не подтвердила DPI/FI.HE-03 Hetzner, DPI/FR.OVH-01 OVH: "
+        ));
+        assert!(error.contains("сбой TLS") && error.contains("адрес отсутствует"));
+        // A separately measured original configuration can pass. The proposed rank still cannot publish.
+        assert!(final_check(&expected, &expected).is_ok());
+        assert!(
+            accept_candidate(Err(anyhow::anyhow!(error)), || panic!(
+                "rank must be preserved"
+            ))
+            .unwrap()
+            .is_some()
+        );
+    }
+
+    #[test]
+    fn rejected_final_run_still_has_its_own_report_with_probe_timings() {
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir(root.path().join("runtime")).unwrap();
+        let app = App {
+            root: root.path().into(),
+            yes: false,
+            json: false,
+        };
+        let mut report = json!({"schema":1,"run_id":"1234567890abcdef1234567890abcdef","best":{"id":"50"},"rows":[{"id":"50","score":49.,"total":54}],
+            "primary":"50","accepted":false,"primary_changed":false,"validation_error":"Clean/sony: TLS 900 мс",
+            "strategy_names":{"50":"ALT11 белый 1"},"timings":{"50":{"tcp_ms":42.,"tls_ms":93.}},
+            "details":{"50":[{"group":"Clean","name":"sony","state":"OK","code":"302","tcp_ms":42.,"tls_ms":93.,"tries":2,"flaky":false}]}});
+        save_report(&app, &mut report).unwrap();
+        let path = PathBuf::from(report["report_file"].as_str().unwrap());
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(text.contains("sony") && text.contains("TCP 42 мс") && text.contains("TLS 93 мс"));
+        assert!(text.contains("Прежние настройки сохранены"));
+        let saved: Value = serde_json::from_slice(
+            &fs::read(root.path().join("runtime/test-native-last.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(saved["accepted"], false);
+        assert_eq!(saved["validation_error"], report["validation_error"]);
+        assert_eq!(saved["text_sha256"], sha256(text.as_bytes()));
+        assert!(
+            root.path()
+                .join("runtime/test-native-1234567890abcdef1234567890abcdef.json")
+                .is_file()
+        );
+        assert!(!root.path().join("runtime/settings.ini").exists());
+    }
+    #[test]
+    fn response_counts_show_real_answers_instead_of_the_half_credit_score() {
+        let mut recovered = row("OK");
+        recovered.flaky = true;
+        let timed_out = row("FREEZE");
+        let mut control = row("OK");
+        control.group = "Clean".into();
+        let absent = row("NA");
+        let rows = vec![recovered, timed_out, control, absent];
+        assert_eq!(availability(&rows), json!({"ok":1,"total":2}));
+        assert_eq!(summary("50", &rows, &BTreeMap::new()).ok, 0.5);
+    }
+    #[test]
+    fn one_unstable_trial_does_not_discard_other_confirmed_strategies() {
+        let rows = vec![
+            RankRow {
+                id: "13".into(),
+                score: 52.,
+                ..Default::default()
+            },
+            RankRow {
+                id: "58".into(),
+                score: 49.5,
+                ..Default::default()
+            },
+            RankRow {
+                id: "31".into(),
+                score: 49.,
+                ..Default::default()
+            },
+        ];
+        let quality = BTreeMap::from([
+            ("13".into(), false),
+            ("58".into(), true),
+            ("31".into(), true),
+        ]);
+        let qualified = qualified_scores(&rows, &quality);
+        assert_eq!(
+            qualified
+                .iter()
+                .map(|row| row.id.as_str())
+                .collect::<Vec<_>>(),
+            ["58", "31"]
+        );
+        assert_eq!(qualified[0].score, 49.5);
+    }
+    #[test]
+    fn missing_or_failed_control_evidence_never_qualifies_a_score() {
+        let rows = vec![RankRow {
+            id: "58".into(),
+            score: 49.5,
+            ..Default::default()
+        }];
+        assert!(qualified_scores(&rows, &BTreeMap::new()).is_empty());
+        assert!(qualified_scores(&rows, &BTreeMap::from([("58".into(), false)])).is_empty());
+    }
+
+    #[test]
+    fn quick_search_can_finish_when_a_strategy_opens_previously_blocked_targets() {
+        let mut blocked = row("FAIL");
+        blocked.tls_ms = 0.;
+        let mut clean = row("OK");
+        clean.group = "Clean".into();
+        assert!(fully_covered(
+            &[blocked.clone(), clean.clone()],
+            &[row("OK"), clean.clone()]
+        ));
+        assert!(!fully_covered(
+            &[blocked.clone(), clean.clone()],
+            &[row("FAIL"), clean.clone()]
+        ));
+        blocked.state = "NA".into();
+        assert!(!fully_covered(
+            &[blocked, clean.clone()],
+            &[row("OK"), clean]
+        ));
+    }
+    #[test]
+    fn family_normalization_retains_protocol_and_fooling_differences() {
+        let mut first = Strategy {
+            id: "12".into(),
+            ..Default::default()
+        };
+        first.sections.insert(
+            "general".into(),
+            vec!["--lua-desync=multisplit:pos=1,2:fooling=md5sig".into()],
+        );
+        let mut second = first.clone();
+        second.sections.get_mut("general").unwrap()[0] =
+            "--lua-desync=multisplit:pos=3,4:fooling=md5sig".into();
+        assert_eq!(family(&first), family(&second));
+        second.sections.get_mut("general").unwrap()[0] =
+            "--lua-desync=multisplit:pos=3,4:fooling=badsum".into();
+        assert_ne!(family(&first), family(&second));
+    }
+
+    fn observation(target: &Target) -> Value {
+        json!({"version":1,"worker_version":"fixture","id":target.id(),"url":target.url,
+            "stage":"Complete","termination":"Complete","error":null,"status_code":200,
+            "body_bytes":128,"received_body_bytes":128,"body_limit":65536,"body_complete":true,
+            "target_reached":false,"post_bytes":0,"request_body_bytes_provided":0,"request_body_measurement":"fixture",
+            "dns_source":"fixture","resolved_addresses":["127.0.0.1"],"tcp_attempts":[],"remote_address":"127.0.0.1:443",
+            "tls_backend":"Schannel","tls_profile":"fixture","trust_source":"System","certificate_validated":true,
+            "dns_ms":1.,"tcp_ms":2.,"tls_ms":3.,"headers_ms":4.,"started_ms":0.,"total_ms":15.})
+    }
+
+    #[test]
+    fn worker_batch_requires_one_complete_typed_observation_per_target() {
+        let target = Target {
+            group: "Clean".into(),
+            name: "fixture".into(),
+            url: "https://fixture.invalid/".into(),
+            post: false,
+        };
+        let value = observation(&target);
+        let bytes = serde_json::to_vec(&value).unwrap();
+        let targets = std::slice::from_ref(&target);
+        assert_eq!(
+            parse_observations(targets, &bytes, Utc::now()).unwrap()[0].state,
+            "OK"
+        );
+        assert!(parse_observations(targets, b"", Utc::now()).is_err());
+        let duplicate = format!("{value}\n{value}\n");
+        assert!(parse_observations(targets, duplicate.as_bytes(), Utc::now()).is_err());
+        for key in ["body_complete", "received_body_bytes", "tls_backend"] {
+            let mut missing = value.clone();
+            missing.as_object_mut().unwrap().remove(key);
+            assert!(
+                convert(&target, missing, Utc::now()).is_err(),
+                "missing {key}"
+            );
+        }
+        let mut foreign = value.clone();
+        foreign["id"] = json!("foreign");
+        assert!(
+            parse_observations(targets, &serde_json::to_vec(&foreign).unwrap(), Utc::now())
+                .is_err()
+        );
+        for termination in ["Cancelled", "Deadline", "Invented"] {
+            let mut interrupted = value.clone();
+            interrupted["termination"] = json!(termination);
+            assert!(
+                convert(&target, interrupted, Utc::now()).is_err(),
+                "{termination}"
+            );
+        }
+    }
+
+    #[test]
+    fn worker_success_requires_verified_tls_and_consistent_transfer_evidence() {
+        let target = Target {
+            group: "Clean".into(),
+            name: "fixture".into(),
+            url: "https://fixture.invalid/".into(),
+            post: false,
+        };
+        for (key, value) in [
+            ("body_complete", json!(false)),
+            ("certificate_validated", json!(false)),
+            ("target_reached", json!(true)),
+            ("received_body_bytes", json!(0)),
+            ("request_body_bytes_provided", json!(1)),
+            ("tls_ms", Value::Null),
+            ("total_ms", json!(-1)),
+        ] {
+            let mut invalid = observation(&target);
+            invalid[key] = value;
+            assert!(convert(&target, invalid, Utc::now()).is_err(), "{key}");
+        }
+        let mut bounded = observation(&target);
+        bounded["body_bytes"] = json!(65536);
+        bounded["received_body_bytes"] = json!(70000);
+        bounded["body_complete"] = json!(false);
+        bounded["target_reached"] = json!(true);
+        bounded["termination"] = json!("BodyLimit");
+        bounded["stage"] = json!("Body");
+        assert_eq!(convert(&target, bounded, Utc::now()).unwrap().state, "OK");
+    }
+
+    #[test]
+    fn engine_lifetime_covers_serial_warmup_and_retry_and_rejects_impossible_batches() {
+        let arguments = TestArgs {
+            parallel: Some(1),
+            timeout_ms: 5000,
+            ..Default::default()
+        };
+        let main = batch_budget(68, 1, 5000).unwrap();
+        assert!(main > 120000);
+        assert!(engine_budget(68, &arguments, true).unwrap() > main * 3);
+        assert!(batch_budget(256, 1, 60000).is_err());
+        assert!(batch_budget(0, 1, 5000).is_err());
+    }
+
+    #[test]
+    fn full_pick_defaults_use_wider_batches_without_overriding_explicit_parallelism() {
+        use clap::Parser;
+        let parse_test = |flags: &[&str]| {
+            let cli = crate::cli::Cli::try_parse_from(
+                ["zapret-rust", "test"]
+                    .into_iter()
+                    .chain(flags.iter().copied()),
+            )
+            .unwrap();
+            let Some(crate::cli::Action::Test(args)) = cli.action else {
+                panic!("expected test arguments");
+            };
+            args
+        };
+        let widths = |args: TestArgs| (args.parallel(), args.retry_parallel());
+        assert_eq!(widths(parse_test(&[])), (16, 4));
+        assert_eq!(widths(parse_test(&["--full"])), (32, 8));
+        assert_eq!(widths(parse_test(&["--full", "--parallel", "16"])), (16, 4));
+        assert_eq!(widths(parse_test(&["--full", "--parallel", "2"])), (2, 2));
+        assert_eq!(widths(parse_test(&["--full", "--parallel", "64"])), (64, 8));
+        assert!(updates_quick_history(&parse_test(&[])));
+        assert!(!updates_quick_history(&parse_test(&["--full"])));
+        assert!(updates_quick_history(&parse_test(&[
+            "--full",
+            "--parallel",
+            "16"
+        ])));
+        assert!(!updates_quick_history(&parse_test(&["--report-only"])));
+        assert_eq!(
+            widths(parse_test(&[
+                "--full",
+                "--compare-a",
+                "12",
+                "--compare-b",
+                "13"
+            ])),
+            (16, 4)
+        );
+        assert_eq!(
+            widths(TestArgs {
+                full: true,
+                ..Default::default()
+            }),
+            (32, 8)
+        );
+    }
+
+    #[test]
+    fn worker_clocks_must_share_the_captured_batch_origin() {
+        let mut rows = vec![row("OK")];
+        assert!(align_observations(&mut rows, 100., 110., 150.).is_err());
+        rows[0].raw = json!({"started_monotonic_ms":120.,"finished_monotonic_ms":130.});
+        align_observations(&mut rows, 100., 110., 150.).unwrap();
+        assert_eq!((rows[0].started_ms, rows[0].observed_ms), (20., 30.));
+        for (start, end) in [(109., 130.), (120., 151.), (130., 120.)] {
+            rows[0].raw = json!({"started_monotonic_ms":start,"finished_monotonic_ms":end});
+            assert!(align_observations(&mut rows, 100., 110., 150.).is_err());
+        }
+    }
+
+    #[test]
+    fn a_new_game_or_reused_pid_does_not_inherit_an_earlier_approval() {
+        let game = |pid, time| json!({"identity":{"pid":pid,"created_filetime":time,"executable":"C:/game.exe"}});
+        let allowed = game_identities(&json!([game(10, 20)])).unwrap();
+        assert!(
+            game_identities(&json!([game(10, 20)]))
+                .unwrap()
+                .is_subset(&allowed)
+        );
+        assert!(
+            !game_identities(&json!([game(10, 21)]))
+                .unwrap()
+                .is_subset(&allowed)
+        );
+        assert!(
+            !game_identities(&json!([game(11, 20)]))
+                .unwrap()
+                .is_subset(&allowed)
+        );
+        assert!(game_identities(&json!([{"pid":10,"identity":null}])).is_err());
+    }
+    #[test]
+    fn published_selection_reports_the_actual_primary_after_checked_fallback() {
+        let mut actual = Settings::default();
+        actual.set("alt", "12").unwrap();
+        let mut report = json!({"accepted":true,"primary_changed":true,"primary":"13"});
+        reconcile_restart(
+            &mut report,
+            &actual,
+            Ok(Some(&json!({"running":true,"restored":true}))),
+        );
+        assert_eq!(report["primary"], "12");
+        assert_eq!(report["primary_requested"], "13");
+        assert_eq!(report["primary_changed"], false);
+        assert_eq!(report["accepted"], true);
+        reconcile_restart(&mut report, &actual, Err("start refused".into()));
+        assert_eq!(report["running_restored"], false);
+        assert_eq!(report["startup_error"], "start refused");
+        assert_eq!(report["primary_requested"], "13");
+    }
+    #[test]
+    fn explicit_apply_starts_an_accepted_unchanged_primary_and_never_starts_rejected_results() {
+        let mut arguments = TestArgs {
+            apply: true,
+            ..Default::default()
+        };
+        let mut actual = Settings::default();
+        actual.set("alt", "50").unwrap();
+        let mut report = json!({"accepted":true,"primary_changed":false,"primary":"50"});
+        assert!(selection_start_requested(&arguments, &report));
+        reconcile_restart(&mut report, &actual, Ok(Some(&json!({"running":true}))));
+        assert_eq!(report["startup"]["running"], true);
+
+        report["accepted"] = json!(false);
+        assert!(!selection_start_requested(&arguments, &report));
+        report["accepted"] = json!(true);
+        arguments.apply = false;
+        assert!(!selection_start_requested(&arguments, &report));
+        report["primary_changed"] = json!(true);
+        assert!(selection_start_requested(&arguments, &report));
+        arguments.report_only = true;
+        assert!(!selection_start_requested(&arguments, &report));
+    }
+    #[test]
+    fn learning_from_one_strategy_does_not_enter_the_next_trial() {
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir(root.path().join("lists")).unwrap();
+        let path = root.path().join("lists/autohostlist.txt");
+        fs::write(&path, b"# original private seed\r\nknown.example\r\n").unwrap();
+        capture_trial_autolist(root.path()).unwrap();
+        fs::write(&path, b"learned-by-previous-strategy.example\n").unwrap();
+        reset_trial_autolist(root.path()).unwrap();
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            b"# original private seed\r\nknown.example\r\n"
+        );
+    }
+
+    #[test]
+    fn recorded_control_failure_keeps_eight_confirmed_results_and_the_best_candidate() {
+        let fixture: Value =
+            serde_json::from_str(include_str!("../tests/fixtures/selection-controls.json"))
+                .unwrap();
+        let targets: Vec<_> = fixture["targets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|name| {
+                let name = name.as_str().unwrap();
+                Target {
+                    group: "Clean".into(),
+                    name: name.into(),
+                    url: format!("https://{name}.invalid/"),
+                    post: false,
+                }
+            })
+            .collect();
+        let rows = |values: &Value| {
+            values
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|value| {
+                    let mut row = row(value["state"].as_str().unwrap());
+                    row.group = "Clean".into();
+                    row.name = value["name"].as_str().unwrap().into();
+                    row.url = format!("https://{}.invalid/", row.name);
+                    row.tls_ms = value["tls_ms"].as_f64().unwrap();
+                    row
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut quality = BTreeMap::new();
+        let mut failures = Vec::new();
+        for trial in fixture["trials"].as_array().unwrap() {
+            let reasons =
+                control_failures(&targets, &rows(&trial["before"]), &rows(&trial["after"]));
+            quality.insert(trial["id"].as_str().unwrap().to_owned(), reasons.is_empty());
+            failures.extend(reasons);
+        }
+        let scores: Vec<_> = fixture["scores"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|score| RankRow {
+                id: score["id"].as_str().unwrap().into(),
+                score: score["score"].as_f64().unwrap(),
+                ..Default::default()
+            })
+            .collect();
+        let qualified = qualified_scores(&scores, &quality);
+        assert_eq!(qualified.len(), 8);
+        assert_eq!(qualified[0].id, "58");
+        assert_eq!(quality.get("50"), Some(&false));
+        assert!(failures.iter().any(|reason| reason.contains("bing")));
+        assert!(!qualified.iter().any(|row| row.id == "50" || row.id == "13"));
+    }
+
+    #[test]
+    fn control_assessment_rejects_missing_samples_and_invalid_tls_timings() {
+        let target = Target {
+            group: "Clean".into(),
+            name: "fixture".into(),
+            url: "https://example.com/".into(),
+            post: false,
+        };
+        let targets = [
+            target.clone(),
+            Target {
+                name: "second".into(),
+                ..target
+            },
+        ];
+        assert!(!control_failures(&targets, &[], &[]).is_empty());
+        let rows: Vec<_> = targets
+            .iter()
+            .cycle()
+            .take(4)
+            .map(|target| {
+                let mut row = row("OK");
+                row.group = target.group.clone();
+                row.name = target.name.clone();
+                row.url = target.url.clone();
+                row
+            })
+            .collect();
+        assert!(control_failures(&targets, &rows, &rows).is_empty());
+        for time in [0., f64::NAN, 1000.] {
+            let mut changed = rows.clone();
+            changed[0].tls_ms = time;
+            changed[2].tls_ms = time;
+            assert!(!control_failures(&targets, &rows, &changed).is_empty());
+        }
+    }
+    #[test]
+    fn skipped_rounds_do_not_duplicate_an_earlier_strategy_measurement() {
+        let mut table = BTreeMap::from([
+            ("12".into(), vec![row("OK")]),
+            ("13".into(), vec![row("FAIL")]),
+        ]);
+        let mut sums = BTreeMap::new();
+        collect_round_summaries(
+            &table,
+            &BTreeSet::from(["12".into(), "13".into()]),
+            &BTreeMap::new(),
+            &mut sums,
+        )
+        .unwrap();
+        table.insert("13".into(), vec![row("OK")]);
+        collect_round_summaries(
+            &table,
+            &BTreeSet::from(["13".into()]),
+            &BTreeMap::new(),
+            &mut sums,
+        )
+        .unwrap();
+        assert_eq!(sums["12"].len(), 1);
+        assert_eq!(sums["13"].len(), 2);
+        assert_eq!(sums["13"][0].score, 0.);
+        assert_eq!(sums["13"][1].score, 1.);
+    }
+}

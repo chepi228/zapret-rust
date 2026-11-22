@@ -1,0 +1,1290 @@
+{
+  "description": "Recorded control timings/status only; no addresses, URLs or machine identities.",
+  "targets": [
+    "adobe",
+    "bing",
+    "akamai"
+  ],
+  "trials": [
+    {
+      "id": "31",
+      "before": [
+        {
+          "name": "adobe",
+          "state": "OK",
+          "tls_ms": 70.02420000000001
+        },
+        {
+          "name": "bing",
+          "state": "OK",
+          "tls_ms": 66.1563
+        },
+        {
+          "name": "akamai",
+          "state": "OK",
+          "tls_ms": 2091.6873
+        },
+        {
+          "name": "adobe",
+          "state": "OK",
+          "tls_ms": 83.1883
+        },
+        {
+          "name": "bing",
+          "state": "OK",
+          "tls_ms": 80.46509999999999
+        },
+        {
+          "name": "akamai",
+          "state": "OK",
+          "tls_ms": 2082.6267000000003
+        }
+      ],
+      "after": [
+        {
+          "name": "bing",
+          "state": "OK",
+          "tls_ms": 92.562
+        },
+        {
+          "name": "adobe",
+          "state": "OK",
+          "tls_ms": 202.997
+        },
+        {
+          "name": "akamai",
+          "state": "OK",
+          "tls_ms": 2104.281
+        },
+        {
+          "name": "adobe",
+          "state": "OK",
+          "tls_ms": 73.7233
+        },
+        {
+          "name": "bing",
+          "state": "OK",
+          "tls_ms": 71.03479999999999
+        },
+        {
+          "name": "akamai",
+          "state": "OK",
+          "tls_ms": 2110.4282
+        }
+      ]
+    },
+    {
+      "id": "21",
+      "before": [
+        {
+          "name": "adobe",
+          "state": "OK",
+          "tls_ms": 96.41350000000001
+        },
+        {
+          "name": "bing",
+          "state": "OK",
+          "tls_ms": 68.5225
+        },
+        {
+          "name": "akamai",
+          "state": "OK",
+          "tls_ms": 2100.9001999999996
+        },
+        {
+          "name": "adobe",
+          "state": "OK",
+          "tls_ms": 70.44839999999999
+        },
+        {
+          "name": "bing",
+          "state": "OK",
+          "tls_ms": 64.66669999999999
+        },
+        {
+          "name": "akamai",
+          "state": "OK",
+          "tls_ms": 2104.8994000000002
+        }
+      ],
+      "after": [
+        {
+          "name": "adobe",
+          "state": "OK",
+          "tls_ms": 80.8513
+        },
+        {
+          "name": "akamai",
+          "state": "OK",
+          "tls_ms": 2146.7677000000003
+        },
+        {
+          "name": "bing",
+          "state": "FAIL",
+          "tls_ms": 0.0
+        },
+        {
+          "name": "adobe",
+          "state": "OK",
+          "tls_ms": 52.7569
+        },
+        {
+          "name": "akamai",
+          "state": "OK",
+          "tls_ms": 2114.2355999999995
+        },
+        {
+          "name": "bing",
+          "state": "FAIL",
+          "tls_ms": 0.0
+        }
+      ]
+    },
+    {
+      "id": "23",
+      "before": [
+        {
+          "name": "adobe",
+          "state": "OK",
+          "tls_ms": 75.35589999999999
+        },
+        {
+          "name": "akamai",
+          "state": "OK",
+          "tls_ms": 2097.0872000000004
+        },
+        {
+          "name": "bing",
+          "state": "FAIL",
+          "tls_ms": 0.0
+        },
+        {
+          "name": "adobe",
+          "state": "OK",
+          "tls_ms": 66.6625
+        },
+        {
+          "name": "akamai",
+          "state": "OK",
+          "tls_ms": 2112.0046
+        },
+        {
+          "name": "bing",
+          "state": "FAIL",
+          "tls_ms": 0.0
+        }
+      ],
+      "after": [
+        {
+          "name": "adobe",
+          "state": "OK",
+          "tls_ms": 78.4844
+        },
+        {
+          "name": "akamai",
+          "state": "OK",
+          "tls_ms": 2145.0848
+        },
+        {
+          "name": "bing",
+          "state": "FAIL",
+          "tls_ms": 0.0
+        },
+        {
+          "name": "adobe",
+          "state": "OK",
+          "tls_ms": 65.8519
+        },
+        {
+          "name": "akamai",
+          "state": "OK",
+          "tls_ms": 2086.7886
+        },
+        {
+          "name": "bing",
+          "state": "FAIL",
+          "tls_ms": 0.0
+        }
+      ]
+    },
+    {
+      "id": "22",
+      "before": [
+        {
+          "name": "adobe",
+          "state": "OK",
+          "tls_ms": 75.8518
+        },
+        {
+          "name": "akamai",
+          "state": "OK",
+          "tls_ms": 2097.8783000000003
+        },
+        {
+          "name": "bing",
+          "state": "FAIL",
+          "tls_ms": 0.0
+        },
+        {
+          "name": "adobe",
+          "state": "OK",
+          "tls_ms": 74.8907
+        },
+        {
+          "name": "akamai",
+          "state": "OK",
+          "tls_ms": 2103.6684000000005
+        },
+        {
+          "name": "bing",
+          "state": "FAIL",
+          "tls_ms": 0.0
+        }
+      ],
+      "after": [
+        {
+          "name": "adobe",
+          "state": "OK",
+          "tls_ms": 106.46950000000001
+        },
+        {
+          "name": "akamai",
+          "state": "OK",
+          "tls_ms": 2156.9695
+        },
+        {
+          "name": "bing",
+          "state": "FAIL",
+          "tls_ms": 0.0
+        },
+        {
+          "name": "adobe",
+          "state": "OK",
+          "tls_ms": 72.7149
+        },
+        {
+          "name": "akamai",
+          "state": "OK",
+          "tls_ms": 2110.6594000000005
+        },
+        {
+          "name": "bing",
+          "state": "FAIL",
+          "tls_ms": 0.0
+        }
+      ]
+    },
+    {
+      "id": "11",
+      "before": [
+        {
+          "name": "adobe",
+          "state": "OK",
+          "tls_ms": 80.76910000000001
+        },
+        {
+          "name": "akamai",
+          "state": "OK",
+          "tls_ms": 2150.5553
+        },
+        {
+          "name": "bing",
+          "state": "FAIL",
+          "tls_ms": 0.0
+        },
+        {
+          "name": "adobe",
+          "state": "OK",
+          "tls_ms": 69.6474
+        },
+        {
+          "name": "akamai",
+          "state": "OK",
+          "tls_ms": 2083.6393
+        },
+        {
+          "name": "bing",
+          "state": "FAIL",
+          "tls_ms": 0.0
+        }
+      ],
+      "after": [
+        {
+          "name": "adobe",
+          "state": "OK",
+          "tls_ms": 69.3401
+        },
+        {
+          "name": "akamai",
+          "state": "OK",
+          "tls_ms": 2096.7926999999995
+        },
+        {
+          "name": "bing",
+          "state": "FAIL",
+          "tls_ms": 0.0
+        },
+        {
+          "name": "adobe",
+          "state": "OK",
+          "tls_ms": 70.53139999999999
+        },
+        {
+          "name": "akamai",
+          "state": "OK",
+          "tls_ms": 2127.6369999999997
+        },
+        {
+          "name": "bing",
+          "state": "FAIL",
+          "tls_ms": 0.0
+        }
+      ]
+    },
+    {
+      "id": "51",
+      "before": [
+        {
+          "name": "adobe",
+          "state": "OK",
+          "tls_ms": 115.0727
+        },
+        {
+          "name": "akamai",
+          "state": "OK",
+          "tls_ms": 2159.0187
+        },
+        {
+          "name": "bing",
+          "state": "FAIL",
+          "tls_ms": 0.0
+        },
+        {
+          "name": "adobe",
+          "state": "OK",
+          "tls_ms": 55.4826
+        },
+        {
+          "name": "akamai",
+          "state": "OK",
+          "tls_ms": 2124.9717
+        },
+        {
+          "name": "bing",
+          "state": "FAIL",
+          "tls_ms": 0.0
+        }
+      ],
+      "after": [
+        {
+          "name": "adobe",
+          "state": "OK",
+          "tls_ms": 89.2037
+        },
+        {
+          "name": "akamai",
+          "state": "OK",
+          "tls_ms": 2155.8637000000003
+        },
+        {
+          "name": "bing",
+          "state": "FAIL",
+          "tls_ms": 0.0
+        },
+        {
+          "name": "adobe",
+          "state": "OK",
+          "tls_ms": 69.97220000000002
+        },
+        {
+          "name": "akamai",
+          "state": "OK",
+          "tls_ms": 2076.9539
+        },
+        {
+          "name": "bing",
+          "state": "FAIL",
+          "tls_ms": 0.0
+        }
+      ]
+    },
+    {
+      "id": "13",
+      "before": [
+        {
+          "name": "adobe",
+          "state": "OK",
+          "tls_ms": 99.90520000000001
+        },
+        {
+          "name": "akamai",
+          "state": "OK",
+          "tls_ms": 2132.6546000000003
+        },
+        {
+          "name": "bing",
+          "state": "FAIL",
+          "tls_ms": 0.0
+        },
+        {
+          "name": "adobe",
+          "state": "OK",
+          "tls_ms": 72.5684
+        },
+        {
+          "name": "akamai",
+          "state": "OK",
+          "tls_ms": 2142.5062000000003
+        },
+        {
+          "name": "bing",
+          "state": "FAIL",
+          "tls_ms": 0.0
+        }
+      ],
+      "after": [
+        {
+          "name": "adobe",
+          "state": "OK",
+          "tls_ms": 77.8565
+        },
+        {
+          "name": "akamai",
+          "state": "OK",
+          "tls_ms": 2133.7971
+        },
+        {
+          "name": "bing",
+          "state": "FAIL",
+          "tls_ms": 0.0
+        },
+        {
+          "name": "adobe",
+          "state": "OK",
+          "tls_ms": 73.24549999999999
+        },
+        {
+          "name": "akamai",
+          "state": "OK",
+          "tls_ms": 2107.3451
+        },
+        {
+          "name": "bing",
+          "state": "FAIL",
+          "tls_ms": 0.0
+        }
+      ]
+    },
+    {
+      "id": "50",
+      "before": [
+        {
+          "name": "adobe",
+          "state": "OK",
+          "tls_ms": 106.51310000000001
+        },
+        {
+          "name": "akamai",
+          "state": "OK",
+          "tls_ms": 2098.7201999999997
+        },
+        {
+          "name": "bing",
+          "state": "FAIL",
+          "tls_ms": 0.0
+        },
+        {
+          "name": "adobe",
+          "state": "OK",
+          "tls_ms": 83.11359999999999
+        },
+        {
+          "name": "akamai",
+          "state": "OK",
+          "tls_ms": 2107.6593000000003
+        },
+        {
+          "name": "bing",
+          "state": "FAIL",
+          "tls_ms": 0.0
+        }
+      ],
+      "after": [
+        {
+          "name": "adobe",
+          "state": "OK",
+          "tls_ms": 2085.0991
+        },
+        {
+          "name": "akamai",
+          "state": "OK",
+          "tls_ms": 2083.0448
+        },
+        {
+          "name": "bing",
+          "state": "FAIL",
+          "tls_ms": 0.0
+        },
+        {
+          "name": "adobe",
+          "state": "OK",
+          "tls_ms": 2068.6452
+        },
+        {
+          "name": "akamai",
+          "state": "OK",
+          "tls_ms": 2122.1942
+        },
+        {
+          "name": "bing",
+          "state": "FAIL",
+          "tls_ms": 0.0
+        }
+      ]
+    },
+    {
+      "id": "71",
+      "before": [
+        {
+          "name": "adobe",
+          "state": "OK",
+          "tls_ms": 2100.5403999999994
+        },
+        {
+          "name": "akamai",
+          "state": "OK",
+          "tls_ms": 2098.1312
+        },
+        {
+          "name": "bing",
+          "state": "FAIL",
+          "tls_ms": 0.0
+        },
+        {
+          "name": "adobe",
+          "state": "OK",
+          "tls_ms": 2095.6509
+        },
+        {
+          "name": "akamai",
+          "state": "OK",
+          "tls_ms": 2093.5311
+        },
+        {
+          "name": "bing",
+          "state": "FAIL",
+          "tls_ms": 0.0
+        }
+      ],
+      "after": [
+        {
+          "name": "adobe",
+          "state": "OK",
+          "tls_ms": 68.87559999999999
+        },
+        {
+          "name": "akamai",
+          "state": "OK",
+          "tls_ms": 2106.6644
+        },
+        {
+          "name": "bing",
+          "state": "FAIL",
+          "tls_ms": 0.0
+        },
+        {
+          "name": "adobe",
+          "state": "OK",
+          "tls_ms": 53.0947
+        },
+        {
+          "name": "akamai",
+          "state": "OK",
+          "tls_ms": 2103.0054
+        },
+        {
+          "name": "bing",
+          "state": "FAIL",
+          "tls_ms": 0.0
+        }
+      ]
+    },
+    {
+      "id": "10",
+      "before": [
+        {
+          "name": "adobe",
+          "state": "OK",
+          "tls_ms": 78.1344
+        },
+        {
+          "name": "akamai",
+          "state": "OK",
+          "tls_ms": 2102.8487
+        },
+        {
+          "name": "bing",
+          "state": "FAIL",
+          "tls_ms": 0.0
+        },
+        {
+          "name": "adobe",
+          "state": "OK",
+          "tls_ms": 68.2508
+        },
+        {
+          "name": "akamai",
+          "state": "OK",
+          "tls_ms": 2142.9926000000005
+        },
+        {
+          "name": "bing",
+          "state": "FAIL",
+          "tls_ms": 0.0
+        }
+      ],
+      "after": [
+        {
+          "name": "adobe",
+          "state": "OK",
+          "tls_ms": 124.68900000000001
+        },
+        {
+          "name": "akamai",
+          "state": "OK",
+          "tls_ms": 2100.1665
+        },
+        {
+          "name": "bing",
+          "state": "FAIL",
+          "tls_ms": 0.0
+        },
+        {
+          "name": "adobe",
+          "state": "OK",
+          "tls_ms": 71.3062
+        },
+        {
+          "name": "akamai",
+          "state": "OK",
+          "tls_ms": 2128.4092
+        },
+        {
+          "name": "bing",
+          "state": "FAIL",
+          "tls_ms": 0.0
+        }
+      ]
+    },
+    {
+      "id": "70",
+      "before": [
+        {
+          "name": "adobe",
+          "state": "OK",
+          "tls_ms": 57.759
+        },
+        {
+          "name": "akamai",
+          "state": "OK",
+          "tls_ms": 2101.1704
+        },
+        {
+          "name": "bing",
+          "state": "FAIL",
+          "tls_ms": 0.0
+        },
+        {
+          "name": "adobe",
+          "state": "OK",
+          "tls_ms": 78.3211
+        },
+        {
+          "name": "akamai",
+          "state": "OK",
+          "tls_ms": 2086.182
+        },
+        {
+          "name": "bing",
+          "state": "FAIL",
+          "tls_ms": 0.0
+        }
+      ],
+      "after": [
+        {
+          "name": "adobe",
+          "state": "OK",
+          "tls_ms": 78.5104
+        },
+        {
+          "name": "akamai",
+          "state": "OK",
+          "tls_ms": 80.62440000000001
+        },
+        {
+          "name": "bing",
+          "state": "FAIL",
+          "tls_ms": 0.0
+        },
+        {
+          "name": "adobe",
+          "state": "OK",
+          "tls_ms": 74.2654
+        },
+        {
+          "name": "akamai",
+          "state": "OK",
+          "tls_ms": 77.3545
+        },
+        {
+          "name": "bing",
+          "state": "OK",
+          "tls_ms": 112.91300000000001
+        }
+      ]
+    },
+    {
+      "id": "42",
+      "before": [
+        {
+          "name": "adobe",
+          "state": "OK",
+          "tls_ms": 66.71770000000001
+        },
+        {
+          "name": "akamai",
+          "state": "OK",
+          "tls_ms": 89.1462
+        },
+        {
+          "name": "bing",
+          "state": "OK",
+          "tls_ms": 106.3229
+        },
+        {
+          "name": "adobe",
+          "state": "OK",
+          "tls_ms": 74.9524
+        },
+        {
+          "name": "akamai",
+          "state": "OK",
+          "tls_ms": 98.1517
+        },
+        {
+          "name": "bing",
+          "state": "OK",
+          "tls_ms": 96.23939999999999
+        }
+      ],
+      "after": [
+        {
+          "name": "adobe",
+          "state": "OK",
+          "tls_ms": 89.2968
+        },
+        {
+          "name": "akamai",
+          "state": "OK",
+          "tls_ms": 123.4465
+        },
+        {
+          "name": "bing",
+          "state": "OK",
+          "tls_ms": 86.6396
+        },
+        {
+          "name": "adobe",
+          "state": "OK",
+          "tls_ms": 73.1626
+        },
+        {
+          "name": "akamai",
+          "state": "OK",
+          "tls_ms": 81.84299999999999
+        },
+        {
+          "name": "bing",
+          "state": "OK",
+          "tls_ms": 79.889
+        }
+      ]
+    },
+    {
+      "id": "41",
+      "before": [
+        {
+          "name": "adobe",
+          "state": "OK",
+          "tls_ms": 53.9095
+        },
+        {
+          "name": "akamai",
+          "state": "OK",
+          "tls_ms": 75.27369999999999
+        },
+        {
+          "name": "bing",
+          "state": "OK",
+          "tls_ms": 72.2912
+        },
+        {
+          "name": "adobe",
+          "state": "OK",
+          "tls_ms": 72.3306
+        },
+        {
+          "name": "akamai",
+          "state": "OK",
+          "tls_ms": 77.6353
+        },
+        {
+          "name": "bing",
+          "state": "OK",
+          "tls_ms": 83.3126
+        }
+      ],
+      "after": [
+        {
+          "name": "adobe",
+          "state": "OK",
+          "tls_ms": 79.9984
+        },
+        {
+          "name": "akamai",
+          "state": "OK",
+          "tls_ms": 77.7082
+        },
+        {
+          "name": "bing",
+          "state": "OK",
+          "tls_ms": 83.712
+        },
+        {
+          "name": "adobe",
+          "state": "OK",
+          "tls_ms": 69.491
+        },
+        {
+          "name": "akamai",
+          "state": "OK",
+          "tls_ms": 75.6806
+        },
+        {
+          "name": "bing",
+          "state": "OK",
+          "tls_ms": 111.13810000000001
+        }
+      ]
+    },
+    {
+      "id": "12",
+      "before": [
+        {
+          "name": "adobe",
+          "state": "OK",
+          "tls_ms": 74.11789999999999
+        },
+        {
+          "name": "akamai",
+          "state": "OK",
+          "tls_ms": 78.8048
+        },
+        {
+          "name": "bing",
+          "state": "OK",
+          "tls_ms": 82.4848
+        },
+        {
+          "name": "adobe",
+          "state": "OK",
+          "tls_ms": 73.238
+        },
+        {
+          "name": "bing",
+          "state": "OK",
+          "tls_ms": 80.6651
+        },
+        {
+          "name": "akamai",
+          "state": "OK",
+          "tls_ms": 123.1124
+        }
+      ],
+      "after": [
+        {
+          "name": "adobe",
+          "state": "OK",
+          "tls_ms": 67.7732
+        },
+        {
+          "name": "akamai",
+          "state": "OK",
+          "tls_ms": 76.1541
+        },
+        {
+          "name": "bing",
+          "state": "OK",
+          "tls_ms": 74.2639
+        },
+        {
+          "name": "adobe",
+          "state": "OK",
+          "tls_ms": 66.977
+        },
+        {
+          "name": "akamai",
+          "state": "OK",
+          "tls_ms": 69.117
+        },
+        {
+          "name": "bing",
+          "state": "OK",
+          "tls_ms": 92.6976
+        }
+      ]
+    },
+    {
+      "id": "32",
+      "before": [
+        {
+          "name": "adobe",
+          "state": "OK",
+          "tls_ms": 59.4304
+        },
+        {
+          "name": "akamai",
+          "state": "OK",
+          "tls_ms": 69.1658
+        },
+        {
+          "name": "bing",
+          "state": "OK",
+          "tls_ms": 77.7753
+        },
+        {
+          "name": "adobe",
+          "state": "OK",
+          "tls_ms": 68.8292
+        },
+        {
+          "name": "akamai",
+          "state": "OK",
+          "tls_ms": 85.6968
+        },
+        {
+          "name": "bing",
+          "state": "OK",
+          "tls_ms": 106.7072
+        }
+      ],
+      "after": [
+        {
+          "name": "adobe",
+          "state": "OK",
+          "tls_ms": 79.1751
+        },
+        {
+          "name": "akamai",
+          "state": "OK",
+          "tls_ms": 83.817
+        },
+        {
+          "name": "bing",
+          "state": "OK",
+          "tls_ms": 87.40110000000001
+        },
+        {
+          "name": "adobe",
+          "state": "OK",
+          "tls_ms": 71.9302
+        },
+        {
+          "name": "akamai",
+          "state": "OK",
+          "tls_ms": 80.09100000000001
+        },
+        {
+          "name": "bing",
+          "state": "OK",
+          "tls_ms": 78.2235
+        }
+      ]
+    },
+    {
+      "id": "58",
+      "before": [
+        {
+          "name": "adobe",
+          "state": "OK",
+          "tls_ms": 97.8854
+        },
+        {
+          "name": "bing",
+          "state": "OK",
+          "tls_ms": 78.27770000000001
+        },
+        {
+          "name": "akamai",
+          "state": "OK",
+          "tls_ms": 122.7077
+        },
+        {
+          "name": "adobe",
+          "state": "OK",
+          "tls_ms": 79.15629999999999
+        },
+        {
+          "name": "bing",
+          "state": "OK",
+          "tls_ms": 76.5697
+        },
+        {
+          "name": "akamai",
+          "state": "OK",
+          "tls_ms": 99.0502
+        }
+      ],
+      "after": [
+        {
+          "name": "adobe",
+          "state": "OK",
+          "tls_ms": 96.9306
+        },
+        {
+          "name": "akamai",
+          "state": "OK",
+          "tls_ms": 91.3509
+        },
+        {
+          "name": "bing",
+          "state": "OK",
+          "tls_ms": 119.9628
+        },
+        {
+          "name": "adobe",
+          "state": "OK",
+          "tls_ms": 85.0132
+        },
+        {
+          "name": "akamai",
+          "state": "OK",
+          "tls_ms": 89.6892
+        },
+        {
+          "name": "bing",
+          "state": "OK",
+          "tls_ms": 112.8315
+        }
+      ]
+    },
+    {
+      "id": "60",
+      "before": [
+        {
+          "name": "adobe",
+          "state": "OK",
+          "tls_ms": 72.4435
+        },
+        {
+          "name": "akamai",
+          "state": "OK",
+          "tls_ms": 78.6665
+        },
+        {
+          "name": "bing",
+          "state": "OK",
+          "tls_ms": 82.4665
+        },
+        {
+          "name": "adobe",
+          "state": "OK",
+          "tls_ms": 88.5373
+        },
+        {
+          "name": "akamai",
+          "state": "OK",
+          "tls_ms": 90.56620000000001
+        },
+        {
+          "name": "bing",
+          "state": "OK",
+          "tls_ms": 203.389
+        }
+      ],
+      "after": [
+        {
+          "name": "adobe",
+          "state": "OK",
+          "tls_ms": 114.27799999999999
+        },
+        {
+          "name": "akamai",
+          "state": "OK",
+          "tls_ms": 87.88839999999999
+        },
+        {
+          "name": "bing",
+          "state": "OK",
+          "tls_ms": 85.2639
+        },
+        {
+          "name": "adobe",
+          "state": "OK",
+          "tls_ms": 83.97800000000001
+        },
+        {
+          "name": "bing",
+          "state": "OK",
+          "tls_ms": 110.03450000000001
+        },
+        {
+          "name": "akamai",
+          "state": "OK",
+          "tls_ms": 120.5913
+        }
+      ]
+    },
+    {
+      "id": "52",
+      "before": [
+        {
+          "name": "adobe",
+          "state": "OK",
+          "tls_ms": 96.52519999999998
+        },
+        {
+          "name": "akamai",
+          "state": "OK",
+          "tls_ms": 100.83189999999999
+        },
+        {
+          "name": "bing",
+          "state": "OK",
+          "tls_ms": 109.5279
+        },
+        {
+          "name": "adobe",
+          "state": "OK",
+          "tls_ms": 81.2586
+        },
+        {
+          "name": "akamai",
+          "state": "OK",
+          "tls_ms": 79.4445
+        },
+        {
+          "name": "bing",
+          "state": "OK",
+          "tls_ms": 76.936
+        }
+      ],
+      "after": [
+        {
+          "name": "adobe",
+          "state": "OK",
+          "tls_ms": 79.0784
+        },
+        {
+          "name": "akamai",
+          "state": "OK",
+          "tls_ms": 84.7774
+        },
+        {
+          "name": "bing",
+          "state": "OK",
+          "tls_ms": 119.4246
+        },
+        {
+          "name": "adobe",
+          "state": "OK",
+          "tls_ms": 82.4574
+        },
+        {
+          "name": "akamai",
+          "state": "OK",
+          "tls_ms": 76.82839999999999
+        },
+        {
+          "name": "bing",
+          "state": "OK",
+          "tls_ms": 80.5419
+        }
+      ]
+    }
+  ],
+  "scores": [
+    {
+      "id": "58",
+      "score": 49.5
+    },
+    {
+      "id": "50",
+      "score": 49.0
+    },
+    {
+      "id": "31",
+      "score": 49.0
+    },
+    {
+      "id": "60",
+      "score": 49.0
+    },
+    {
+      "id": "52",
+      "score": 48.5
+    },
+    {
+      "id": "32",
+      "score": 48.0
+    },
+    {
+      "id": "51",
+      "score": 47.0
+    },
+    {
+      "id": "10",
+      "score": 45.0
+    },
+    {
+      "id": "12",
+      "score": 44.0
+    },
+    {
+      "id": "11",
+      "score": 44.0
+    },
+    {
+      "id": "70",
+      "score": 40.5
+    },
+    {
+      "id": "71",
+      "score": 40.5
+    },
+    {
+      "id": "42",
+      "score": 37.0
+    },
+    {
+      "id": "41",
+      "score": 36.0
+    },
+    {
+      "id": "23",
+      "score": 32.0
+    },
+    {
+      "id": "21",
+      "score": 15.0
+    },
+    {
+      "id": "13",
+      "score": 13.0
+    },
+    {
+      "id": "22",
+      "score": 12.0
+    }
+  ]
+}

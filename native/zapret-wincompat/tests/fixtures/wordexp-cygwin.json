@@ -1,0 +1,884 @@
+{
+  "source": {
+    "cygwin": "3.6.12-1",
+    "bash": "5.2.21-1",
+    "flags": "WRDE_NOCMD",
+    "configuration_preprocessing": "nfqws replaces CR/LF/TAB in config with spaces before wordexp. The line-continuation case exercises the underlying parser directly.",
+    "captured": "2026-11-14"
+  },
+  "variables": {
+    "ZAPRET_TEST_WORDS": "  alpha  beta \t gamma ",
+    "ZAPRET_TEST_EMPTY": "",
+    "ZAPRET_TEST_ONE": "word",
+    "ZAPRET_TEST_PATH": "directory with spaces",
+    "ZAPRET_TEST_PATTERN": "*.txt",
+    "ZAPRET_TEST_NUMBER": "9",
+    "HOME": "/fixture/home",
+    "OLDPWD": "/fixture/previous",
+    "USER": "wordexp",
+    "ZAPRET_TEST_PHRASE": "one and two"
+  },
+  "files": [
+    "a.txt",
+    "b.txt",
+    ".hidden.txt",
+    "space name.txt",
+    "one.rs",
+    "目录/файл.txt"
+  ],
+  "cases": [
+    {
+      "name": "empty",
+      "input": "",
+      "status": 1,
+      "words": []
+    },
+    {
+      "name": "space",
+      "input": "x --dry-run --wf-tcp-out=80,443",
+      "status": 0,
+      "words": [
+        "x",
+        "--dry-run",
+        "--wf-tcp-out=80,443"
+      ]
+    },
+    {
+      "name": "quotes",
+      "input": "x 'a b' \"c d\" a\\ b '' \"\"",
+      "status": 0,
+      "words": [
+        "x",
+        "a b",
+        "c d",
+        "a b",
+        "",
+        ""
+      ]
+    },
+    {
+      "name": "adjacent-quotes",
+      "input": "x pre'fix'\"ed\"",
+      "status": 0,
+      "words": [
+        "x",
+        "prefixed"
+      ]
+    },
+    {
+      "name": "windows-paths",
+      "input": "x \"C:\\a\\b\\c\" C:\\a\\b",
+      "status": 0,
+      "words": [
+        "x",
+        "C:\\a\\b\\c",
+        "C:ab"
+      ]
+    },
+    {
+      "name": "double-escapes",
+      "input": "x \"a\\\\b\\\"c\\$d\\`e\" \"\\q\"",
+      "status": 0,
+      "words": [
+        "x",
+        "a\\b\"c$d`e",
+        "\\q"
+      ]
+    },
+    {
+      "name": "comments",
+      "input": "x abc#literal # ignored tail",
+      "status": 0,
+      "words": [
+        "x",
+        "abc#literal"
+      ]
+    },
+    {
+      "name": "metacharacters",
+      "input": "x 'a;&|(){}[]<>*'",
+      "status": 0,
+      "words": [
+        "x",
+        "a;&|(){}[]<>*"
+      ]
+    },
+    {
+      "name": "semicolon",
+      "input": "x a; b",
+      "status": 1,
+      "words": []
+    },
+    {
+      "name": "pipe",
+      "input": "x a | b",
+      "status": 1,
+      "words": []
+    },
+    {
+      "name": "ampersand",
+      "input": "x a& b",
+      "status": 1,
+      "words": []
+    },
+    {
+      "name": "parenthesis",
+      "input": "x (a)",
+      "status": 5,
+      "words": []
+    },
+    {
+      "name": "redirect-in",
+      "input": "x < abc tail",
+      "status": 0,
+      "words": [
+        "x",
+        "tail"
+      ]
+    },
+    {
+      "name": "redirect-out",
+      "input": "x a>abc tail",
+      "status": 0,
+      "words": [
+        "x",
+        "a",
+        "tail"
+      ]
+    },
+    {
+      "name": "redirect-fd",
+      "input": "x 2>abc tail",
+      "status": 0,
+      "words": [
+        "x",
+        "tail"
+      ]
+    },
+    {
+      "name": "redirect-quoted",
+      "input": "x >\"other file\" tail",
+      "status": 0,
+      "words": [
+        "x",
+        "tail"
+      ]
+    },
+    {
+      "name": "brace-list",
+      "input": "x a{b,c}d",
+      "status": 0,
+      "words": [
+        "x",
+        "abd",
+        "acd"
+      ]
+    },
+    {
+      "name": "brace-number",
+      "input": "x pre{1..3}z {03..1}",
+      "status": 0,
+      "words": [
+        "x",
+        "pre1z",
+        "pre2z",
+        "pre3z",
+        "03",
+        "02",
+        "01"
+      ]
+    },
+    {
+      "name": "brace-letters",
+      "input": "x {a..c} {e..a..2}",
+      "status": 0,
+      "words": [
+        "x",
+        "a",
+        "b",
+        "c",
+        "e",
+        "c",
+        "a"
+      ]
+    },
+    {
+      "name": "brace-nested",
+      "input": "x {a,{b,c}} {a,b}{c,d}",
+      "status": 0,
+      "words": [
+        "x",
+        "a",
+        "b",
+        "c",
+        "ac",
+        "ad",
+        "bc",
+        "bd"
+      ]
+    },
+    {
+      "name": "brace-empty",
+      "input": "x {a,,b} {} {plain}",
+      "status": 0,
+      "words": [
+        "x",
+        "a",
+        "b",
+        "{}",
+        "{plain}"
+      ]
+    },
+    {
+      "name": "brace-quoted",
+      "input": "x '{a,b}' \\{a,b\\}",
+      "status": 0,
+      "words": [
+        "x",
+        "{a,b}",
+        "{a,b}"
+      ]
+    },
+    {
+      "name": "brace-step",
+      "input": "x {1..3..2} {3..1..2}",
+      "status": 0,
+      "words": [
+        "x",
+        "1",
+        "3",
+        "3",
+        "1"
+      ]
+    },
+    {
+      "name": "env-split",
+      "input": "x $ZAPRET_TEST_WORDS end",
+      "status": 0,
+      "words": [
+        "x",
+        "alpha",
+        "beta",
+        "gamma",
+        "end"
+      ]
+    },
+    {
+      "name": "env-double",
+      "input": "x \"$ZAPRET_TEST_WORDS\"",
+      "status": 0,
+      "words": [
+        "x",
+        "  alpha  beta \t gamma "
+      ]
+    },
+    {
+      "name": "env-concatenated",
+      "input": "x before$ZAPRET_TEST_WORDS/after",
+      "status": 0,
+      "words": [
+        "x",
+        "before",
+        "alpha",
+        "beta",
+        "gamma",
+        "/after"
+      ]
+    },
+    {
+      "name": "env-empty",
+      "input": "x $ZAPRET_TEST_EMPTY end",
+      "status": 0,
+      "words": [
+        "x",
+        "end"
+      ]
+    },
+    {
+      "name": "env-empty-prefix",
+      "input": "x a$ZAPRET_TEST_EMPTY",
+      "status": 0,
+      "words": [
+        "x",
+        "a"
+      ]
+    },
+    {
+      "name": "env-empty-double",
+      "input": "x \"$ZAPRET_TEST_EMPTY\"",
+      "status": 0,
+      "words": [
+        "x",
+        ""
+      ]
+    },
+    {
+      "name": "env-quoted-prefix",
+      "input": "x \"\"$ZAPRET_TEST_WORDS",
+      "status": 0,
+      "words": [
+        "x",
+        "",
+        "alpha",
+        "beta",
+        "gamma"
+      ]
+    },
+    {
+      "name": "env-quoted-suffix",
+      "input": "x $ZAPRET_TEST_WORDS\"\"",
+      "status": 0,
+      "words": [
+        "x",
+        "alpha",
+        "beta",
+        "gamma",
+        ""
+      ]
+    },
+    {
+      "name": "env-default",
+      "input": "x ${ZAPRET_TEST_MISSING:-fallback} ${ZAPRET_TEST_EMPTY-default}",
+      "status": 0,
+      "words": [
+        "x",
+        "fallback"
+      ]
+    },
+    {
+      "name": "env-default-empty",
+      "input": "x ${ZAPRET_TEST_EMPTY:-fallback}",
+      "status": 0,
+      "words": [
+        "x",
+        "fallback"
+      ]
+    },
+    {
+      "name": "env-alternate",
+      "input": "x ${ZAPRET_TEST_ONE:+yes} ${ZAPRET_TEST_MISSING+no}",
+      "status": 0,
+      "words": [
+        "x",
+        "yes"
+      ]
+    },
+    {
+      "name": "env-assign",
+      "input": "x ${ZAPRET_TEST_MISSING:=set} $ZAPRET_TEST_MISSING",
+      "status": 0,
+      "words": [
+        "x",
+        "set",
+        "set"
+      ]
+    },
+    {
+      "name": "env-required",
+      "input": "x ${ZAPRET_TEST_ONE?error}",
+      "status": 0,
+      "words": [
+        "x",
+        "word"
+      ]
+    },
+    {
+      "name": "env-required-missing",
+      "input": "x ${ZAPRET_TEST_MISSING?error}",
+      "status": 5,
+      "words": []
+    },
+    {
+      "name": "env-default-quoted",
+      "input": "x ${ZAPRET_TEST_MISSING:-'a b'}",
+      "status": 0,
+      "words": [
+        "x",
+        "a b"
+      ]
+    },
+    {
+      "name": "env-default-double",
+      "input": "x \"${ZAPRET_TEST_MISSING:-'a b'}\"",
+      "status": 0,
+      "words": [
+        "x",
+        "'a b'"
+      ]
+    },
+    {
+      "name": "env-default-nested",
+      "input": "x ${ZAPRET_TEST_MISSING:-${ZAPRET_TEST_ONE}}",
+      "status": 0,
+      "words": [
+        "x",
+        "word"
+      ]
+    },
+    {
+      "name": "env-length",
+      "input": "x ${#ZAPRET_TEST_ONE} ${#ZAPRET_TEST_EMPTY}",
+      "status": 0,
+      "words": [
+        "x",
+        "4",
+        "0"
+      ]
+    },
+    {
+      "name": "env-trim",
+      "input": "x ${ZAPRET_TEST_ONE%rd} ${ZAPRET_TEST_ONE#w} ${ZAPRET_TEST_ONE%%o*} ${ZAPRET_TEST_ONE##*o}",
+      "status": 0,
+      "words": [
+        "x",
+        "wo",
+        "ord",
+        "w",
+        "rd"
+      ]
+    },
+    {
+      "name": "env-substring",
+      "input": "x ${ZAPRET_TEST_ONE:1:2} ${ZAPRET_TEST_ONE: -2} ${ZAPRET_TEST_ONE:0:-1}",
+      "status": 0,
+      "words": [
+        "x",
+        "or",
+        "rd",
+        "wor"
+      ]
+    },
+    {
+      "name": "env-case",
+      "input": "x ${ZAPRET_TEST_ONE^} ${ZAPRET_TEST_ONE^^} ${ZAPRET_TEST_ONE,}",
+      "status": 0,
+      "words": [
+        "x",
+        "Word",
+        "WORD",
+        "word"
+      ]
+    },
+    {
+      "name": "env-literal",
+      "input": "x '${ZAPRET_TEST_WORDS}'",
+      "status": 0,
+      "words": [
+        "x",
+        "${ZAPRET_TEST_WORDS}"
+      ]
+    },
+    {
+      "name": "env-unknown",
+      "input": "x \"$ZAPRET_TEST_MISSING\" $ZAPRET_TEST_MISSING",
+      "status": 0,
+      "words": [
+        "x",
+        ""
+      ]
+    },
+    {
+      "name": "protected-command",
+      "input": "x $(printf BAD)",
+      "status": 0,
+      "words": [
+        "x",
+        "$(printf",
+        "BAD)"
+      ]
+    },
+    {
+      "name": "protected-backtick",
+      "input": "x `printf BAD`",
+      "status": 0,
+      "words": [
+        "x",
+        "`printf",
+        "BAD`"
+      ]
+    },
+    {
+      "name": "protected-command-quoted",
+      "input": "x \"$(printf 'hello world')\"",
+      "status": 0,
+      "words": [
+        "x",
+        "$(printf 'hello world')"
+      ]
+    },
+    {
+      "name": "protected-command-quotes",
+      "input": "x $(printf 'hello world')",
+      "status": 0,
+      "words": [
+        "x",
+        "$(printf",
+        "'hello",
+        "world')"
+      ]
+    },
+    {
+      "name": "protected-nested",
+      "input": "x $(echo $ZAPRET_TEST_ONE)",
+      "status": 0,
+      "words": [
+        "x",
+        "$(echo",
+        "$ZAPRET_TEST_ONE)"
+      ]
+    },
+    {
+      "name": "protected-process",
+      "input": "x <(printf BAD) >(printf BAD)",
+      "status": 0,
+      "words": [
+        "x",
+        "<(printf BAD)",
+        ">(printf BAD)"
+      ]
+    },
+    {
+      "name": "protected-literal",
+      "input": "x '$(printf OK)' '\\`literal\\`'",
+      "status": 0,
+      "words": [
+        "x",
+        "$(printf OK)",
+        "\\`literal\\`"
+      ]
+    },
+    {
+      "name": "protected-unused-default",
+      "input": "x ${ZAPRET_TEST_ONE:-$(printf bad)}",
+      "status": 0,
+      "words": [
+        "x",
+        "word"
+      ]
+    },
+    {
+      "name": "arithmetic",
+      "input": "x $((1+2*3)) $((8/2)) $((2<<3))",
+      "status": 0,
+      "words": [
+        "x",
+        "7",
+        "4",
+        "16"
+      ]
+    },
+    {
+      "name": "arithmetic-variable",
+      "input": "x $((ZAPRET_TEST_NUMBER+1)) $((unset))",
+      "status": 0,
+      "words": [
+        "x",
+        "10",
+        "0"
+      ]
+    },
+    {
+      "name": "arithmetic-assignment",
+      "input": "x $((counter=3)) $((counter++)) $((counter+=5)) $counter",
+      "status": 0,
+      "words": [
+        "x",
+        "3",
+        "3",
+        "9",
+        "9"
+      ]
+    },
+    {
+      "name": "arithmetic-conditional",
+      "input": "x $((0 ? 1/0 : 4)) $((1 || 1/0)) $((0 && 1/0))",
+      "status": 0,
+      "words": [
+        "x",
+        "4",
+        "1",
+        "0"
+      ]
+    },
+    {
+      "name": "arithmetic-bases",
+      "input": "x $((0x20+010)) $((2#101)) $((2**5)) $[1+2]",
+      "status": 0,
+      "words": [
+        "x",
+        "40",
+        "5",
+        "32",
+        "3"
+      ]
+    },
+    {
+      "name": "arithmetic-wrapping",
+      "input": "x $((9223372036854775807+1))",
+      "status": 0,
+      "words": [
+        "x",
+        "-9223372036854775808"
+      ]
+    },
+    {
+      "name": "arithmetic-zero",
+      "input": "x $((3/0))",
+      "status": 5,
+      "words": []
+    },
+    {
+      "name": "tilde",
+      "input": "x ~ ~/a ~nosuchuser a~ ~-/file",
+      "status": 0,
+      "words": [
+        "x",
+        "/fixture/home",
+        "/fixture/home/a",
+        "~nosuchuser",
+        "a~",
+        "~-/file"
+      ]
+    },
+    {
+      "name": "tilde-option",
+      "input": "x a=~ --arg=~/x",
+      "status": 0,
+      "words": [
+        "x",
+        "a=/fixture/home",
+        "--arg=~/x"
+      ]
+    },
+    {
+      "name": "glob",
+      "input": "x *.txt '?' \\*.txt [ab].txt nope*.txt",
+      "status": 0,
+      "words": [
+        "x",
+        "a.txt",
+        "b.txt",
+        "space name.txt",
+        "?",
+        "*.txt",
+        "a.txt",
+        "b.txt",
+        "nope*.txt"
+      ]
+    },
+    {
+      "name": "glob-quoted",
+      "input": "x '*.txt' \"*.txt\"",
+      "status": 0,
+      "words": [
+        "x",
+        "*.txt",
+        "*.txt"
+      ]
+    },
+    {
+      "name": "glob-env",
+      "input": "x $ZAPRET_TEST_PATTERN",
+      "status": 0,
+      "words": [
+        "x",
+        "a.txt",
+        "b.txt",
+        "space name.txt"
+      ]
+    },
+    {
+      "name": "glob-subdir",
+      "input": "x */*.txt",
+      "status": 0,
+      "words": [
+        "x",
+        "目录/файл.txt"
+      ]
+    },
+    {
+      "name": "unicode",
+      "input": "x --arg='Привет мир' '目录/файл.txt'",
+      "status": 0,
+      "words": [
+        "x",
+        "--arg=Привет мир",
+        "目录/файл.txt"
+      ]
+    },
+    {
+      "name": "unclosed-double",
+      "input": "x \"unterminated",
+      "status": 5,
+      "words": []
+    },
+    {
+      "name": "unclosed-single",
+      "input": "x 'unterminated",
+      "status": 5,
+      "words": []
+    },
+    {
+      "name": "unclosed-command",
+      "input": "x $(unterminated",
+      "status": 5,
+      "words": []
+    },
+    {
+      "name": "unclosed-parameter",
+      "input": "x ${ZAPRET_TEST_ONE",
+      "status": 5,
+      "words": []
+    },
+    {
+      "name": "trailing-backslash",
+      "input": "x a\\",
+      "status": 0,
+      "words": [
+        "x",
+        "a\\"
+      ]
+    },
+    {
+      "name": "line-continuation",
+      "input": "x foo\\\nbar",
+      "status": 0,
+      "words": [
+        "x",
+        "foobar"
+      ]
+    },
+    {
+      "name": "long-word",
+      "input": "x longwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongword",
+      "status": 0,
+      "words": [
+        "x",
+        "longwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongwordlongword"
+      ]
+    },
+    {
+      "name": "ansi-printable",
+      "input": "x $'abc' $'a\\x20b' $'\\u0416'",
+      "status": 0,
+      "words": [
+        "x",
+        "abc",
+        "a b",
+        "Ж"
+      ]
+    },
+    {
+      "name": "ansi-newline-protocol",
+      "input": "x $'a\\nb' tail",
+      "status": 0,
+      "words": [
+        "x",
+        "a",
+        "b"
+      ]
+    },
+    {
+      "name": "ansi-tab",
+      "input": "x $'a\\tb' tail",
+      "status": 0,
+      "words": [
+        "x",
+        "a\tb",
+        "tail"
+      ]
+    },
+    {
+      "name": "ansi-nul",
+      "input": "x $'a\\0b' tail",
+      "status": 0,
+      "words": [
+        "x",
+        "a",
+        "tail"
+      ]
+    },
+    {
+      "name": "ansi-escaped-quotes",
+      "input": "x $'a\\'b' $'a\\\\b'",
+      "status": 0,
+      "words": [
+        "x",
+        "a'b",
+        "a\\b"
+      ]
+    },
+    {
+      "name": "ansi-protected-double",
+      "input": "x \"$'literal\"",
+      "status": 0,
+      "words": [
+        "x",
+        "$'literal"
+      ]
+    },
+    {
+      "name": "env-replace",
+      "input": "x ${ZAPRET_TEST_PHRASE/and/with} ${ZAPRET_TEST_PHRASE//o/X}",
+      "status": 0,
+      "words": [
+        "x",
+        "one",
+        "with",
+        "two",
+        "Xne",
+        "and",
+        "twX"
+      ]
+    },
+    {
+      "name": "env-replace-anchor",
+      "input": "x ${ZAPRET_TEST_PHRASE/#one/first} ${ZAPRET_TEST_PHRASE/%two/last}",
+      "status": 0,
+      "words": [
+        "x",
+        "first",
+        "and",
+        "two",
+        "one",
+        "and",
+        "last"
+      ]
+    },
+    {
+      "name": "env-replace-glob",
+      "input": "x ${ZAPRET_TEST_PHRASE/*and*/X} ${ZAPRET_TEST_PHRASE// /_}",
+      "status": 0,
+      "words": [
+        "x",
+        "X",
+        "one_and_two"
+      ]
+    },
+    {
+      "name": "env-case-pattern",
+      "input": "x ${ZAPRET_TEST_PHRASE^^[ot]} ${ZAPRET_TEST_PHRASE^n}",
+      "status": 0,
+      "words": [
+        "x",
+        "One",
+        "and",
+        "TwO",
+        "one",
+        "and",
+        "two"
+      ]
+    },
+    {
+      "name": "env-shell-quote",
+      "input": "x ${ZAPRET_TEST_PHRASE@Q}",
+      "status": 0,
+      "words": [
+        "x",
+        "'one",
+        "and",
+        "two'"
+      ]
+    }
+  ]
+}

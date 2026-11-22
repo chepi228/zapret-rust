@@ -1,0 +1,25 @@
+[package]
+name = "zapret-dev"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+flate2.workspace = true
+clap = { version = "4", features = ["derive"] }
+getrandom = { version = "0.3", features = ["std"] }
+regex = "1"
+mlua = { version = "0.11.6", features = ["lua54", "vendored", "error-send"] }
+serde.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+zapret-core.workspace = true
+zapret-platform.workspace = true
+ring-backend = { package = "zapret-ring-ffi", path = "../zapret-ring-ffi" }
+zip.workspace = true
+rcgen = "0.13"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_Security", "Win32_Security_Authorization", "Win32_System_Threading", "Win32_System_JobObjects"] }

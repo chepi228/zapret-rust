@@ -1,0 +1,11 @@
+[alias]
+zapret = ["run", "--locked", "--manifest-path", "native/Cargo.toml", "--target-dir", "dist/native", "-p", "zapret-dev", "--"]
+
+[target.x86_64-pc-windows-gnu]
+# rustc locates its bundled LLD. Passing arguments directly also supports
+# portable LLVM MinGW toolchains without GCC's libgcc and libgcc_eh.
+rustflags = [
+    "-C", "linker=rust-lld",
+    "-C", "linker-flavor=ld.lld",
+    "-C", "link-arg=--no-insert-timestamp",
+]

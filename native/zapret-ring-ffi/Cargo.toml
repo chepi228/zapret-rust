@@ -1,0 +1,14 @@
+[package]
+name = "zapret-ring-ffi"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+name = "zapret_ring_ffi"
+crate-type = ["cdylib","rlib"]
+
+[dependencies]
+zapret-ring = {path="../zapret-ring"}

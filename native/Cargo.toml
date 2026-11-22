@@ -1,0 +1,35 @@
+[workspace]
+members = ["zapret-core", "zapret-dev", "zapret-net", "zapret-platform", "zapret", "zapret-worker", "telegram-core", "zapret-ring", "zapret-ring-ffi", "zapret-wincompat"]
+resolver = "3"
+
+[workspace.package]
+version = "1.0.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+publish = false
+
+[workspace.dependencies]
+anyhow = "1"
+flate2 = { version = "1", default-features = false, features = ["zlib-rs"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tempfile = "3"
+tokio = { version = "1", features = ["io-util", "macros", "net", "rt", "signal", "sync", "time"] }
+windows-sys = "0.61"
+zip = { version = "2.4", default-features = false, features = ["deflate-flate2", "flate2"] }
+zapret-core = { path = "zapret-core" }
+zapret-net = { path = "zapret-net" }
+zapret-platform = { path = "zapret-platform" }
+telegram-core = { path = "telegram-core" }
+
+[profile.release]
+strip = true
+lto = "thin"
+
+# Keep debug controller images inside the same bounded executable-read budget
+# as production while retaining useful file/line information in backtraces.
+[profile.dev]
+debug = "line-tables-only"
+

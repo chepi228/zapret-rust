@@ -1,0 +1,127 @@
+﻿# Архив для пользователей (Releases на GitHub): копия папки без dev\, .git и данных этого ПК.
+# Результат - dist\zapret-v<версия>.zip, версия берётся из tools\lib.ps1.
+param([string]$OutDir = (Join-Path (Split-Path -Parent $PSScriptRoot) 'dist'))
+$ErrorActionPreference='Stop'
+$root=[IO.Path]::GetFullPath((Split-Path -Parent $PSScriptRoot))
+$temporary=$null;$owned=$false;$archive=$null;$file=$null
+try{
+    Add-Type -AssemblyName System.IO.Compression
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $version=[regex]::Match([IO.File]::ReadAllText((Join-Path $root 'tools/lib.ps1')), "Script:Version\s*=\s*'([^']+)'").Groups[1].Value
+    if($version -notmatch '^[0-9][0-9A-Za-z._-]*$'){throw 'Invalid package version in tools/lib.ps1'}
+    foreach($relative in @('tools','tools/integrity.ps1','tools/upstream.txt')){
+        $item=Get-Item -LiteralPath (Join-Path $root $relative) -Force
+        if($item.Attributes -band [IO.FileAttributes]::ReparsePoint){throw ('Reparse package input: '+$relative)}
+    }
+    . (Join-Path $root 'tools/integrity.ps1')
+    $core=Read-CoreManifest (Join-Path $root 'tools/upstream.txt')
+    $manifest=Join-Path $PSScriptRoot 'package-files.txt'
+    $names=New-Object 'Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    foreach($line in [IO.File]::ReadAllLines($manifest)){
+        if(-not $line -or $line.StartsWith('#')){continue}
+        if($line -notmatch '^[A-Za-z0-9_.-]+(/[A-Za-z0-9_.-]+)*$' -or @($line.Split('/')|Where-Object{$_ -eq '.' -or $_ -eq '..'}).Count){throw ('Invalid package path: '+$line)}
+        foreach($segment in $line.Split('/')){
+            if($segment.EndsWith('.') -or $segment -match '^(con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)'){throw ('Noncanonical Windows package path: '+$line)}
+        }
+        if($line -match '/' -and $line -notmatch '^(bin|fake|lists|lua|strategies|tools|windivert)/'){throw ('Invalid package directory: '+$line)}
+        if($line -notmatch '/' -and $line -notmatch '^(CHANGELOG\.md|CHECKSUMS\.txt|LICENSE(?:-[A-Za-z0-9-]+\.txt)?|README(?:\.en)?\.md|THIRD-PARTY-NOTICES\.md|zapret\.bat)$'){throw ('Invalid package root file: '+$line)}
+        if(-not $names.Add($line)){throw ('Duplicate package path: '+$line)}
+    }
+    $rustRing=Test-Path -LiteralPath (Join-Path $root 'tools/rust-ring.json')
+    if($core.Schema -ge 2){[void]$names.Remove('bin/cygwin1.dll')}
+    if($rustRing){
+        $runtimeLicense=if($core.Schema -eq 4){'LICENSE-Luna.txt'}else{'LICENSE-LuaJIT.txt'}
+        $extras=@('bin/zapret-ring.dll','tools/rust-ring.json',$runtimeLicense)
+        if($core.Schema -eq 1){$extras+=@('LICENSE-cygwin.txt')}
+        foreach($name in $extras){if(-not $names.Add($name)){throw 'Duplicate Rust ring compatibility input'}}
+    }
+    $defaults=@('list-general-user.txt','list-exclude-user.txt','ipset-user.txt','ipset-exclude-user.txt')
+    foreach($required in @('zapret.bat','tools/lib.ps1','tools/filtercheck.cs','tools/integrity.ps1','tools/upstream.txt','CHECKSUMS.txt','bin/winws2.exe')+@($defaults|ForEach-Object{'lists/'+$_})){
+        if(-not $names.Contains($required)){throw ('Missing required manifest entry: '+$required)}
+    }
+    $paths=[string[]]@($names);[Array]::Sort($paths,[StringComparer]::Ordinal)
+    $inputs=@()
+    foreach($path in $paths){
+        $relative=$path
+        # Historical fixtures retain the old ZIP layout, using the renamed source launcher.
+        if($path -ceq 'zapret.bat'){$relative='zapret-rust.bat'}
+        if($path.StartsWith('lists/',[StringComparison]::OrdinalIgnoreCase) -and $defaults -contains $path.Substring(6)){$relative='dev/package-defaults/'+$path}
+        # Check every component: a file in a linked directory is also outside the declared input tree.
+        $source=$root
+        foreach($part in $relative.Split('/')){
+            $source=Join-Path $source $part
+            $item=Get-Item -LiteralPath $source -Force
+            if($item.Attributes -band [IO.FileAttributes]::ReparsePoint){throw ('Reparse package input: '+$relative)}
+        }
+        if($item.PSIsContainer){throw ('Package input is a directory: '+$relative)}
+        $inputs+=@{Name=('zapret/'+$path);Source=$source}
+    }
+    $sumBytes=Read-CoreManifestBytes (Join-Path $root 'CHECKSUMS.txt')
+    $encoding=New-Object Text.UTF8Encoding($false,$true)
+    $sumText=$encoding.GetString($sumBytes).TrimStart([char]0xFEFF).Replace("`r`n","`n")
+    if(-not $sumText.StartsWith($core.ChecksumsBlock.Replace("`r`n","`n"),[StringComparison]::Ordinal)){throw 'CHECKSUMS.txt differs from tools/upstream.txt'}
+    $expectedHashes=@{'tools/upstream.txt'=$core.ContentHash;'CHECKSUMS.txt'=(Get-CoreManifestHash $sumBytes)}
+    . (Join-Path $root 'tools/tgws.ps1')
+    $telegramComponent=Get-TgWsRelease
+    if(-not $names.Contains($telegramComponent.RelativePath)){throw 'Missing official TG WS Proxy package entry'}
+    $expectedHashes[$telegramComponent.RelativePath]=$telegramComponent.Sha256
+    foreach($name in $core.Hashes.Keys){
+        $relative=$name.Replace('\','/')
+        if(-not $names.Contains($relative)){throw ('Missing pinned core package entry: '+$relative)}
+        $expectedHashes[$relative]=$core.Hashes[$name]
+    }
+    if($rustRing){
+        $ownBytes=[IO.File]::ReadAllBytes((Join-Path $root 'tools/rust-ring.json'))
+        $own=$encoding.GetString($ownBytes)|ConvertFrom-Json
+        if($own.schema -ne $core.Schema -or $own.abi -ne 1 -or $own.backend -cne 'Rust' -or $own.base_commit -cne $core.Commit){throw 'Invalid native ring compatibility manifest'}
+        $ringFiles=@('bin/winws2.exe','bin/zapret-ring.dll')
+        if($core.Schema -lt 3){$ringFiles+=@('lua/ring-store.lua','lua/autoring.lua','lua/host-cache.lua')}
+        if($core.Schema -eq 1){$ringFiles+=@('bin/cygwin1.dll')}
+        if(@($own.hashes.PSObject.Properties).Count -ne $ringFiles.Count){throw 'Incomplete native ring compatibility pins'}
+        foreach($name in $ringFiles){$hash=$own.hashes.$name;if($hash -notmatch '^[0-9A-Fa-f]{64}$' -or ($expectedHashes.ContainsKey($name) -and $expectedHashes[$name] -ine $hash)){throw 'Invalid native ring compatibility digest'};$expectedHashes[$name]=$hash}
+        $expectedHashes['tools/rust-ring.json']=Get-CoreManifestHash $ownBytes
+    }
+    $output=[IO.Path]::GetFullPath($OutDir)
+    [IO.Directory]::CreateDirectory($output)|Out-Null
+    $destination=Join-Path $output ('zapret-v'+$version+'.zip')
+    $temporary=Join-Path $output ('.zapret-build-'+[guid]::NewGuid().ToString('N')+'.tmp.zip')
+    $file=[IO.File]::Open($temporary,[IO.FileMode]::CreateNew,[IO.FileAccess]::ReadWrite,[IO.FileShare]::None);$owned=$true
+    $archive=New-Object IO.Compression.ZipArchive($file,[IO.Compression.ZipArchiveMode]::Create,$true)
+    $timestamp=[DateTimeOffset]::new(2000,1,1,0,0,0,[TimeSpan]::Zero)
+    foreach($inputFile in $inputs){
+        $entry=$archive.CreateEntry($inputFile.Name,[IO.Compression.CompressionLevel]::Optimal);$entry.LastWriteTime=$timestamp
+        $sourceStream=$null;$entryStream=$null
+        try{
+            $sourceStream=[IO.File]::Open($inputFile.Source,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::Read)
+            $relative=$inputFile.Name.Substring('zapret/'.Length)
+            if($expectedHashes.ContainsKey($relative)){
+                $sha=[Security.Cryptography.SHA256]::Create()
+                try{$hash=[BitConverter]::ToString($sha.ComputeHash($sourceStream)).Replace('-','')}finally{$sha.Dispose()}
+                if($hash -ine $expectedHashes[$relative]){throw ('Pinned core input changed: '+$relative)}
+                $sourceStream.Position=0
+            }
+            $entryStream=$entry.Open();$sourceStream.CopyTo($entryStream)
+        }finally{if($entryStream){$entryStream.Dispose()};if($sourceStream){$sourceStream.Dispose()}}
+    }
+    $entry=$archive.CreateEntry('zapret/runtime/.keep');$entry.LastWriteTime=$timestamp
+    $archive.Dispose();$archive=$null;$file.Dispose();$file=$null
+    $check=[IO.Compression.ZipFile]::OpenRead($temporary)
+    try{
+        $expected=@($inputs|ForEach-Object{$_.Name})+@('zapret/runtime/.keep')
+        $actual=@($check.Entries|ForEach-Object{$_.FullName})
+        if($actual.Count -ne $expected.Count -or @(Compare-Object $expected $actual -CaseSensitive).Count){throw 'ZIP entries do not match the package manifest'}
+    }finally{$check.Dispose()}
+    $digest=(Get-FileHash -LiteralPath $temporary -Algorithm SHA256).Hash
+    if($digest -notmatch '^[A-Fa-f0-9]{64}$'){throw 'Cannot compute package SHA256'}
+    # Same-directory replacement is atomic; an inaccessible destination leaves the old ZIP intact.
+    if([IO.File]::Exists($destination)){[IO.File]::Replace($temporary,$destination,[System.Management.Automation.Language.NullString]::Value)}else{[IO.File]::Move($temporary,$destination)}
+    $owned=$false
+    Write-Host ('Готово: {0} ({1} файлов, SHA256 {2})' -f $destination,$expected.Count,$digest) -ForegroundColor Green
+}catch{
+    Write-Host ('Сборка не выполнена: '+$_.Exception.Message) -ForegroundColor Red
+    exit 1
+}finally{
+    if($archive){$archive.Dispose()}
+    if($file){$file.Dispose()}
+    if($owned -and $temporary -and [IO.File]::Exists($temporary)){[IO.File]::Delete($temporary)}
+}

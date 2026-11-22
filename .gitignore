@@ -1,0 +1,31 @@
+# настройки, рейтинг, отчёты и логи конкретного ПК
+runtime/*
+!runtime/.keep
+
+# создаётся при первом запуске и пополняется сам
+lists/autohostlist.txt
+
+# старые версии списков после обновления (пункт 8)
+lists/*.bak
+
+# архивы сборки (dev\build.ps1)
+dist/
+tools/rust-ring-next/
+*.zip
+
+# developer Python cache
+__pycache__/
+
+# Local native build outputs
+/bin/zapret-rust.exe
+/bin/zapret-rust-recovery.exe
+/bin/zapret-rust-worker.exe
+/bin/zapret.exe
+/bin/zapret-recovery.exe
+/bin/zapret-worker.exe
+*.rar
+*.7z
+/bin/winws2.exe
+/bin/cygwin1.dll
+/bin/zapret-ring.dll
+/bin/tgws/

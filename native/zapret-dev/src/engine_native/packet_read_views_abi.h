@@ -1,0 +1,30 @@
+/* MIT. Bind read-only projections to the existing Rust functions. */
+#pragma once
+
+extern __typeof__(extract_ports) zapret_packet_extract_ports;
+extern __typeof__(extract_endpoints) zapret_packet_extract_endpoints;
+extern __typeof__(tcp_find_scale_factor) zapret_packet_tcp_find_scale_factor;
+extern __typeof__(tcp_find_mss) zapret_packet_tcp_find_mss;
+extern __typeof__(tcp_synack_segment) zapret_packet_tcp_synack_segment;
+extern __typeof__(tcp_syn_segment) zapret_packet_tcp_syn_segment;
+extern __typeof__(ttl46) zapret_packet_ttl46;
+extern __typeof__(family_from_proto) zapret_packet_family_from_proto;
+extern __typeof__(proto_check_ipv4) zapret_packet_check_ipv4;
+extern __typeof__(proto_check_ipv6) zapret_packet_check_ipv6;
+extern __typeof__(proto_check_tcp) zapret_packet_check_tcp;
+extern __typeof__(proto_check_udp) zapret_packet_check_udp;
+extern __typeof__(proto_check_icmp) zapret_packet_check_icmp;
+
+#define extract_ports zapret_packet_extract_ports
+#define extract_endpoints zapret_packet_extract_endpoints
+#define tcp_find_scale_factor zapret_packet_tcp_find_scale_factor
+#define tcp_find_mss zapret_packet_tcp_find_mss
+#define tcp_synack_segment zapret_packet_tcp_synack_segment
+#define tcp_syn_segment zapret_packet_tcp_syn_segment
+#define ttl46 zapret_packet_ttl46
+#define family_from_proto zapret_packet_family_from_proto
+#define proto_check_ipv4 zapret_packet_check_ipv4
+#define proto_check_ipv6 zapret_packet_check_ipv6
+#define proto_check_tcp zapret_packet_check_tcp
+#define proto_check_udp zapret_packet_check_udp
+#define proto_check_icmp zapret_packet_check_icmp

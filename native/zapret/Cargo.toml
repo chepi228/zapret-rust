@@ -1,0 +1,29 @@
+[package]
+name = "zapret"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json = { workspace = true, features = ["float_roundtrip"] }
+sha2.workspace = true
+tempfile.workspace = true
+zapret-core.workspace = true
+zapret-net.workspace = true
+zapret-platform.workspace = true
+clap = { version = "4", features = ["derive"] }
+# Select the workspace's Rust backend for ZIP DEFLATE.
+flate2.workspace = true
+zip.workspace = true
+chrono = { version = "0.4", features = ["serde"] }
+ctrlc = "3.4"
+regex = "1"
+getrandom = "0.3"
+tokio.workspace = true
+url = "2"
+png = "0.17"
+windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_System_Console", "Win32_Graphics_Gdi"] }

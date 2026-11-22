@@ -1,0 +1,1641 @@
+use crate::console::{Frame, Tone, Viewport};
+use serde_json::Value;
+
+fn primary_answer(text: &str) -> Option<bool> {
+    crate::confirmation::answer(text)
+}
+
+fn result_tone(qualified: bool, leader: bool, harm: usize, score: f64, best: f64) -> Tone {
+    if !qualified {
+        Tone::Warning
+    } else if leader {
+        Tone::Good
+    } else if harm >= 3 || best - score >= 10. {
+        Tone::Bad
+    } else if best - score <= 2. {
+        Tone::Good
+    } else {
+        Tone::Text
+    }
+}
+
+pub struct RunState {
+    pub qualified: bool,
+    pub leader: bool,
+    pub best_score: f64,
+    pub details: bool,
+    pub position: usize,
+    pub total: usize,
+}
+
+pub fn primary_frame(report: &Value, viewport: Viewport) -> Frame {
+    let mut frame = Frame::new(viewport, "Выбор основной стратегии");
+    let best = report["best"]["id"].as_str().unwrap_or("");
+    let primary = report["primary"].as_str().unwrap_or("");
+    frame.row(" Рабочая конфигурация рекомендации проверена.", Tone::Good);
+    frame.row(
+        &format!(" Рекомендация: {}", name(report, best)),
+        Tone::Good,
+    );
+    frame.row(
+        &format!(" Сейчас сохранена: {}", name(report, primary)),
+        Tone::Text,
+    );
+    if let Some(reason) = speed_reason(report) {
+        frame.row(&reason, Tone::Good);
+    }
+    frame.separator("РЕЗУЛЬТАТЫ");
+    let mut rows: Vec<_> = report["rows"].as_array().into_iter().flatten().collect();
+    rows.sort_by_key(|row| row["id"].as_str() != Some(best));
+    for row in rows.into_iter().take(3) {
+        let id = row["id"].as_str().unwrap_or("");
+        let confirmed = report["final_checks"][id]["confirmed"].as_bool();
+        let (label, tone) = if confirmed == Some(false) {
+            ("ФИНАЛ НЕ ПРОЙДЕН", Tone::Bad)
+        } else if id == best {
+            ("ПОДТВЕРЖДЕНА", Tone::Good)
+        } else {
+            ("ОДИНОЧНЫЙ ТЕСТ", Tone::Text)
+        };
+        frame.row(
+            &format!(
+                " {label}: {} · балл {}",
+                name(report, id),
+                row["score"]
+                    .as_f64()
+                    .map(points)
+                    .unwrap_or_else(|| "—".into())
+            ),
+            tone,
+        );
+    }
+    frame.separator("ДЕЙСТВИЕ");
+    frame.item(
+        'y',
+        &format!("Применить {}", name(report, best)),
+        Tone::Good,
+    );
+    frame.item(
+        'n',
+        &format!("Оставить {}", name(report, primary)),
+        Tone::Text,
+    );
+    frame.row(
+        " Enter — n, оставить текущую. Применение — y.",
+        Tone::Secondary,
+    );
+    frame
+}
+
+pub fn choose_primary(app: &crate::App, report: &Value) -> anyhow::Result<bool> {
+    if app.yes {
+        return Ok(true);
+    }
+    primary_frame(report, Viewport::current()).append()?;
+    let stdin = std::io::stdin();
+    loop {
+        crate::console::prompt("Выбор [y/n]")?;
+        let mut text = String::new();
+        if stdin.read_line(&mut text)? == 0 {
+            return Ok(false);
+        }
+        if let Some(answer) = primary_answer(&text) {
+            return Ok(answer);
+        }
+        crate::console::line("Введите y или n. Enter — n.", Tone::Bad)?;
+    }
+}
+
+pub fn heading(app: &crate::App, text: &str) -> anyhow::Result<()> {
+    if !app.json {
+        crate::console::status(text, Tone::Accent)?;
+    }
+    Ok(())
+}
+
+pub fn validation_notice(
+    app: &crate::App,
+    name: &str,
+    error: Option<&str>,
+    details: bool,
+) -> anyhow::Result<()> {
+    if !app.json {
+        match error {
+            Some(error) => crate::console::line(
+                &format!(
+                    "  ФИНАЛ НЕ ПРОЙДЕН: {name}{}",
+                    if details {
+                        format!(". {error}")
+                    } else {
+                        String::new()
+                    }
+                ),
+                Tone::Bad,
+            )?,
+            None => {
+                crate::console::line(&format!("  РАБОЧИЙ РЕЖИМ ПОДТВЕРЖДЁН: {name}"), Tone::Good)?
+            }
+        }
+    }
+    Ok(())
+}
+
+pub fn points(value: f64) -> String {
+    if !value.is_finite() {
+        "—".into()
+    } else if value.fract().abs() < 0.001 {
+        format!("{value:.0}")
+    } else {
+        format!("{value:.1}").replace('.', ",")
+    }
+}
+
+fn name(report: &Value, id: &str) -> String {
+    report["strategy_names"][id]
+        .as_str()
+        .map(str::to_owned)
+        .unwrap_or_else(|| format!("Стратегия {id}"))
+}
+
+fn speed_reason(report: &Value) -> Option<String> {
+    let selection = &report["connection_selection"];
+    if selection["confirmed"] != true {
+        return None;
+    }
+    let working = &selection["working"];
+    let ms = working["gain_ms"].as_f64()?;
+    if working["scope"] == "AllTargets" {
+        return Some(format!(
+            " При близком балле полный запрос быстрее на ~{ms:.0} мс (адресов: {}).",
+            working["targets"].as_u64().unwrap_or(0)
+        ));
+    }
+    Some(format!(
+        " При близком балле подключение {} быстрее на ~{ms:.0} мс (адресов: {}).",
+        if working["scope"] == "GameServices" {
+            "к 2K/EAC"
+        } else {
+            "к сервисам"
+        },
+        working["targets"].as_u64().unwrap_or(0)
+    ))
+}
+
+fn full_request_policy(report: &Value) -> bool {
+    matches!(
+        report["selection_policy"].as_str(),
+        Some("availability-then-full-request-latency-v2" | crate::selection_latency::POLICY)
+    )
+}
+
+fn working_timing(report: &Value, id: &str) -> Option<crate::selection_latency::Timing> {
+    let check = &report["final_checks"][id];
+    if check["confirmed"] != true {
+        return None;
+    }
+    Some(crate::selection_latency::timing(
+        check["details"].as_array()?,
+    ))
+}
+
+fn connection_timing(report: &Value, id: &str) -> Option<(f64, f64)> {
+    let preference = &report["connection_selection"];
+    if preference["confirmed"] == true {
+        let prefix = if preference["reference"] == id {
+            Some("reference")
+        } else if preference["candidate"] == id {
+            Some("candidate")
+        } else {
+            None
+        };
+        if let Some(prefix) = prefix {
+            let working = &preference["working"];
+            if let Some(pair) = working[format!("{prefix}_tcp_ms")]
+                .as_f64()
+                .zip(working[format!("{prefix}_tls_ms")].as_f64())
+            {
+                return Some(pair);
+            }
+        }
+    }
+    if let Some(pair) = working_timing(report, id).and_then(|t| t.tcp_ms.zip(t.tls_ms)) {
+        return Some(pair);
+    }
+    let timing = &report["timings"][id];
+    timing["overall"]["tcp_ms"]
+        .as_f64()
+        .zip(timing["overall"]["tls_ms"].as_f64())
+        .or_else(|| {
+            timing["game"]["tcp_ms"]
+                .as_f64()
+                .zip(timing["game"]["tls_ms"].as_f64())
+        })
+}
+
+fn request_timing(report: &Value, id: &str) -> Option<(f64, f64, &'static str)> {
+    let preference = &report["connection_selection"];
+    if preference["confirmed"] == true && preference["working"]["scope"] == "AllTargets" {
+        let prefix = if preference["reference"] == id {
+            Some("reference")
+        } else if preference["candidate"] == id {
+            Some("candidate")
+        } else {
+            None
+        };
+        if let Some(prefix) = prefix {
+            let working = &preference["working"];
+            if let Some(pair) = working[format!("{prefix}_total_ms")]
+                .as_f64()
+                .zip(working[format!("{prefix}_p95_ms")].as_f64())
+            {
+                return Some((pair.0, pair.1, "В рабочем режиме"));
+            }
+        }
+    }
+    if let Some((total, p95)) = working_timing(report, id).and_then(|t| t.total_ms.zip(t.p95_ms)) {
+        return Some((total, p95, "В рабочем режиме"));
+    }
+    let timing = &report["timings"][id]["overall"];
+    Some((
+        timing["total_ms"].as_f64()?,
+        timing["p95_ms"].as_f64()?,
+        "В отдельном тесте",
+    ))
+}
+
+fn final_targets(report: &Value, error: &str) -> String {
+    let Some((names, _)) = error
+        .strip_prefix("Финальная комбинация не подтвердила ")
+        .and_then(|message| message.split_once(": "))
+    else {
+        return error.into();
+    };
+    let mut targets: Vec<_> = names.split(", ").map(str::to_owned).collect();
+    // Older reports recorded only the first error, but kept both measured panels.
+    fn key(row: &Value) -> Option<(&str, &str, &str)> {
+        Some((
+            row["group"].as_str()?,
+            row["name"].as_str()?,
+            row["url"].as_str()?,
+        ))
+    }
+    let failed: std::collections::BTreeSet<_> = report["final_details"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|row| matches!(row["state"].as_str(), Some("FAIL" | "FREEZE")))
+        .filter_map(key)
+        .collect();
+    for row in report["working_reference"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|row| row["state"] == "OK" && (row["group"] != "DPI" || row["flaky"] != true))
+    {
+        let Some((group, name, _)) = key(row).filter(|target| failed.contains(target)) else {
+            continue;
+        };
+        let label = format!("{group}/{name}");
+        if !targets.contains(&label) {
+            targets.push(label);
+        }
+    }
+    let shown = targets.len().min(3);
+    let mut summary = targets[..shown].join(", ");
+    if targets.len() > shown {
+        summary.push_str(&format!(" и ещё {}", targets.len() - shown));
+    }
+    summary
+}
+
+fn label(text: &str, width: usize) -> String {
+    if text.chars().count() <= width {
+        text.into()
+    } else {
+        text.chars()
+            .take(width.saturating_sub(1))
+            .chain(['…'])
+            .collect()
+    }
+}
+
+pub fn result_frame(report: &Value, viewport: Viewport) -> Option<Frame> {
+    result_frame_mode(report, viewport, false)
+}
+
+pub fn result_frame_mode(report: &Value, viewport: Viewport, historical: bool) -> Option<Frame> {
+    if report["protocol"] == "finalists-native-v1" || report["scope"] == "observed-https-tls" {
+        return Some(comparison_frame(report, viewport));
+    }
+    let rows = report["rows"].as_array()?;
+    let best = report["best"]["id"].as_str()?;
+    if report["presentation"] == "compact" {
+        return Some(compact_result(report, rows, best, viewport, historical));
+    }
+    let mut shown = rows.len();
+    loop {
+        let frame = ranking_frame(report, rows, best, shown, viewport, historical);
+        if frame.height() <= viewport.rows || shown <= 1 {
+            return Some(frame);
+        }
+        shown -= 1;
+    }
+}
+
+fn compact_result(
+    report: &Value,
+    rows: &[Value],
+    best: &str,
+    viewport: Viewport,
+    historical: bool,
+) -> Frame {
+    let mut frame = Frame::new(
+        viewport,
+        if historical {
+            "Результат прошлой проверки"
+        } else {
+            "Итог автоподбора"
+        },
+    );
+    let primary = report["primary"].as_str().unwrap_or("");
+    let restored = report["startup"]["restored"] == true;
+    let accepted = report["accepted"] == true && !restored;
+    let report_only = report["report_only"] == true;
+    let retained = report["retained_check"]["confirmed"].as_bool();
+    let (status, tone) = if restored {
+        ("НЕ ПРИМЕНЕНО", Tone::Warning)
+    } else if accepted && report["startup_error"].is_string() {
+        ("СОХРАНЕНО", Tone::Warning)
+    } else if report_only {
+        ("ТОЛЬКО ОТЧЁТ", Tone::Text)
+    } else if accepted && report["primary_changed"] == true {
+        ("ПРИМЕНЕНО", Tone::Good)
+    } else if accepted || retained == Some(true) {
+        ("ОСТАВЛЕНО", Tone::Good)
+    } else {
+        ("НЕ ПРИМЕНЕНО", Tone::Bad)
+    };
+    frame.row(&format!(" {status}: {}", name(report, primary)), tone);
+    if restored {
+        frame.row(
+            " Новый обход не запустился. Восстановлен прежний.",
+            Tone::Warning,
+        );
+    } else if report_only {
+        frame.row(" Настройки не менялись: выбран режим отчёта.", Tone::Text);
+    } else if accepted && report["primary_changed"] != true {
+        frame.row(
+            if primary == best && report["recommendation_status"] == "confirmed" {
+                " Текущая стратегия — лучший подтверждённый вариант."
+            } else if report["choice"] == "kept" {
+                " По вашему выбору сохранена текущая стратегия."
+            } else {
+                " Смена основной не требовалась; результаты сохранены."
+            },
+            Tone::Text,
+        );
+    } else if !accepted {
+        if retained == Some(true) {
+            frame.row(
+                " Прежний порядок автосмены прошёл повторную проверку.",
+                Tone::Good,
+            );
+        } else if retained == Some(false) {
+            frame.row(
+                " Прежний порядок автосмены тоже не прошёл проверку.",
+                Tone::Warning,
+            );
+        }
+        if let Some(error) = report["validation_error"].as_str() {
+            frame.row(
+                &format!(
+                    " Сбой финальной проверки — {}.",
+                    final_targets(report, error)
+                ),
+                Tone::Warning,
+            );
+        } else if report["quality_eligible"] == false {
+            frame.row(
+                " Измерения нестабильны. Настройки сохранены без изменений.",
+                Tone::Warning,
+            );
+        } else {
+            frame.row(" Проверка не меняла основную стратегию.", Tone::Text);
+        }
+    }
+    if report["startup"]["requested"] == false && report["startup"]["reason"] == "BypassWasStopped"
+    {
+        frame.row(
+            " Обход выключен. Включить — пункт 1 главного меню.",
+            Tone::Secondary,
+        );
+    } else if report["startup_error"].is_string() {
+        frame.row(
+            " Настройки сохранены, но запуск обхода не подтверждён.",
+            Tone::Warning,
+        );
+    } else if report["startup"]["running"] == true {
+        let message = match (historical, accepted) {
+            (true, _) => " После проверки обход был запущен.",
+            (false, false) => " Обход запущен с прежними настройками.",
+            (false, true) => " Обход работает.",
+        };
+        frame.row(message, Tone::Good);
+    }
+    if accepted {
+        if let Some(actual) = report["final_details"]
+            .as_array()
+            .filter(|rows| !rows.is_empty())
+        {
+            let ok = actual.iter().filter(|row| row["state"] == "OK").count();
+            frame.row(
+                &format!(" Рабочий режим: ответили {ok}/{} адресов.", actual.len()),
+                Tone::Text,
+            );
+            if ok < actual.len() {
+                frame.row(
+                    &format!(
+                        " {} адресов остались недоступны; подробности в отчёте.",
+                        actual.len() - ok
+                    ),
+                    Tone::Warning,
+                );
+            }
+        }
+    }
+    if let Some(reason) = speed_reason(report) {
+        frame.row(&reason, Tone::Good);
+    }
+    if let Some(ms) = report["elapsed_ms"].as_f64() {
+        let seconds = (ms / 1000.).round() as u64;
+        frame.row(
+            &format!(
+                " Проверено: {} стратегий за {} мин {:02} с.",
+                rows.len(),
+                seconds / 60,
+                seconds % 60
+            ),
+            Tone::Secondary,
+        );
+    }
+    frame.separator("ЛУЧШИЕ ИЗ ПРОВЕРЕННЫХ");
+    let mut ordered: Vec<_> = rows.iter().collect();
+    ordered.sort_by_key(|row| row["id"].as_str() != Some(best));
+    for row in ordered.into_iter().take(3) {
+        let id = row["id"].as_str().unwrap_or("");
+        let confirmed = report["final_checks"][id]["confirmed"].as_bool();
+        let flag = if confirmed == Some(false) {
+            " · финал не пройден"
+        } else if confirmed == Some(true) {
+            " · проверена"
+        } else {
+            ""
+        };
+        frame.row(
+            &format!(
+                " {} · {}{}{}{}",
+                name(report, id),
+                row["score"]
+                    .as_f64()
+                    .map(points)
+                    .unwrap_or_else(|| "—".into()),
+                flag,
+                connection_timing(report, id)
+                    .map(|(tcp, tls)| format!(" · TCP {tcp:.0} / TLS {tls:.0} мс"))
+                    .unwrap_or_default(),
+                request_timing(report, id)
+                    .map(|(total, _, _)| format!(" · всего {total:.0} мс"))
+                    .unwrap_or_default()
+            ),
+            if confirmed == Some(false) {
+                Tone::Bad
+            } else if report["strategy_quality"][id] == false {
+                Tone::Warning
+            } else {
+                Tone::Good
+            },
+        );
+    }
+    if full_request_policy(report) {
+        frame.row(
+            " Задержка по всем группам; всего = DNS → ответ и данные.",
+            Tone::Secondary,
+        );
+        if let Some((_, p95, stage)) = request_timing(report, best) {
+            frame.row(
+                &format!(
+                    " {stage} {} P95 успешных запросов ~{p95:.0} мс.",
+                    name(report, best)
+                ),
+                Tone::Secondary,
+            );
+        }
+    } else if report["selection_policy"] == "availability-then-paired-connections-v1" {
+        frame.row(
+            " TCP/TLS — подключение к сервисам; игровой пинг не измерялся.",
+            Tone::Secondary,
+        );
+    }
+    frame.separator("");
+    if let Some(path) = report["report_file"].as_str() {
+        let file = path.rsplit(['\\', '/']).next().unwrap_or(path);
+        frame.row(&format!(" Подробности: runtime\\{file}"), Tone::Secondary);
+    }
+    frame
+}
+
+fn comparison_frame(report: &Value, viewport: Viewport) -> Frame {
+    let assessment = if report["protocol"] == "finalists-native-v1" {
+        &report["assessment"]
+    } else {
+        report
+    };
+    let mut frame = Frame::new(viewport, "Сравнение стратегий");
+    if let (Some(first), Some(second)) = (report["a_name"].as_str(), report["b_name"].as_str()) {
+        frame.row(&format!(" A: {first}"), Tone::Text);
+        frame.row(&format!(" B: {second}"), Tone::Text);
+        frame.separator("");
+    }
+    let (conclusion, tone) = match assessment["status"].as_str() {
+        Some("ConsistentImprovement") => (
+            " Вторая стратегия быстрее подключалась к части адресов; ухудшений не обнаружено.",
+            Tone::Good,
+        ),
+        Some("NoClearDifference") => (" Устойчивой разницы не обнаружено.", Tone::Text),
+        _ => (
+            " Данных недостаточно для вывода. Есть пропуски или нестабильные измерения.",
+            Tone::Warning,
+        ),
+    };
+    frame.row(conclusion, tone);
+    if assessment["resources"]["status"] == "Ready" {
+        for arm in ["a", "b"] {
+            if let Some(percent) =
+                assessment["resources"][arm]["cpu_percent_one_core_weighted"].as_f64()
+            {
+                frame.row(
+                    &format!(
+                        " Нагрузка на одно ядро {}: {}%",
+                        arm.to_uppercase(),
+                        points(percent)
+                    ),
+                    Tone::Text,
+                );
+            }
+        }
+    }
+    frame.separator("");
+    frame.row(
+        " Проверялось соединение с сайтами. Пинг игры не измерялся.",
+        Tone::Text,
+    );
+    frame.row(" Сравнение не меняет основную стратегию.", Tone::Secondary);
+    frame
+}
+
+fn ranking_frame(
+    report: &Value,
+    rows: &[Value],
+    best: &str,
+    shown: usize,
+    viewport: Viewport,
+    historical: bool,
+) -> Frame {
+    let mut frame = Frame::new(
+        viewport,
+        if historical {
+            "Результат прошлой проверки"
+        } else {
+            "Автоподбор завершён"
+        },
+    );
+    frame.row(&format!(" Проверено стратегий: {}", rows.len()), Tone::Text);
+    if let Some(ms) = report["elapsed_ms"].as_f64() {
+        frame.row(
+            &format!(" Время проверки: {} с", points(ms / 1000.)),
+            Tone::Secondary,
+        );
+    }
+    let has_counts = report["availability"].is_object();
+    let has_timing = report["timings"]
+        .as_object()
+        .is_some_and(|map| !map.is_empty());
+    let best_score = rows
+        .iter()
+        .filter(|row| report["strategy_quality"][row["id"].as_str().unwrap_or("")] != false)
+        .filter_map(|row| row["score"].as_f64())
+        .fold(f64::NEG_INFINITY, f64::max);
+    let recommendation_confirmed = report["recommendation_status"] == "confirmed"
+        && report["final_checks"][best]["confirmed"] == true;
+    let name_width = viewport
+        .inner_width()
+        .saturating_sub(if has_counts { 20 } else { 11 })
+        .saturating_sub(if has_timing { 18 } else { 0 })
+        .max(1);
+    frame.separator("");
+    frame.row(
+        &(if has_counts {
+            format!(
+                " {:<name_width$} {:>7} {:>7}",
+                "Стратегия", "Ответы", "Оценка"
+            )
+        } else {
+            format!(" {:<name_width$} {:>7}", "Стратегия", "Оценка")
+        } + if has_timing {
+            "   TCP мс   TLS мс"
+        } else {
+            ""
+        }),
+        Tone::Secondary,
+    );
+    for row in rows.iter().take(shown) {
+        let id = row["id"].as_str().unwrap_or("");
+        let unconfirmed = report["strategy_quality"][id] == false;
+        let failed_final = report["final_checks"][id]["confirmed"] == false;
+        let display_name = if failed_final {
+            format!("! {}", name(report, id))
+        } else if unconfirmed {
+            format!("{} *", name(report, id))
+        } else if id == best {
+            format!("> {}", name(report, id))
+        } else {
+            name(report, id)
+        };
+        let name = label(&display_name, name_width);
+        let score = row["score"]
+            .as_f64()
+            .map(points)
+            .unwrap_or_else(|| "—".into());
+        let mut text = if has_counts {
+            let counts = &report["availability"][id];
+            let responses = counts["ok"]
+                .as_u64()
+                .zip(counts["total"].as_u64())
+                .map(|(ok, total)| format!("{ok}/{total}"))
+                .unwrap_or_else(|| "—".into());
+            format!(" {name:<name_width$} {responses:>7} {score:>7}")
+        } else {
+            format!(" {name:<name_width$} {score:>7}")
+        };
+        if has_timing {
+            let timing = &report["timings"][id];
+            let pair = connection_timing(report, id)
+                .or_else(|| timing["tcp_ms"].as_f64().zip(timing["tls_ms"].as_f64()));
+            match pair {
+                Some((tcp, tls)) => text.push_str(&format!(" {tcp:>8.0} {tls:>8.0}")),
+                None => text.push_str(&format!(" {:>8} {:>8}", "—", "—")),
+            }
+        }
+        frame.row(
+            &text,
+            if failed_final {
+                Tone::Bad
+            } else if unconfirmed
+                || (id == best
+                    && report["validation_error"].is_string()
+                    && !recommendation_confirmed)
+            {
+                Tone::Warning
+            } else if id == best {
+                Tone::Good
+            } else {
+                result_tone(
+                    true,
+                    false,
+                    row["harm"].as_u64().unwrap_or(0) as usize,
+                    row["score"].as_f64().unwrap_or(best_score),
+                    best_score,
+                )
+            },
+        );
+    }
+    if shown < rows.len() {
+        frame.row(
+            &format!(" Показаны лучшие: {shown} из {}.", rows.len()),
+            Tone::Secondary,
+        );
+    }
+    frame.row(
+        " Выше оценка — лучше результат с учётом повторов и замедлений.",
+        Tone::Text,
+    );
+    frame.row(
+        " Зелёный — лидеры теста; красный — слабый результат или отказ в финале.",
+        Tone::Secondary,
+    );
+    frame.separator("");
+    let excluded = rows
+        .iter()
+        .filter(|row| {
+            row["id"]
+                .as_str()
+                .is_some_and(|id| report["strategy_quality"][id] == false)
+        })
+        .count();
+    if report["quality_eligible"] == false {
+        frame.row(
+            " Проверка получилась нестабильной. Результат не применён.",
+            Tone::Warning,
+        );
+    } else if excluded > 0 {
+        frame.row(
+            &format!(
+                " Нестабильные измерения исключены: {excluded} из {}.",
+                rows.len()
+            ),
+            Tone::Warning,
+        );
+    }
+    if excluded > 0 {
+        let reasons: std::collections::BTreeSet<_> = report["quality_reasons"]
+            .as_object()
+            .into_iter()
+            .flat_map(|map| map.values())
+            .filter_map(Value::as_array)
+            .flatten()
+            .filter_map(Value::as_str)
+            .collect();
+        for reason in reasons.iter().take(3) {
+            frame.row(&format!(" {reason}"), Tone::Warning);
+        }
+        if reasons.len() > 3 {
+            frame.row(
+                " Остальные причины сохранены в отчёте JSON.",
+                Tone::Secondary,
+            );
+        }
+    }
+    let best_label = if recommendation_confirmed {
+        "Рекомендация"
+    } else if report["validation_error"].is_string() || report["recommendation_status"].is_string()
+    {
+        "Лидер отдельного теста"
+    } else if report["quality_eligible"] == false {
+        "Лучший предварительный результат"
+    } else if excluded > 0 {
+        "Лучший из подтверждённых"
+    } else {
+        "Лучший результат"
+    };
+    frame.row(
+        &format!(" {best_label}: {}", name(report, best)),
+        if recommendation_confirmed {
+            Tone::Good
+        } else if report["quality_eligible"] == false
+            || report["validation_error"].is_string()
+            || report["recommendation_status"] == "unconfirmed"
+        {
+            Tone::Warning
+        } else {
+            Tone::Good
+        },
+    );
+    if recommendation_confirmed {
+        frame.row(" Рабочий режим рекомендации подтверждён.", Tone::Good);
+        if let Some(reason) = speed_reason(report) {
+            frame.row(&reason, Tone::Good);
+        }
+        if let Some(trial) = report["trial_best"]["id"].as_str().filter(|id| *id != best) {
+            frame.row(
+                &format!(" Лидер отдельного теста: {}", name(report, trial)),
+                Tone::Secondary,
+            );
+        }
+    }
+    if let Some(checks) = report["final_checks"].as_object() {
+        for (id, check) in checks
+            .iter()
+            .filter(|(_, check)| check["confirmed"] == false)
+        {
+            frame.row(
+                &format!(" ФИНАЛ НЕ ПРОЙДЕН: {}", name(report, id)),
+                Tone::Bad,
+            );
+            if let Some(error) = check["error"].as_str() {
+                frame.row(&format!(" {error}"), Tone::Bad);
+            }
+        }
+    }
+    let primary = report["primary"].as_str().unwrap_or("");
+    let restored = report["startup"]["restored"] == true;
+    let changed = report["primary_changed"] == true && report["accepted"] == true;
+    let state = if historical && restored {
+        "Прежний обход был восстановлен; основная после проверки"
+    } else if historical {
+        "Основная после проверки"
+    } else if restored {
+        "Прежний обход восстановлен"
+    } else if changed {
+        "Основная изменена"
+    } else {
+        "Основная сохранена"
+    };
+    frame.row(
+        &format!(" {state}: {}", name(report, primary)),
+        if changed && !restored {
+            Tone::Good
+        } else if restored {
+            Tone::Warning
+        } else {
+            Tone::Secondary
+        },
+    );
+    if report["choice"] == "kept" && recommendation_confirmed && best != primary {
+        frame.row(
+            " По вашему выбору оставлена текущая основная стратегия.",
+            Tone::Text,
+        );
+    } else if report["choice"] == "unconfirmed" {
+        frame.row(
+            " Лучшие варианты не подтвердили рабочий режим. Основная сохранена.",
+            Tone::Warning,
+        );
+    }
+    if report["accepted"] == false && !restored {
+        frame.row(
+            if historical {
+                " Настройки тогда не изменялись."
+            } else {
+                " Настройки не изменены."
+            },
+            Tone::Text,
+        );
+    }
+    if let Some(error) = report["validation_error"].as_str() {
+        frame.row(
+            " Финальная проверка не пройдена. Прежние настройки сохранены.",
+            Tone::Bad,
+        );
+        frame.row(&format!(" {error}"), Tone::Bad);
+    }
+    if let Some(passed) = report["retained_check"]["confirmed"].as_bool() {
+        if passed {
+            frame.row(
+                " Прежний порядок автосмены прошёл повторную проверку.",
+                Tone::Good,
+            );
+        } else if let Some(error) = report["retained_check"]["error"].as_str() {
+            frame.row(
+                &format!(" Проверка прежнего порядка автосмены — {error}"),
+                Tone::Warning,
+            );
+        }
+    }
+    if report["cache_error"].is_string() {
+        frame.row(
+            " Не удалось сохранить историю пропусков; следующий подбор проверит весь быстрый пул.",
+            Tone::Warning,
+        );
+    }
+    if let Some(deferred) = report["deferred_history"]
+        .as_array()
+        .filter(|ids| !ids.is_empty())
+    {
+        frame.row(
+            &format!(
+                " По истории отложены слабые стратегии: {}. Полный тест проверяет все.",
+                deferred.len()
+            ),
+            Tone::Secondary,
+        );
+    }
+    if let Some(path) = report["report_file"].as_str() {
+        frame.row(&format!(" Подробный отчёт: {path}"), Tone::Secondary);
+    }
+    if report["startup_error"].is_string() {
+        frame.row(
+            " Запуск обхода после проверки не подтверждён.",
+            Tone::Warning,
+        );
+    }
+    if let Some(rows) = report["webcheck"]["rows"].as_array() {
+        let browser: Vec<_> = rows
+            .iter()
+            .filter(|row| matches!(row["mode"].as_str(), Some("BrowserAuto" | "BrowserTcp")))
+            .collect();
+        let passed = !browser.is_empty()
+            && browser.iter().all(|row| {
+                row["state"] == "OK" && row["complete"] == true && row["cleanup_complete"] == true
+            });
+        frame.row(
+            if passed {
+                " Браузер: проверка пройдена."
+            } else {
+                " Браузер: есть ошибки, смотрите отчёт проверки."
+            },
+            if passed { Tone::Good } else { Tone::Warning },
+        );
+    } else if report["webcheck"].is_object() {
+        frame.row(" Проверка браузера не завершена.", Tone::Warning);
+    }
+    frame
+}
+
+pub fn result_text(report: &Value) -> Option<String> {
+    let mut complete = report.clone();
+    complete["presentation"] = Value::String("detailed".into());
+    let mut text = result_frame(
+        &complete,
+        Viewport {
+            columns: 80,
+            rows: usize::MAX,
+        },
+    )
+    .map(Frame::plain)?;
+    if report["timings"].is_object() {
+        text.push_str("\r\n\r\nСводка по стратегиям\r\n");
+        if full_request_policy(report) {
+            text.push_str("Полное время тестового запроса: DNS, TCP, TLS, ответ и передача данных до конца ответа или лимита 64 КиБ. Медиана и P95 — по стабильным успешным запросам всех групп; ошибки и повторы учитываются отдельно. TCP и TLS в этой сводке — длительности отдельных этапов.\r\n");
+        }
+        for row in report["rows"].as_array().into_iter().flatten() {
+            let id = row["id"].as_str().unwrap_or("");
+            let n = |v: &Value| {
+                v.as_f64()
+                    .filter(|v| v.is_finite())
+                    .map(points)
+                    .unwrap_or_else(|| "—".into())
+            };
+            let phases = if report["timings"][id]["overall"].is_object() {
+                &report["timings"][id]["overall"]
+            } else {
+                &report["timings"][id]
+            };
+            text.push_str(&format!("{}: балл {} | ответили {}/{} | вред {} | зависаний {} | TCP ~{} мс | TLS ~{} мс | время {} с\r\n",
+                name(report,id),n(&row["score"]),n(&report["availability"][id]["ok"]),n(&report["availability"][id]["total"]),n(&row["harm"]),n(&row["freeze"]),
+                n(&phases["tcp_ms"]),n(&phases["tls_ms"]),report["timings"][id]["elapsed_ms"].as_f64().map(|v|points(v/1000.)).unwrap_or_else(||"—".into())));
+            let overall = &report["timings"][id]["overall"];
+            if overall.is_object() {
+                text.push_str(&format!("  Все группы: DNS {} мс | TCP {} мс | TLS {} мс | первый ответ {} мс | всего {} мс | P95 {} мс | стабильных замеров {} | ошибок {} | со второй попытки {}\r\n",
+                    n(&overall["dns_ms"]), n(&overall["tcp_ms"]), n(&overall["tls_ms"]), n(&overall["first_byte_ms"]), n(&overall["total_ms"]), n(&overall["p95_ms"]), n(&overall["samples"]), n(&overall["errors"]), n(&overall["recovered"])));
+                if let Some(groups) = overall["groups"].as_object() {
+                    for (group, timing) in groups {
+                        text.push_str(&format!("  {group}: ответили {}/{} | всего {} мс | P95 {} мс | стабильных замеров {}\r\n", n(&timing["ok"]), n(&timing["total"]), n(&timing["total_ms"]), n(&timing["p95_ms"]), n(&timing["samples"])));
+                    }
+                }
+            }
+            let mut parts = Vec::new();
+            for (key, label) in [
+                ("DPI", "16–20 КБ"),
+                ("Discord", "Discord"),
+                ("YouTube", "YouTube"),
+                ("SoundCloud", "SoundCloud"),
+                ("NBA2K", "2K"),
+                ("EAC", "EAC/Epic"),
+                ("Clean", "обычные сайты"),
+            ] {
+                if row["group_totals"][key].is_number() {
+                    parts.push(format!(
+                        "{label} {}/{}",
+                        n(&row["groups"][key]),
+                        n(&row["group_totals"][key])
+                    ));
+                }
+            }
+            if !parts.is_empty() {
+                text.push_str(&format!("  {}\r\n", parts.join(" | ")));
+            }
+        }
+    }
+    if let Some(details) = report["details"].as_object() {
+        text.push_str("\r\n\r\nПодробные результаты. TCP/TLS — мс от начала DNS до подключения и завершения TLS; HTTP — код ответа. x2 — повтор, нестабильно — ответ только со второй попытки.\r\n");
+        let mut order = vec!["0"];
+        order.extend(
+            report["rows"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|row| row["id"].as_str()),
+        );
+        for id in order {
+            let Some(rows) = details.get(id).and_then(Value::as_array) else {
+                continue;
+            };
+            text.push_str(&format!(
+                "\r\n{}\r\n",
+                if id == "0" {
+                    "Без обхода".into()
+                } else {
+                    name(report, id)
+                }
+            ));
+            for row in rows {
+                text.push_str(&detail_line(row));
+                text.push_str("\r\n");
+            }
+        }
+        if let Some(rows) = report["final_details"]
+            .as_array()
+            .filter(|rows| !rows.is_empty())
+        {
+            text.push_str("\r\nФинальная комбинация\r\n");
+            for row in rows {
+                text.push_str(&detail_line(row));
+                text.push_str("\r\n");
+            }
+        }
+    }
+    if let Some(reference) = report["working_reference"]
+        .as_array()
+        .filter(|rows| !rows.is_empty())
+    {
+        text.push_str("\r\n\r\nРабочий режим до применения (основа проверки регрессий)\r\n");
+        for row in reference {
+            text.push_str(&detail_line(row));
+            text.push_str("\r\n");
+        }
+    }
+    if let Some(checks) = report["final_checks"]
+        .as_object()
+        .filter(|map| !map.is_empty())
+    {
+        text.push_str("\r\n\r\nФинальные проверки кандидатов\r\n");
+        for (id, check) in checks {
+            text.push_str(&format!(
+                "\r\nРабочий режим: {} — {}\r\n",
+                name(report, id),
+                if check["confirmed"] == true {
+                    "ПОДТВЕРЖДЁН"
+                } else {
+                    "НЕ ПРОЙДЕН"
+                }
+            ));
+            if let Some(error) = check["error"].as_str() {
+                text.push_str(error);
+                text.push_str("\r\n");
+            }
+            for row in check["details"].as_array().into_iter().flatten() {
+                text.push_str(&detail_line(row));
+                text.push_str("\r\n");
+            }
+        }
+    }
+    if let Some(rows) = report["retained_check"]["details"].as_array() {
+        text.push_str("\r\nПовторная проверка прежнего порядка автосмены\r\n");
+        for row in rows {
+            text.push_str(&detail_line(row));
+            text.push_str("\r\n");
+        }
+    }
+    Some(text)
+}
+
+fn detail_line(row: &Value) -> String {
+    let field = |key: &str| row[key].as_str().unwrap_or("—");
+    let ms = |key: &str| {
+        row[key]
+            .as_f64()
+            .filter(|v| v.is_finite())
+            .map(|v| format!("{v:.0}"))
+            .unwrap_or_else(|| "—".into())
+    };
+    format!(
+        "  {}/{} | {} | HTTP {} | DNS {} мс | TCP {} мс | TLS {} мс | всего {} мс | отправлено {} / получено {} байт{}{}",
+        field("group"),
+        field("name"),
+        field("state"),
+        field("code"),
+        ms("dns_ms"),
+        ms("tcp_ms"),
+        ms("tls_ms"),
+        ms("total_ms"),
+        ms("up"),
+        ms("down"),
+        if row["tries"].as_u64().unwrap_or(1) > 1 {
+            " | x2"
+        } else {
+            ""
+        },
+        if row["flaky"] == true {
+            " | нестабильно"
+        } else {
+            ""
+        }
+    )
+}
+
+pub fn run_summary(
+    app: &crate::App,
+    name: &str,
+    summary: &zapret_core::RankRow,
+    counts: &Value,
+    timing: &Value,
+    rows: &[crate::selection::Row],
+    state: RunState,
+) -> anyhow::Result<()> {
+    if app.json {
+        return Ok(());
+    }
+    let ms = |key: &str| {
+        timing[key]
+            .as_f64()
+            .filter(|v| v.is_finite())
+            .map(|v| format!("{v:.0}"))
+            .unwrap_or_else(|| "—".into())
+    };
+    let tone = if summary.id == "0" {
+        Tone::Secondary
+    } else {
+        result_tone(
+            state.qualified,
+            state.leader,
+            summary.harm,
+            summary.score,
+            state.best_score,
+        )
+    };
+    if !state.details {
+        let marker = if !state.qualified {
+            " · нестабильно"
+        } else if state.leader {
+            " · лидер"
+        } else {
+            ""
+        };
+        let prefix = if state.position > 0 {
+            format!("[{:02}/{:02}] ", state.position, state.total)
+        } else {
+            String::new()
+        };
+        crate::console::line(
+            &format!(
+                "{prefix}{} · {}/{} · TCP {} / TLS {} · всего {} мс{marker}",
+                label(name, 24),
+                counts["ok"],
+                counts["total"],
+                timing["overall"]["tcp_ms"]
+                    .as_f64()
+                    .map(|v| format!("{v:.0}"))
+                    .unwrap_or_else(|| ms("tcp_ms")),
+                timing["overall"]["tls_ms"]
+                    .as_f64()
+                    .map(|v| format!("{v:.0}"))
+                    .unwrap_or_else(|| ms("tls_ms")),
+                timing["overall"]["total_ms"]
+                    .as_f64()
+                    .map(|v| format!("{v:.0}"))
+                    .unwrap_or_else(|| "—".into())
+            ),
+            tone,
+        )?;
+        return Ok(());
+    }
+    if summary.id != "0" {
+        let label = if !state.qualified {
+            "КОНТРОЛЬ НЕ ПОДТВЕРЖДЁН"
+        } else if state.leader {
+            "ЛИДЕР В ТЕСТЕ"
+        } else if tone == Tone::Good {
+            "БЛИЗКО К ЛИДЕРУ"
+        } else if tone == Tone::Bad {
+            "СЛАБЫЙ РЕЗУЛЬТАТ"
+        } else {
+            "РЕЗУЛЬТАТ"
+        };
+        crate::console::line(&format!("  {label}: {name}"), tone)?;
+    }
+    crate::console::line(
+        &format!(
+            "  {name}: балл {} | ответили {}/{} | зачёт {}/{} | вред {}/{} | зависаний {} | TCP ~{} мс | TLS ~{} мс | время {} с",
+            points(summary.score),
+            counts["ok"],
+            counts["total"],
+            points(summary.ok),
+            summary.total,
+            summary.harm,
+            summary.group_totals.get("Clean").copied().unwrap_or(0),
+            summary.freeze,
+            ms("tcp_ms"),
+            ms("tls_ms"),
+            timing["elapsed_ms"]
+                .as_f64()
+                .map(|v| points(v / 1000.))
+                .unwrap_or_else(|| "—".into())
+        ),
+        tone,
+    )?;
+    let mut groups = Vec::new();
+    for (key, label) in [
+        ("DPI", "16–20 КБ"),
+        ("Discord", "Discord"),
+        ("YouTube", "YouTube"),
+        ("SoundCloud", "SoundCloud"),
+        ("NBA2K", "2K"),
+        ("EAC", "EAC/Epic"),
+    ] {
+        if let Some(total) = summary.group_totals.get(key) {
+            groups.push(format!(
+                "{label} {}/{total}",
+                points(summary.groups.get(key).copied().unwrap_or(0.))
+            ));
+        }
+    }
+    crate::console::line(
+        &format!(
+            "  {} | повторено адресов: {}",
+            groups.join(" | "),
+            timing["retries"]
+        ),
+        Tone::Text,
+    )?;
+    let flaky: Vec<_> = rows
+        .iter()
+        .filter(|row| row.flaky)
+        .map(|row| row.name.as_str())
+        .collect();
+    if !flaky.is_empty() {
+        crate::console::line(
+            &format!("  Открылись со второй попытки: {}", flaky.join(", ")),
+            Tone::Warning,
+        )?;
+    }
+    Ok(())
+}
+
+pub fn progress(app: &crate::App, text: &str) -> anyhow::Result<()> {
+    if !app.json {
+        crate::console::line(text, Tone::Text)?;
+    }
+    Ok(())
+}
+
+pub fn detail(app: &crate::App, enabled: bool, text: &str) -> anyhow::Result<()> {
+    if enabled {
+        progress(app, text)?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn compact_outcome_leads_with_the_saved_strategy_and_keeps_details_in_the_file() {
+        let mut data = report();
+        data["presentation"] = json!("compact");
+        data["accepted"] = json!(true);
+        data["primary_changed"] = json!(true);
+        data["primary"] = json!("52");
+        data["elapsed_ms"] = json!(95000.);
+        data["final_checks"] = json!({"52":{"confirmed":true}});
+        data["recommendation_status"] = json!("confirmed");
+        let frame = result_frame(
+            &data,
+            Viewport {
+                columns: 80,
+                rows: 24,
+            },
+        )
+        .unwrap();
+        assert!(frame.has_tone(Tone::Good, "ПРИМЕНЕНО: ALT11 белый 3"));
+        assert!(frame.height() <= 16);
+        let text = frame.plain();
+        assert!(text.contains("1 мин 35 с"));
+        assert!(!text.contains("Настройки не изменены"));
+    }
+
+    #[test]
+    fn compact_rejection_names_the_retained_primary_without_repeating_all_final_errors() {
+        let mut data = report();
+        data["presentation"] = json!("compact");
+        data["validation_error"] =
+            json!("Финальная комбинация не подтвердила DPI/Hetzner: FAIL, TCP 30 мс, TLS 0 мс");
+        data["final_checks"] = json!({"52":{"confirmed":false,"error":data["validation_error"]}});
+        let frame = result_frame(
+            &data,
+            Viewport {
+                columns: 55,
+                rows: 24,
+            },
+        )
+        .unwrap();
+        assert!(frame.has_tone(Tone::Bad, "НЕ ПРИМЕНЕНО:"));
+        let text = frame.plain();
+        assert!(text.contains("ALT11 белый 1") && text.contains("Hetzner"));
+        assert!(!text.contains("TLS 0 мс"));
+        assert!(text.lines().count() <= 18);
+        assert!(result_text(&data).unwrap().contains("TLS 0 мс"));
+    }
+
+    #[test]
+    fn cached_rejection_shows_all_working_losses_and_the_origin_of_the_latency() {
+        let mut data = report();
+        data["presentation"] = json!("compact");
+        data["selection_policy"] = json!("availability-then-full-request-latency-v2");
+        data["validation_error"] = json!("Финальная комбинация не подтвердила DPI/Hetzner: FAIL");
+        data["working_reference"] = json!([
+            {"group":"DPI","name":"Hetzner","url":"https://a.test/","state":"OK"},
+            {"group":"DPI","name":"OVH","url":"https://b.test/","state":"OK"}]);
+        data["final_details"] = json!([
+            {"group":"DPI","name":"OVH","url":"https://b.test/","state":"FAIL"},
+            {"group":"DPI","name":"Hetzner","url":"https://a.test/","state":"FAIL"}]);
+        data["timings"] = json!({"52":{"overall":{"total_ms":281.,"p95_ms":1352.}}});
+        let viewport = Viewport {
+            columns: 100,
+            rows: 36,
+        };
+        let text = result_frame_mode(&data, viewport, true).unwrap().plain();
+        assert!(text.contains("DPI/Hetzner, DPI/OVH"));
+        assert!(text.contains("В отдельном тесте") && !text.contains("У рекомендации"));
+        data["retained_check"] = json!({"confirmed":true,"details":[]});
+        let frame = result_frame(&data, viewport).unwrap();
+        assert!(frame.has_tone(Tone::Good, "ОСТАВЛЕНО"));
+        assert!(frame.plain().contains("Прежний порядок автосмены прошёл"));
+    }
+
+    #[test]
+    fn primary_choice_rejects_an_accidental_russian_comma_instead_of_silently_keeping() {
+        assert_eq!(primary_answer("б"), None);
+        assert_eq!(primary_answer("y"), Some(true));
+        assert_eq!(primary_answer("n"), Some(false));
+        assert_eq!(primary_answer(""), Some(false));
+    }
+
+    #[test]
+    fn full_latency_result_uses_all_targets_and_only_short_confirmation_labels() {
+        let mut data = report();
+        data["presentation"] = json!("compact");
+        data["selection_policy"] = json!("availability-then-full-request-latency-v2");
+        data["connection_selection"] = json!({"confirmed":true,"reference":"50","candidate":"52",
+            "working":{"scope":"AllTargets","targets":50,"gain_ms":40.,"reference_tcp_ms":60.,"candidate_tcp_ms":40.,
+                "reference_tls_ms":80.,"candidate_tls_ms":60.,"reference_total_ms":240.,"candidate_total_ms":200.,
+                "reference_p95_ms":450.,"candidate_p95_ms":400.}});
+        let text = result_frame(
+            &data,
+            Viewport {
+                columns: 100,
+                rows: 40,
+            },
+        )
+        .unwrap()
+        .plain();
+        assert!(
+            text.contains("полный запрос быстрее на ~40 мс") && text.contains("адресов: 50"),
+            "{text}"
+        );
+        assert!(
+            text.contains("всего 200 мс") && text.contains("400 мс"),
+            "{text}"
+        );
+        assert!(!text.contains("к 2K/EAC"), "{text}");
+        let prompt = primary_frame(
+            &data,
+            Viewport {
+                columns: 100,
+                rows: 40,
+            },
+        )
+        .plain();
+        assert!(prompt.contains("y") && prompt.contains("n"));
+        assert!(!prompt.contains("yes") && !prompt.contains("no") && !prompt.contains("[д/Н]"));
+    }
+
+    #[test]
+    fn leader_bad_and_unconfirmed_results_have_distinct_meaningful_colors() {
+        assert_eq!(result_tone(true, true, 0, 50., 50.), Tone::Good);
+        assert_eq!(result_tone(true, false, 6, 20., 50.), Tone::Bad);
+        assert_eq!(result_tone(false, false, 0, 51., 50.), Tone::Warning);
+        assert_eq!(result_tone(true, false, 0, 47., 50.), Tone::Text);
+    }
+    use serde_json::json;
+
+    #[test]
+    fn history_does_not_present_the_previous_primary_as_the_current_setting() {
+        let data = report();
+        let original = data.clone();
+        let text = result_frame_mode(
+            &data,
+            Viewport {
+                columns: 80,
+                rows: 30,
+            },
+            true,
+        )
+        .unwrap()
+        .plain();
+        assert!(text.contains("прошлой проверки"));
+        assert!(text.contains("Основная после проверки"));
+        assert!(!text.contains("Основная сохранена"));
+        assert_eq!(data, original);
+    }
+
+    #[test]
+    fn comparison_has_a_readable_conclusion_without_changing_its_signed_record() {
+        let report = json!({"protocol":"finalists-native-v1","a_name":"ALT11 белый 1","b_name":"ALT11 белый 3",
+            "completion_hash":"signed-record", "assessment":{"status":"NoClearDifference","reasons":[],"resources":{"status":"Unavailable"}}});
+        let original = report.clone();
+        let text = result_frame(
+            &report,
+            Viewport {
+                columns: 55,
+                rows: 16,
+            },
+        )
+        .unwrap()
+        .plain();
+        assert!(text.contains("ALT11 белый 1") && text.contains("ALT11 белый 3"));
+        assert!(text.contains("Устойчивой разницы не обнаружено"));
+        assert!(!text.contains("NoClearDifference") && !text.contains("completion_hash"));
+        assert_eq!(report, original);
+    }
+
+    fn report() -> Value {
+        json!({"schema":1,"best":{"id":"52","score":48.,"total":54},
+            "rows":[{"id":"52","score":48.,"total":54},{"id":"50","score":46.5,"total":54}],
+            "availability":{"52":{"ok":49,"total":54},"50":{"ok":48,"total":54}},
+            "strategy_names":{"52":"ALT11 белый 3","50":"ALT11 белый 1"},
+            "primary":"50","primary_changed":false,"accepted":false,"quality_eligible":true,
+            "rounds_measured":{"52":1,"50":1},
+            "journal":"C:/private/runtime/test-internal.jsonl", "native_identity":"private-hash",
+            "startup":{"running":true,"restored":false}})
+    }
+
+    #[test]
+    fn final_winner_is_green_and_a_rejected_trial_leader_is_red() {
+        let mut data = report();
+        data["trial_best"] = json!({"id":"52"});
+        data["best"] = json!({"id":"50","score":46.5});
+        data["recommendation_status"] = json!("confirmed");
+        data["final_checks"] =
+            json!({"52":{"confirmed":false,"error":"Hetzner: TLS reset"},"50":{"confirmed":true}});
+        let frame = result_frame(
+            &data,
+            Viewport {
+                columns: 80,
+                rows: 80,
+            },
+        )
+        .unwrap();
+        assert!(frame.has_tone(Tone::Bad, "ALT11 белый 3"));
+        assert!(frame.has_tone(Tone::Good, "Рекомендация: ALT11 белый 1"));
+        let text = frame.plain();
+        assert!(text.contains("Hetzner: TLS reset"));
+        assert!(text.contains("Лидер отдельного теста"));
+        assert!(!text.contains("Основная изменена"));
+    }
+
+    #[test]
+    fn failed_historical_report_does_not_call_its_trial_winner_a_working_recommendation() {
+        let mut data = report();
+        data["validation_error"] = json!("Hetzner: TLS reset");
+        let frame = result_frame_mode(
+            &data,
+            Viewport {
+                columns: 80,
+                rows: 80,
+            },
+            true,
+        )
+        .unwrap();
+        assert!(frame.has_tone(Tone::Warning, "Лидер отдельного теста"));
+        assert!(!frame.has_tone(Tone::Good, "Рекомендация:"));
+        let text = frame.plain();
+        assert!(text.contains("Основная после проверки"));
+        assert!(text.contains("Hetzner: TLS reset"));
+    }
+
+    #[test]
+    fn primary_choice_names_both_actions_and_colors_the_verified_recommendation() {
+        let mut data = report();
+        data["final_checks"] = json!({"52":{"confirmed":true}});
+        let frame = primary_frame(
+            &data,
+            Viewport {
+                columns: 55,
+                rows: 30,
+            },
+        );
+        assert!(frame.has_tone(Tone::Good, "Рекомендация: ALT11 белый 3"));
+        let text = frame.plain();
+        assert!(text.contains("y  Применить ALT11 белый 3"));
+        assert!(text.contains("n  Оставить ALT11 белый 1"));
+        assert!(text.contains("Enter — n"));
+        assert!(text.lines().all(|line| line.chars().count() <= 53));
+    }
+
+    #[test]
+    fn text_report_retains_each_final_candidate_failure_and_probe_timing() {
+        let mut data = report();
+        data["final_checks"] = json!({"52":{"confirmed":false,"error":"Hetzner: TLS reset","details":[{"group":"DPI","name":"Hetzner","state":"FAIL","tcp_ms":36.,"tls_ms":0.}]},"50":{"confirmed":true,"details":[]}});
+        let text = result_text(&data).unwrap();
+        assert!(text.contains("Рабочий режим: ALT11 белый 3"));
+        assert!(text.contains("Hetzner: TLS reset"));
+        assert!(text.contains("TCP 36 мс"));
+    }
+
+    #[test]
+    fn ordinary_result_explains_ranking_and_keeps_the_actual_primary_visible() {
+        let mut report = report();
+        report["timings"] = json!({"52":{"tcp_ms":42.,"tls_ms":93.,"elapsed_ms":12000.}});
+        let original = report.clone();
+        let text = result_frame(
+            &report,
+            Viewport {
+                columns: 80,
+                rows: 30,
+            },
+        )
+        .unwrap()
+        .plain();
+        for expected in [
+            "Автоподбор завершён",
+            "ALT11 белый 3",
+            "ALT11 белый 1",
+            "49/54",
+            "46,5",
+            "Оценка",
+            "Основная сохранена",
+            "Настройки не изменены",
+            "TCP",
+            "42",
+            "мс",
+        ] {
+            assert!(text.contains(expected), "missing {expected}: {text}");
+        }
+        for internal in [
+            "quality_eligible",
+            "native_identity",
+            "C:/private",
+            "private-hash",
+            "{\n",
+        ] {
+            assert!(!text.contains(internal), "leaked {internal}");
+        }
+        assert_eq!(report, original);
+    }
+
+    #[test]
+    fn partial_control_failure_explains_which_result_was_excluded() {
+        let mut report = report();
+        report["strategy_quality"] = json!({"52":true,"50":false});
+        report["quality_reasons"] =
+            json!({"50":["Контрольный адрес bing не ответил после измерения."]});
+        let original = report.clone();
+        let text = result_frame(
+            &report,
+            Viewport {
+                columns: 80,
+                rows: 40,
+            },
+        )
+        .unwrap()
+        .plain();
+        assert!(
+            text.contains("Нестабильные измерения исключены: 1 из 2"),
+            "{text}"
+        );
+        assert!(text.contains("bing"), "{text}");
+        assert!(text.contains("Лучший из подтверждённых"), "{text}");
+        assert!(!text.contains("Проверка получилась нестабильной"));
+        assert_eq!(report, original);
+    }
+
+    #[test]
+    fn unstable_or_restored_results_never_claim_the_winner_was_applied() {
+        let mut report = report();
+        report["quality_eligible"] = json!(false);
+        report["startup"]["restored"] = json!(true);
+        let text = result_frame(
+            &report,
+            Viewport {
+                columns: 80,
+                rows: 30,
+            },
+        )
+        .unwrap()
+        .plain();
+        assert!(text.contains("Проверка получилась нестабильной"));
+        assert!(text.contains("Прежний обход восстановлен"));
+        assert!(!text.contains("Основная изменена"));
+    }
+
+    #[test]
+    fn result_fits_a_short_console_and_does_not_invent_coverage_for_an_old_record() {
+        let mut report = report();
+        report.as_object_mut().unwrap().remove("availability");
+        let text = result_frame(
+            &report,
+            Viewport {
+                columns: 55,
+                rows: 16,
+            },
+        )
+        .unwrap()
+        .plain();
+        assert!(
+            text.lines().all(|line| line.chars().count() <= 53),
+            "{text}"
+        );
+        assert!(!text.contains("49/54"));
+        assert!(!text.contains("48/54"));
+        assert!(
+            result_frame(
+                &json!({"settings":{}}),
+                Viewport {
+                    columns: 80,
+                    rows: 30
+                }
+            )
+            .is_none()
+        );
+    }
+}

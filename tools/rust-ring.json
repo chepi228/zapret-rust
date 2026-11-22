@@ -1,0 +1,17 @@
+{
+  "schema": 1,
+  "abi": 1,
+  "backend": "Rust",
+  "base_commit": "221d7dff24bfec0cd5ac0a5070b8acef2008af3d",
+  "base_source_sha256": "c9925bb194eea8c19feb05ea6b24a848e8b50af8c64643b9e394ffe653327d87",
+  "luajit_source_sha256": "5a49743ad6ce4b7f19aac71b55a08052c1feb62750f051982082c12bf62f39c0",
+  "bridge_source_sha256": "DA7F836A81C1CC37B64A420B8B7838D4F1090DEFCA0DEA7CD3234C49335DE509",
+  "hashes": {
+    "bin/cygwin1.dll": "ed9d5379061e5de79c3375cc62246c2142ea1c97d94f4d16bfbea6fb1b7fc889",
+    "bin/winws2.exe": "b1599ae03a62d479a76165ba8131bc3367ceb234e48386cc3f887a076d0bcf99",
+    "bin/zapret-ring.dll": "e7244c711b4f46cc585d6bc7b9609507f1dbf5fc061ed8b80c694349de62e7d5",
+    "lua/autoring.lua": "b6e5e4885fac7fc1bf4098f3560f7247e677f9fa194e6608a600f26ec5e6fc1a",
+    "lua/host-cache.lua": "9691e8e6f5cf781382278a8b166c3b5d631b0071959217f1b534ae2643ab8144",
+    "lua/ring-store.lua": "181d321403b713dc0b082047b4c3f83e7bbe25568faacc604384c9bc96a3ef3e"
+  }
+}

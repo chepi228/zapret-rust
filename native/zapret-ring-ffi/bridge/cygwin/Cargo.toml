@@ -1,0 +1,35 @@
+[package]
+name = "zapret-cygwin-ring-support"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[lib]
+path = "lib.rs"
+crate-type = ["staticlib"]
+test = false
+doctest = false
+
+[features]
+default = ["cygwin-host"]
+cygwin-host = []
+
+[dependencies.windows-sys]
+version = "0.61"
+features = [
+    "Win32_Foundation",
+    "Win32_Security_Cryptography",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_LibraryLoader",
+]
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+# Keep unused Rust core unwind code out of the archive linked by Cygwin.
+lto = true
+panic = "abort"

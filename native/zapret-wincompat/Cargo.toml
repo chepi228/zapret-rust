@@ -1,0 +1,53 @@
+[package]
+name = "zapret-wincompat"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+aes = "0.8"
+aes-gcm = { version = "=0.10.3", default-features = false }
+ctr = "=0.9.2"
+ring = "=0.17.14"
+flate2.workspace = true
+glob = "0.3"
+ghash = "=0.5.1"
+hkdf = "=0.12.4"
+libc = "0.2"
+sha2.workspace = true
+zlib-rs = { version = "=0.6.8", default-features = false, features = ["std", "__internal-api"] }
+windows-sys = { workspace = true, features = [
+    "Win32_Globalization",
+    "Win32_Networking_WinSock",
+    "Win32_NetworkManagement_WiFi",
+    "Win32_NetworkManagement_Ndis",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_Security_Cryptography",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Console",
+    "Win32_System_Com",
+    "Win32_System_Environment",
+    "Win32_System_EventLog",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_IO",
+    "Win32_System_JobObjects",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Registry",
+    "Win32_System_Services",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+    "Win32_System_WindowsProgramming",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[dev-dependencies]
+serde.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true

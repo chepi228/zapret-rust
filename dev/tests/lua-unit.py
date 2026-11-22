@@ -1,0 +1,26 @@
+"""Optional developer-only Lua runtime; not shipped in user packages."""
+import argparse
+from pathlib import Path
+import sys
+
+parser = argparse.ArgumentParser()
+parser.add_argument('--pkg', required=True)
+parser.add_argument('--runtime', required=True)
+parser.add_argument('--test', default='watchtest.lua', choices=('watchtest.lua', 'storetest.lua', 'linkguardtest.lua', 'hostcachetest.lua'))
+args = parser.parse_args()
+sys.path.insert(0, args.runtime)
+from lupa.luajit21 import LuaRuntime
+
+pkg = Path(args.pkg)
+lua = LuaRuntime()
+print('developer runtime:', lua.eval('_VERSION'), 'LuaJIT 2.1')
+lua.execute('os.exit=function(code) TEST_EXIT=code end')
+if args.test == 'hostcachetest.lua':
+    lua.execute((pkg / 'lua/zapret-auto.lua').read_text(encoding='utf-8-sig'))
+    if (pkg / 'lua/host-cache.lua').exists():
+        lua.execute((pkg / 'lua/host-cache.lua').read_text(encoding='utf-8-sig'))
+if (pkg / 'lua/ring-store.lua').exists():
+    lua.execute((pkg / 'lua/ring-store.lua').read_text(encoding='utf-8-sig'))
+lua.execute((pkg / 'lua/autoring.lua').read_text(encoding='utf-8-sig'))
+lua.execute((pkg / 'dev/tests' / args.test).read_text(encoding='utf-8-sig'))
+sys.exit(lua.globals().TEST_EXIT if lua.globals().TEST_EXIT is not None else 1)
