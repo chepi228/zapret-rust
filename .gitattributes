@@ -1,7 +1,11 @@
 # Файлы хранятся байт в байт: .bat нужны CRLF, а файлы zapret2 сверяются по SHA-256 (CHECKSUMS.txt)
 * -text
 
-# Language statistics focus on the maintained implementation and its launchers.
+# Language statistics focus on the native Rust implementation.
+# Entry scripts keep their existing behavior and language highlighting.
+/zapret-rust.bat -linguist-detectable
+/linux/install.sh -linguist-detectable
+
 # Development scripts and test fixtures remain available in the repository.
 /dev/** -linguist-detectable
 /native/*/tests/** -linguist-detectable

@@ -14,7 +14,7 @@ The native Rust application handles the menu, diagnostics, strategy selection, W
 
 The standard Windows x64 package uses the project's Rust engine, controller, worker, Telegram integration and ring library. It depends on the third-party WinDivert driver and Windows system libraries. [Engine build and package variants](native/zapret-ring-ffi/README.md#native-windows-engine).
 
-The repository also contains C references, test scripts and legacy compatibility files. The rules in `.gitattributes` exclude those files from the GitHub language chart.
+The GitHub language chart covers the Rust implementation. The rules in `.gitattributes` exclude the BAT launcher, Linux installer, C references, test scripts and legacy compatibility files from the chart.
 
 ## Linux
 
