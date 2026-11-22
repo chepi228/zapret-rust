@@ -12,7 +12,9 @@ DPI circumvention for YouTube and Discord with automatic strategy selection and 
 
 The native Rust application handles the menu, diagnostics, strategy selection, Windows services and Telegram. Standard profiles are built into the packet engine, and Luna Core runs custom Lua scripts. Rust ownership and bounds checks help prevent resource and memory errors.
 
-The standard Windows x64 package uses the project's Rust engine, controller, worker, Telegram integration and ring library. It depends on the third-party WinDivert driver and Windows system libraries. The repository includes C reference tests and compatibility code. [Engine build and package variants](native/zapret-ring-ffi/README.md#native-windows-engine).
+The standard Windows x64 package uses the project's Rust engine, controller, worker, Telegram integration and ring library. It depends on the third-party WinDivert driver and Windows system libraries. [Engine build and package variants](native/zapret-ring-ffi/README.md#native-windows-engine).
+
+The repository also contains C references, test scripts and legacy compatibility files. The rules in `.gitattributes` exclude those files from the GitHub language chart.
 
 ## Linux
 

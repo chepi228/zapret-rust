@@ -1,2 +1,22 @@
 # Файлы хранятся байт в байт: .bat нужны CRLF, а файлы zapret2 сверяются по SHA-256 (CHECKSUMS.txt)
 * -text
+
+# Language statistics focus on the maintained implementation and its launchers.
+# Development scripts and test fixtures remain available in the repository.
+/dev/** -linguist-detectable
+/native/*/tests/** -linguist-detectable
+/native/zapret-dev/src/fixtures/** -linguist-detectable
+
+# Native engine conformance sources and C headers for ABI checks.
+/native/zapret-dev/src/engine_native/**/*.c -linguist-detectable
+/native/zapret-dev/src/engine_native/**/*.h -linguist-detectable
+/native/zapret-dev/src/engine_native/**/*.inc -linguist-detectable
+/native/zapret-dev/src/engine_native/**/*.s -linguist-detectable
+
+# Archived Windows scripts and the optional LuaJIT/Cygwin comparison inputs.
+/tools/*.ps1 -linguist-detectable
+/tools/*.cs -linguist-detectable
+/lua/** -linguist-detectable
+/native/zapret-ring/lua/** -linguist-detectable
+/native/zapret-ring-ffi/bridge/**/*.c -linguist-detectable
+/native/zapret-ring-ffi/bridge/**/*.h -linguist-detectable
