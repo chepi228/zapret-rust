@@ -69,7 +69,7 @@ sh zapret-rust-v1.1-linux-install.sh
 
 В стандартной сборке Windows x64 контроллер, фоновый процесс, пакетный движок, библиотека ring и мост Telegram реализованы на Rust. Встроенные стратегии входят в движок, пользовательские Lua-сценарии исполняет Luna Core. Для работы с трафиком используется сторонний драйвер WinDivert и системные API Windows. Исходники также содержат тестовые эталоны и сборки совместимости. [Сборка и варианты движка](https://github.com/chepi228/zapret-rust/blob/v1.1/native/zapret-ring-ffi/README.md#native-windows-engine)
 
-Проект основан на zapret2 и использует наработки Flowseal. Код проекта распространяется по MIT, для сторонних компонентов действуют лицензии их авторов. [zapret2](https://github.com/bol-van/zapret2) · [Стратегии Flowseal](https://github.com/Flowseal/zapret-discord-youtube) · [TG WS Proxy](https://github.com/Flowseal/tg-ws-proxy) · [MIT](LICENSE) · [Сторонние компоненты](THIRD-PARTY-NOTICES.md)
+Проект основан на zapret2 и использует наработки Flowseal. Код проекта распространяется по MIT, для сторонних компонентов действуют лицензии их авторов. [zapret2](https://github.com/bol-van/zapret2) · [Стратегии Flowseal](https://github.com/Flowseal/zapret-discord-youtube) · [TG WS Proxy](https://github.com/Flowseal/tg-ws-proxy) · [MIT](licenses/LICENSE) · [Сторонние компоненты](licenses/THIRD-PARTY-NOTICES.md)
 
 Диаграмма языков GitHub показывает исходники Rust согласно правилам `.gitattributes`. BAT, Linux-установщик и исторические эталоны исключены из этого подсчёта. [Правила подсчёта](https://github.com/chepi228/zapret-rust/blob/v1.1/.gitattributes)
 

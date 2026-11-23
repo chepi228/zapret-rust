@@ -23,16 +23,16 @@ try{
         foreach($segment in $line.Split('/')){
             if($segment.EndsWith('.') -or $segment -match '^(con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)'){throw ('Noncanonical Windows package path: '+$line)}
         }
-        if($line -match '/' -and $line -notmatch '^(bin|fake|lists|lua|strategies|tools|windivert)/'){throw ('Invalid package directory: '+$line)}
+        if($line -match '/' -and $line -notmatch '^(bin|fake|licenses|lists|lua|strategies|tools|windivert)/'){throw ('Invalid package directory: '+$line)}
         if($line -notmatch '/' -and $line -notmatch '^(CHANGELOG\.md|CHECKSUMS\.txt|LICENSE(?:-[A-Za-z0-9-]+\.txt)?|README(?:\.en)?\.md|THIRD-PARTY-NOTICES\.md|zapret\.bat)$'){throw ('Invalid package root file: '+$line)}
         if(-not $names.Add($line)){throw ('Duplicate package path: '+$line)}
     }
     $rustRing=Test-Path -LiteralPath (Join-Path $root 'tools/rust-ring.json')
     if($core.Schema -ge 2){[void]$names.Remove('bin/cygwin1.dll')}
     if($rustRing){
-        $runtimeLicense=if($core.Schema -eq 4){'LICENSE-Luna.txt'}else{'LICENSE-LuaJIT.txt'}
+        $runtimeLicense=if($core.Schema -eq 4){'licenses/LICENSE-Luna.txt'}else{'licenses/LICENSE-LuaJIT.txt'}
         $extras=@('bin/zapret-ring.dll','tools/rust-ring.json',$runtimeLicense)
-        if($core.Schema -eq 1){$extras+=@('LICENSE-cygwin.txt')}
+        if($core.Schema -eq 1){$extras+=@('licenses/LICENSE-cygwin.txt')}
         foreach($name in $extras){if(-not $names.Add($name)){throw 'Duplicate Rust ring compatibility input'}}
     }
     $defaults=@('list-general-user.txt','list-exclude-user.txt','ipset-user.txt','ipset-exclude-user.txt')

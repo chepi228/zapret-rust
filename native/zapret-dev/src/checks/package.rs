@@ -52,6 +52,18 @@ pub(crate) fn run(archive: &Path, output: &Path) -> Result<()> {
             serde_json::from_slice(&fs::read(root.join("package-manifest.json"))?)?;
         let core = zapret_core::read_core_manifest(&root.join("tools/upstream.txt"))?;
         let has_cygwin = core.schema == 1;
+        evidence.check(
+            root.join("licenses/LICENSE").is_file()
+                && root.join("licenses/THIRD-PARTY-NOTICES.md").is_file()
+                && !fs::read_dir(&root)?.any(|entry| {
+                    entry.is_ok_and(|entry| {
+                        let name = entry.file_name();
+                        name.to_string_lossy().starts_with("LICENSE")
+                            || name == "THIRD-PARTY-NOTICES.md"
+                    })
+                }),
+            "Bundled licenses and third-party notices are grouped under licenses/",
+        )?;
         if core.schema >= zapret_core::BUILTIN_RULES_SCHEMA {
             evidence.check(
                 names.iter().all(|name| !name.ends_with(".lua")),
@@ -60,8 +72,8 @@ pub(crate) fn run(archive: &Path, output: &Path) -> Result<()> {
         }
         if core.schema == zapret_core::RUST_LUA_SCHEMA {
             evidence.check(
-                root.join("LICENSE-Luna.txt").is_file()
-                    && !root.join("LICENSE-LuaJIT.txt").exists(),
+                root.join("licenses/LICENSE-Luna.txt").is_file()
+                    && !root.join("licenses/LICENSE-LuaJIT.txt").exists(),
                 "The archive contains the Rust interpreter license",
             )?;
         }

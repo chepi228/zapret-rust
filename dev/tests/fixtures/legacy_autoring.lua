@@ -9,7 +9,7 @@
 --  - сайт, которому подошла не первая стратегия, и подсеть его сервера запоминаются в файле state: после перезапуска
 --    сайт сразу идёт с этой стратегией, а другие сайты той же подсети начинают с неё же.
 -- Память только подсказывает, с чего начать: не сработает - автосмена пойдёт дальше как обычно.
--- Идеи - из Zapret GUI (censorliber, MIT), см. THIRD-PARTY-NOTICES.md.
+-- Идеи - из Zapret GUI (censorliber, MIT), см. licenses/THIRD-PARTY-NOTICES.md.
 --
 -- --writable=<каталог>
 -- --lua-desync=circular:key=general:state=ring-general.txt:success_detector=ring_success:failure_detector=ring_failure

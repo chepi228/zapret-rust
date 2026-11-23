@@ -394,7 +394,7 @@ fn omit_cygwin(inputs: &mut BTreeMap<String, Vec<u8>>, core: &CoreManifest) -> R
     inputs
         .remove(CYGWIN_DLL)
         .context("Missing pinned Cygwin file")?;
-    inputs.remove("LICENSE-cygwin.txt");
+    inputs.remove("licenses/LICENSE-cygwin.txt");
     Ok(())
 }
 fn no_reparse(path: &Path) -> Result<()> {
@@ -598,6 +598,36 @@ fn preserved_list(relative: &str) -> bool {
         ]
         .contains(&name)
 }
+
+fn license_name(name: &str) -> bool {
+    !name.contains('/')
+        && (matches!(name, "LICENSE" | "THIRD-PARTY-NOTICES.md")
+            || (name.starts_with("LICENSE-") && name.ends_with(".txt")))
+}
+
+fn installed_license_hashes(root: &Path) -> Result<BTreeMap<String, String>> {
+    let path = checked_path(root, CATALOG)?;
+    // Older or incomplete installations may have no readable catalog. Only
+    // catalog-owned, byte-identical originals can be retired automatically.
+    let catalog = read_bounded(&path, 1024 * 1024)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<PackageManifest>(&bytes).ok());
+    let mut hashes = BTreeMap::new();
+    if let Some(catalog) = catalog.filter(|catalog| catalog.schema == 1) {
+        for path in PACKAGE_FILES.lines() {
+            let Some(leaf) = path.strip_prefix("licenses/") else {
+                continue;
+            };
+            for name in [path, leaf] {
+                if let Some(hash) = catalog.files.get(name) {
+                    hashes.insert(name.to_owned(), hash.clone());
+                }
+            }
+        }
+    }
+    Ok(hashes)
+}
+
 fn update_plan(
     source: &Path,
     root: &Path,
@@ -617,6 +647,15 @@ fn update_plan(
         }
     }
     let mut remove = Vec::new();
+    for (name, hash) in installed_license_hashes(root)? {
+        let original = checked_path(root, &name)?;
+        if !source.join(&name).exists()
+            && original.is_file()
+            && file_hash(&original)?.eq_ignore_ascii_case(&hash)
+        {
+            remove.push(name);
+        }
+    }
     if native_only {
         let old = checked_path(root, CYGWIN_DLL)?;
         let installed = checked_path(root, "tools/upstream.txt")?;
@@ -934,6 +973,7 @@ fn prepare_transaction(
     trusted_directory(&backup, trust)?;
     let mut entries = Vec::new();
     let mut seen = HashSet::new();
+    let previous_licenses = installed_license_hashes(root)?;
     for (is_remove, paths) in [(false, plan), (true, remove)] {
         for relative in paths {
             let relative = normalized_relative(relative)?;
@@ -973,6 +1013,14 @@ fn prepare_transaction(
             } else {
                 String::new()
             };
+            if is_remove && license_name(relative.strip_prefix("licenses/").unwrap_or(&relative)) {
+                ensure!(
+                    previous_licenses
+                        .get(&relative)
+                        .is_some_and(|hash| hash.eq_ignore_ascii_case(&old_hash)),
+                    "License or its catalog entry changed before update: {relative}"
+                );
+            }
             if is_remove && relative == CYGWIN_DLL {
                 let installed =
                     zapret_core::read_core_manifest(&checked_path(root, "tools/upstream.txt")?)?;
@@ -1156,6 +1204,9 @@ fn allowed_package_path(name: &str) -> bool {
         ]
         .contains(&image);
     }
+    if let Some(leaf) = name.strip_prefix("licenses/") {
+        return license_name(leaf);
+    }
     if let Some((directory, _)) = name.split_once('/') {
         return [
             "bin",
@@ -1173,13 +1224,11 @@ fn allowed_package_path(name: &str) -> bool {
         "CHECKSUMS.txt",
         "README.md",
         "README.en.md",
-        "THIRD-PARTY-NOTICES.md",
         "zapret-rust.bat",
         CATALOG,
     ]
     .contains(&name)
-        || name == "LICENSE"
-        || (name.starts_with("LICENSE-") && name.ends_with(".txt"))
+        || license_name(name)
 }
 fn verify_catalog(source: &Path, actual: &[String], manifest: &PackageManifest) -> Result<()> {
     ensure!(
@@ -1241,6 +1290,21 @@ fn validate_package(
         "tools/upstream.txt",
         "tools/targets.txt",
         "tools/dpi-suite.json",
+    ] {
+        ensure!(
+            manifest.files.contains_key(name),
+            "Native package missing required file: {name}"
+        );
+    }
+    let grouped = manifest
+        .files
+        .keys()
+        .any(|name| name.starts_with("licenses/"));
+    ensure!(
+        !grouped || !manifest.files.keys().any(|name| license_name(name)),
+        "Mixed license layouts in the native package"
+    );
+    for leaf in [
         "LICENSE",
         "LICENSE-zapret2.txt",
         "LICENSE-flowseal.txt",
@@ -1248,8 +1312,13 @@ fn validate_package(
         "LICENSE-rust.txt",
         "THIRD-PARTY-NOTICES.md",
     ] {
+        let name = if grouped {
+            format!("licenses/{leaf}")
+        } else {
+            leaf.to_owned()
+        };
         ensure!(
-            manifest.files.contains_key(name),
+            manifest.files.contains_key(&name),
             "Native package missing required file: {name}"
         );
     }
@@ -1956,6 +2025,53 @@ mod tests {
         assert!(restore_journal(&target, &record, &trust).unwrap());
         assert_eq!(fs::read(&dll).unwrap(), dll_bytes);
     }
+    #[test]
+    fn license_move_retires_only_catalogued_originals_and_rolls_back() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("installed");
+        let source = temp.path().join("incoming");
+        let mut files = BTreeMap::new();
+        for leaf in ["LICENSE", "LICENSE-rust.txt", "THIRD-PARTY-NOTICES.md"] {
+            atomic_write(&root.join(leaf), b"previous").unwrap();
+            files.insert(leaf.to_owned(), sha256(b"previous"));
+            atomic_write(&source.join("licenses").join(leaf), b"current").unwrap();
+        }
+        atomic_write(&root.join("LICENSE-rust.txt"), b"user edit").unwrap();
+        atomic_write(&root.join("LICENSE-custom.txt"), b"user document").unwrap();
+        let catalog = PackageManifest {
+            schema: 1,
+            version: "1.1".into(),
+            files,
+        };
+        atomic_write(&root.join(CATALOG), &serde_json::to_vec(&catalog).unwrap()).unwrap();
+        let (plan, remove) = update_plan(&source, &root, false).unwrap();
+        assert_eq!(remove, ["LICENSE", "THIRD-PARTY-NOTICES.md"]);
+        let trust = FixtureTrust;
+        let directory = root.join("runtime/update").join("a".repeat(32));
+        let mut journal =
+            prepare_transaction(&source, &root, &directory, &plan, &remove, false, &trust).unwrap();
+        apply_prepared(&root, &source, &directory, &mut journal, &trust).unwrap();
+        assert!(!root.join("LICENSE").exists());
+        assert_eq!(fs::read(root.join("licenses/LICENSE")).unwrap(), b"current");
+        assert_eq!(
+            fs::read(root.join("LICENSE-rust.txt")).unwrap(),
+            b"user edit"
+        );
+        assert_eq!(
+            fs::read(root.join("LICENSE-custom.txt")).unwrap(),
+            b"user document"
+        );
+        let record = directory.join("journal.json");
+        journal.state = "Applying".into();
+        write_journal(&record, &journal, &trust).unwrap();
+        assert!(restore_journal(&root, &record, &trust).unwrap());
+        assert_eq!(fs::read(root.join("LICENSE")).unwrap(), b"previous");
+        assert!(!root.join("licenses/LICENSE").exists());
+        assert!(allowed_package_path("LICENSE") && allowed_package_path("licenses/LICENSE"));
+        assert!(!allowed_package_path("licenses/bin/LICENSE"));
+        assert!(!allowed_package_path("licenses/helper.exe"));
+    }
+
     #[test]
     fn prepared_recovery_preserves_edits_and_durable_start_intent() {
         let temp = tempfile::tempdir().unwrap();

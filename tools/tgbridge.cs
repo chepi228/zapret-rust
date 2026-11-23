@@ -1,5 +1,5 @@
 // zapret: встроенный мост Telegram (MTProto -> WebSocket), перенос основной логики tg-ws-proxy от Flowseal
-// (github.com/Flowseal/tg-ws-proxy, MIT, см. LICENSE-tg-ws-proxy.txt).
+// (github.com/Flowseal/tg-ws-proxy, MIT, см. licenses/LICENSE-tg-ws-proxy.txt).
 //
 // Telegram Desktop подключается к 127.0.0.1:<порт> как к MTProto-прокси (secret "dd..."). Мост снимает обфускацию
 // клиента, узнаёт номер дата-центра, открывает WebSocket к kws<N>.web.telegram.org/apiws (веб-версию Telegram у нас

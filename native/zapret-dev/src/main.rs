@@ -431,7 +431,7 @@ fn run(action: Action) -> Result<()> {
             ]);
             let metadata = output_of(&mut cargo)?;
             let sysroot = Build::sysroot()?;
-            let output = output.unwrap_or_else(|| root.join("LICENSE-rust.txt"));
+            let output = output.unwrap_or_else(|| root.join("licenses/LICENSE-rust.txt"));
             licenses::generate(&metadata, &sysroot, &std::path::absolute(output)?)
         }
         Action::ImportFlowseal {

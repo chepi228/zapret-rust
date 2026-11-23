@@ -25,10 +25,11 @@ pub const BUNDLED_LUA_FILES: [&str; 7] = [
 ];
 
 pub fn omits_engine_file(schema: u32, name: &str) -> bool {
-    (schema >= NATIVE_ONLY_SCHEMA && matches!(name, CYGWIN_DLL | "LICENSE-cygwin.txt"))
+    let license = name.strip_prefix("licenses/").unwrap_or(name);
+    (schema >= NATIVE_ONLY_SCHEMA && (name == CYGWIN_DLL || license == "LICENSE-cygwin.txt"))
         || (schema >= BUILTIN_RULES_SCHEMA && BUNDLED_LUA_FILES.contains(&name))
-        || (schema == RUST_LUA_SCHEMA && name == "LICENSE-LuaJIT.txt")
-        || (schema != RUST_LUA_SCHEMA && name == "LICENSE-Luna.txt")
+        || (schema == RUST_LUA_SCHEMA && license == "LICENSE-LuaJIT.txt")
+        || (schema != RUST_LUA_SCHEMA && license == "LICENSE-Luna.txt")
 }
 
 pub const CORE_FILES: [&str; 8] = [

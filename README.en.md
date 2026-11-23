@@ -69,7 +69,7 @@ sh zapret-rust-v1.1-linux-install.sh
 
 The standard Windows x64 package runs the project's Rust controller, worker, packet engine, ring library and Telegram bridge. Standard profiles are built in. Luna Core runs custom Lua scripts. Windows packet capture uses the third-party WinDivert driver and Windows system APIs. The source tree also contains test references and compatibility builds. [Engine and package variants](https://github.com/chepi228/zapret-rust/blob/v1.1/native/zapret-ring-ffi/README.md#native-windows-engine)
 
-The project builds on zapret2 and work by Flowseal. Project code is licensed under MIT, and bundled third-party components retain their respective licenses. [zapret2](https://github.com/bol-van/zapret2) · [Flowseal strategies](https://github.com/Flowseal/zapret-discord-youtube) · [TG WS Proxy](https://github.com/Flowseal/tg-ws-proxy) · [MIT](LICENSE) · [Third-party notices](THIRD-PARTY-NOTICES.md)
+The project builds on zapret2 and work by Flowseal. Project code is licensed under MIT, and bundled third-party components retain their respective licenses. [zapret2](https://github.com/bol-van/zapret2) · [Flowseal strategies](https://github.com/Flowseal/zapret-discord-youtube) · [TG WS Proxy](https://github.com/Flowseal/tg-ws-proxy) · [MIT](licenses/LICENSE) · [Third-party notices](licenses/THIRD-PARTY-NOTICES.md)
 
 The GitHub language chart counts Rust sources according to the repository's `.gitattributes`. The BAT launcher, Linux installer and historical test references are excluded from the chart. [Language chart rules](https://github.com/chepi228/zapret-rust/blob/v1.1/.gitattributes)
 

@@ -564,7 +564,7 @@ executable, keeping controller context tied to the program loaded at startup.
 
 `dev/native-package-files.txt` is the release allowlist. Package building embeds
 clean user-list defaults and an empty runtime. Run `cargo zapret licenses` with the
-`rust-docs` component to regenerate `LICENSE-rust.txt` from the locked release
+`rust-docs` component to regenerate `licenses/LICENSE-rust.txt` from the locked release
 dependency graph and the Rust standard-library notices. Regenerate this file when
 changing release dependencies or the build toolchain.
 

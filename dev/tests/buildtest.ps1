@@ -67,9 +67,9 @@ try{
                 $declared=@([IO.File]::ReadAllLines($manifest)|Where-Object{$_ -and -not $_.StartsWith('#')}|ForEach-Object{'zapret/'+$_})+@('zapret/runtime/.keep')
                 if(Test-Path (Join-Path $Pkg 'tools/rust-ring.json')){
                     $ring=Get-Content -LiteralPath (Join-Path $Pkg 'tools/rust-ring.json') -Raw|ConvertFrom-Json
-                    $runtimeLicense=if($ring.schema -eq 4){'zapret/LICENSE-Luna.txt'}else{'zapret/LICENSE-LuaJIT.txt'}
+                    $runtimeLicense=if($ring.schema -eq 4){'zapret/licenses/LICENSE-Luna.txt'}else{'zapret/licenses/LICENSE-LuaJIT.txt'}
                     $declared+=@('zapret/bin/zapret-ring.dll','zapret/tools/rust-ring.json',$runtimeLicense)
-                    if($ring.schema -eq 1){$declared+=@('zapret/LICENSE-cygwin.txt')}
+                    if($ring.schema -eq 1){$declared+=@('zapret/licenses/LICENSE-cygwin.txt')}
                     else{$declared=@($declared|Where-Object{$_ -cne 'zapret/bin/cygwin1.dll'})}
                 }
                 Check 'ZIP entries match the declared manifest exactly' (@(Compare-Object ($declared|Sort-Object) ($names|Sort-Object)).Count -eq 0)
