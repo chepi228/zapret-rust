@@ -20,7 +20,65 @@ use zapret_core::{
     compose, list_strategies, prepare_runtime, read_settings, save_settings, sha256,
     test_result_context_with_identity, transfer_state,
 };
+use zapret_net::{Job, ProbeMode};
 use zapret_platform::{ControlGuard, OwnedChild, RunOptions};
+
+mod endpoints;
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct ExpectedResponse {
+    mode: ProbeMode,
+    status: u16,
+    min_bytes: usize,
+    max_bytes: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    sha256: Option<String>,
+}
+
+impl ExpectedResponse {
+    fn parse(fields: &[&str]) -> Result<Option<Self>> {
+        if fields.is_empty() {
+            return Ok(None);
+        }
+        let [method, status, size, digest @ ..] = fields else {
+            bail!("Ожидаются метод, HTTP-код и размер ответа")
+        };
+        let mode = match *method {
+            "GET" => ProbeMode::FullGet,
+            "H3" => ProbeMode::Http3Head,
+            _ => bail!("Допустимы GET и H3"),
+        };
+        let status = status.parse()?;
+        let (min_bytes, max_bytes) = size.split_once("..").unwrap_or((size, size));
+        let min_bytes = min_bytes.parse()?;
+        let max_bytes = max_bytes.parse()?;
+        let sha256 = match digest {
+            [] => None,
+            [hash]
+                if mode == ProbeMode::FullGet
+                    && hash.len() == 64
+                    && hash.bytes().all(|b| b.is_ascii_hexdigit()) =>
+            {
+                Some(hash.to_ascii_lowercase())
+            }
+            _ => bail!("Ожидается SHA-256 файла из 64 шестнадцатеричных цифр для GET"),
+        };
+        ensure!(
+            (200..300).contains(&status)
+                && min_bytes <= max_bytes
+                && max_bytes < zapret_net::MAX_BODY_LIMIT
+                && (mode != ProbeMode::Http3Head || max_bytes == 0),
+            "Неверный HTTP-код или диапазон размеров ответа"
+        );
+        Ok(Some(Self {
+            mode,
+            status,
+            min_bytes,
+            max_bytes,
+            sha256,
+        }))
+    }
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Target {
@@ -32,6 +90,10 @@ pub struct Target {
     pub url: String,
     #[serde(default, alias = "Post")]
     pub post: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    expected: Option<ExpectedResponse>,
+    #[serde(skip)]
+    peer: Option<std::net::SocketAddr>,
 }
 
 impl Target {
@@ -40,6 +102,38 @@ impl Target {
     }
     pub(crate) fn id(&self) -> String {
         sha256(self.key().as_bytes())
+    }
+    fn body_limit(&self) -> usize {
+        // One extra byte distinguishes EOF at the expected size from a truncated prefix.
+        self.expected
+            .as_ref()
+            .map_or(65536, |check| check.max_bytes + 1)
+    }
+    pub(crate) fn probe_mode(&self) -> ProbeMode {
+        self.expected
+            .as_ref()
+            .map_or(ProbeMode::Range, |check| check.mode)
+    }
+    pub(crate) fn job(&self, timeout_ms: u64, control: bool) -> Job {
+        let mode = self.probe_mode();
+        let method = match mode {
+            ProbeMode::Http3Head => "HEAD",
+            ProbeMode::FullGet => "GET",
+            ProbeMode::Range if control => "HEAD",
+            ProbeMode::Range if self.post => "POST",
+            ProbeMode::Range => "GET",
+        };
+        Job {
+            version: 1,
+            id: self.id(),
+            url: self.url.clone(),
+            timeout_ms,
+            body_limit: self.body_limit(),
+            post_bytes: if method == "POST" { 65536 } else { 0 },
+            method: Some(method.into()),
+            mode,
+            connect_ip: self.peer.map(|peer| peer.ip()),
+        }
     }
 }
 
@@ -70,6 +164,8 @@ pub struct Row {
     pub termination: String,
     pub tries: usize,
     pub flaky: bool,
+    #[serde(skip)]
+    failed_retry: Option<Value>,
     pub raw: Value,
 }
 
@@ -77,10 +173,33 @@ impl Row {
     fn key(&self) -> String {
         format!("{}|{}|{}", self.group, self.name, self.url)
     }
+    fn connection_ms(&self) -> f64 {
+        if self.url.starts_with("http://") {
+            self.conn_ms
+        } else {
+            self.tls_ms
+        }
+    }
+    fn healthy_connection(&self, before: Option<f64>) -> bool {
+        let ms = self.connection_ms();
+        self.state == "OK"
+            && ms.is_finite()
+            && ms > 0.
+            && before.is_none_or(|limit| ms <= limit + 500.)
+    }
 }
 
-fn read_targets(root: &Path) -> Result<Vec<Target>> {
-    read_targets_with_suite(root, &root.join("tools/dpi-suite.json"))
+fn read_targets(root: &Path, args: &TestArgs) -> Result<Vec<Target>> {
+    let mut targets = read_targets_with_suite(root, &root.join("tools/dpi-suite.json"))?;
+    if args.compare_a.is_some() || args.compare_b.is_some() {
+        // The saved A/B protocol compares the TCP/TLS handshake under matched conditions.
+        targets.retain(|t| t.url.starts_with("https://") && t.probe_mode() != ProbeMode::Http3Head);
+        ensure!(
+            !targets.is_empty(),
+            "Для сравнения финалистов нужны HTTPS-адреса с TCP"
+        );
+    }
+    Ok(targets)
 }
 
 pub(crate) fn read_targets_with_suite(root: &Path, suite: &Path) -> Result<Vec<Target>> {
@@ -101,6 +220,8 @@ pub(crate) fn read_targets_with_suite(root: &Path, suite: &Path) -> Result<Vec<T
                     .to_owned(),
                     url: format!("https://{host}/"),
                     post: true,
+                    expected: None,
+                    peer: None,
                 });
             }
         }
@@ -109,7 +230,8 @@ pub(crate) fn read_targets_with_suite(root: &Path, suite: &Path) -> Result<Vec<T
         let Some((identity, url)) = line.trim().split_once('=') else {
             continue;
         };
-        let Some((group, name)) = identity.trim().split_once('.') else {
+        let mut fields = identity.split_ascii_whitespace();
+        let Some((group, name)) = fields.next().and_then(|key| key.split_once('.')) else {
             continue;
         };
         if group.is_empty() || !group.bytes().all(|b| b.is_ascii_alphanumeric()) {
@@ -118,11 +240,21 @@ pub(crate) fn read_targets_with_suite(root: &Path, suite: &Path) -> Result<Vec<T
         if name.is_empty() || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
             continue;
         }
+        let expected = ExpectedResponse::parse(&fields.collect::<Vec<_>>())
+            .with_context(|| format!("tools/targets.txt, {group}.{name}"))?;
+        ensure!(
+            expected.as_ref().is_none_or(
+                |e| e.mode != ProbeMode::Http3Head || url.trim().starts_with("https://")
+            ),
+            "HTTP/3 требует HTTPS для {group}.{name}"
+        );
         targets.push(Target {
             group: group.into(),
             name: name.into(),
             url: url.trim().into(),
             post: false,
+            expected,
+            peer: None,
         });
     }
     let mut unique = BTreeSet::new();
@@ -143,9 +275,16 @@ fn convert(target: &Target, value: Value, started: chrono::DateTime<Utc>) -> Res
     let observation: zapret_net::Observation = serde_json::from_value(value.clone())
         .context("Worker вернул неполную или некорректную запись")?;
     ensure!(
+        observation.mode == target.probe_mode(),
+        "Режим пробы не совпадает с заданием"
+    );
+    ensure!(
         value["version"] == 1 && value["id"] == target.id() && value["url"] == target.url,
         "Некорректная идентичность результата worker"
     );
+    if let Some(peer) = target.peer {
+        endpoints::verify_peer(&observation, peer)?;
+    }
     let termination = value["termination"]
         .as_str()
         .context("Нет причины завершения пробы")?
@@ -161,7 +300,7 @@ fn convert(target: &Target, value: Value, started: chrono::DateTime<Utc>) -> Res
         .as_u64()
         .context("Неизвестен лимит тела")? as usize;
     ensure!(
-        limit == 65536 && bytes <= limit,
+        limit == target.body_limit() && bytes <= limit,
         "Неверный бюджет тела в результате"
     );
     let reached = value["target_reached"] == true;
@@ -226,7 +365,23 @@ fn convert(target: &Target, value: Value, started: chrono::DateTime<Utc>) -> Res
     let down = value["received_body_bytes"]
         .as_f64()
         .unwrap_or(bytes as f64);
-    let state = match transfer_state(&code, Some(exit), up, down, target.post, reached) {
+    let mut state = transfer_state(&code, Some(exit), up, down, target.post, reached);
+    if let Some(check) = &target.expected {
+        if state == ProbeState::Ok
+            && (termination != "Complete"
+                || !complete
+                || reached
+                || observation.status_code != Some(check.status)
+                || !(check.min_bytes..=check.max_bytes).contains(&bytes)
+                || check
+                    .sha256
+                    .as_ref()
+                    .is_some_and(|hash| observation.body_sha256.as_ref() != Some(hash)))
+        {
+            state = ProbeState::Fail;
+        }
+    }
+    let state = match state {
         ProbeState::Ok => "OK",
         ProbeState::Fail => "FAIL",
         ProbeState::Freeze => "FREEZE",
@@ -251,7 +406,11 @@ fn convert(target: &Target, value: Value, started: chrono::DateTime<Utc>) -> Res
         exit,
         up,
         down,
-        conn_ms: tcp,
+        conn_ms: if observation.mode == ProbeMode::Http3Head {
+            0.
+        } else {
+            tcp
+        },
         tls_ms: tls,
         dns_ms: dns,
         first_byte_ms: if value["tls_ms"].is_number() {
@@ -272,6 +431,7 @@ fn convert(target: &Target, value: Value, started: chrono::DateTime<Utc>) -> Res
         termination,
         tries: 1,
         flaky: false,
+        failed_retry: None,
         raw: value,
     })
 }
@@ -321,16 +481,11 @@ fn probe_batch(
     context.assert_current()?;
     let deadline = batch_budget(targets.len(), parallel, timeout_ms)?;
     let mut input = Vec::new();
+    let control = metadata["Stage"]
+        .as_str()
+        .is_some_and(|stage| stage.starts_with("control-"));
     for target in targets {
-        let control = metadata["Stage"]
-            .as_str()
-            .is_some_and(|stage| stage.starts_with("control-"));
-        serde_json::to_writer(
-            &mut input,
-            &json!({"version":1,"id":target.id(),"url":target.url,"timeout_ms":timeout_ms,
-            "body_limit":65536,"post_bytes":if target.post&&!control {65536}else{0},
-            "method":if control {"HEAD"}else if target.post {"POST"}else{"GET"}}),
-        )?;
+        serde_json::to_writer(&mut input, &target.job(timeout_ms, control))?;
         input.push(b'\n');
     }
     let executable = std::env::current_exe()?;
@@ -557,6 +712,7 @@ fn merge_retry(rows: &mut [Row], retry: &[Row]) {
         };
         row.tries = 2;
         if next.state != "OK" {
+            row.failed_retry = Some(next.raw.clone());
             if row.state != "OK" && next.state == "FREEZE" {
                 row.state = "FREEZE".into();
             }
@@ -578,22 +734,48 @@ fn baseline(rows: &[Row]) -> BTreeMap<String, f64> {
     let mut result = BTreeMap::<String, f64>::new();
     for row in rows
         .iter()
-        .filter(|row| row.group == "Clean" && row.state == "OK")
+        .filter(|row| row.group == "Clean" && row.healthy_connection(None))
     {
         result
             .entry(row.name.clone())
-            .and_modify(|value| *value = value.min(row.tls_ms))
-            .or_insert(row.tls_ms);
+            .and_modify(|value| *value = value.min(row.connection_ms()))
+            .or_insert_with(|| row.connection_ms());
     }
     result
 }
 
-fn availability(rows: &[Row]) -> Value {
-    let targets: Vec<_> = rows
+pub(crate) struct Availability {
+    pub ok: usize,
+    targets: Vec<String>,
+}
+
+impl Availability {
+    pub fn total(&self) -> usize {
+        self.targets.len()
+    }
+
+    fn counts(&self) -> Value {
+        json!({"ok":self.ok, "total":self.total()})
+    }
+
+    fn change_from(&self, baseline: &Self) -> Option<i64> {
+        (!self.targets.is_empty() && self.targets == baseline.targets)
+            .then(|| self.ok as i64 - baseline.ok as i64)
+    }
+}
+
+fn availability(rows: &[Row]) -> Availability {
+    let mut targets = Vec::new();
+    let mut ok = 0;
+    for row in rows
         .iter()
         .filter(|row| row.group != "Clean" && row.state != "NA")
-        .collect();
-    json!({"ok":targets.iter().filter(|row|row.state=="OK").count(),"total":targets.len()})
+    {
+        targets.push(row.key());
+        ok += usize::from(row.state == "OK");
+    }
+    targets.sort_unstable();
+    Availability { ok, targets }
 }
 
 fn summary(id: &str, rows: &[Row], clean: &BTreeMap<String, f64>) -> RankRow {
@@ -616,7 +798,7 @@ fn summary(id: &str, rows: &[Row], clean: &BTreeMap<String, f64>) -> RankRow {
         } else if id != "0"
             && clean
                 .get(&row.name)
-                .is_some_and(|before| row.state != "OK" || row.tls_ms > *before + 500.)
+                .is_some_and(|before| !row.healthy_connection(Some(*before)))
         {
             result.harm += 1;
         }
@@ -625,12 +807,15 @@ fn summary(id: &str, rows: &[Row], clean: &BTreeMap<String, f64>) -> RankRow {
     result
 }
 
-fn family(strategy: &Strategy) -> String {
-    let tuning = Regex::new(r":(pos|repeats|blob|host|seqovl|seqovl_pattern)=[^:]+")
-        .expect("constant regex");
-    let sni = Regex::new(r"([=,])sni=[^,:]+").expect("constant regex");
-    let mut parts = vec!["family-tcp-v1".to_owned()];
-    for section in ["general", "google", "discord_media", "ipset_tcp"] {
+pub(crate) fn family(strategy: &Strategy) -> String {
+    use std::sync::LazyLock;
+    static TUNING: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r":(pos|repeats|blob|host|seqovl|seqovl_pattern)=[^:]+").expect("constant regex")
+    });
+    static SNI: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"([=,])sni=[^,:]+").expect("constant regex"));
+    let mut parts = vec!["family-http-v2".to_owned()];
+    for section in ["general", "google", "discord_media", "ipset_tcp", "quic"] {
         let actual = if strategy.sections.contains_key(section) {
             section
         } else {
@@ -643,8 +828,8 @@ fn family(strategy: &Strategy) -> String {
         let mut previous = None;
         for line in strategy.section(actual, "general") {
             if line.starts_with("--lua-desync=") {
-                let normalized = tuning.replace_all(line, ":${1}=*");
-                let normalized = sni.replace_all(&normalized, "${1}sni=*").into_owned();
+                let normalized = TUNING.replace_all(line, ":${1}=*");
+                let normalized = SNI.replace_all(&normalized, "${1}sni=*").into_owned();
                 if previous.as_ref() != Some(&normalized) {
                     parts.push(normalized.clone());
                 }
@@ -681,13 +866,21 @@ fn final_check(expected: &[Row], actual: &[Row]) -> Result<()> {
         let reason = match actual.get(&key) {
             Some(next)
                 if next.state == "OK"
-                    && (row.group != "Clean" || next.tls_ms <= row.tls_ms + 500.) =>
+                    && (row.group != "Clean"
+                        || next.healthy_connection(Some(row.connection_ms()))) =>
             {
                 continue;
+            }
+            Some(next) if next.termination == "TlsFailure" && next.raw["mode"] == "http3_head" => {
+                "сбой рукопожатия QUIC".to_owned()
             }
             Some(next) if next.termination == "TlsFailure" => {
                 format!("сбой TLS после подключения TCP за {:.0} мс", next.conn_ms)
             }
+            Some(next) if row.url.starts_with("http://") => format!(
+                "{} (TCP {:.0} мс, ранее {:.0} мс)",
+                next.state, next.conn_ms, row.conn_ms
+            ),
             Some(next) => format!(
                 "{} (TCP {:.0} мс, TLS {:.0} мс, ранее TLS {:.0} мс)",
                 next.state, next.conn_ms, next.tls_ms, row.tls_ms
@@ -771,10 +964,10 @@ fn timing_summary(rows: &[Row], elapsed_ms: f64) -> Value {
         .iter()
         .filter(|row| row.state == "OK" && row.group != "Clean")
         .collect();
-    let average = |get: fn(&Row) -> f64| {
+    let average = |get: fn(&Row) -> Option<f64>| {
         let values: Vec<_> = successful
             .iter()
-            .map(|row| get(row))
+            .filter_map(|row| get(row))
             .filter(|v| v.is_finite() && *v >= 0.)
             .collect();
         if values.is_empty() {
@@ -783,7 +976,7 @@ fn timing_summary(rows: &[Row], elapsed_ms: f64) -> Value {
             json!(values.iter().sum::<f64>() / values.len() as f64)
         }
     };
-    json!({"overall":crate::selection_latency::overall_timing(&probe_details(rows)),"tcp_ms":average(|r|r.conn_ms),"tls_ms":average(|r|r.tls_ms),"elapsed_ms":elapsed_ms,
+    json!({"overall":crate::selection_latency::overall_timing(&probe_details(rows)),"tcp_ms":average(|r|(r.raw["mode"] != "http3_head").then_some(r.conn_ms)),"tls_ms":average(|r|Some(r.tls_ms)),"elapsed_ms":elapsed_ms,
         "retries":rows.iter().filter(|r|r.tries>1).count(),"flaky":rows.iter().filter(|r|r.flaky).count()})
 }
 
@@ -792,8 +985,8 @@ fn probe_details(rows: &[Row]) -> Vec<Value> {
         .map(|r| {
             json!({"group":r.group,"name":r.name,"state":r.state,"code":r.code,
         "url":r.url,"remote_address":r.raw["remote_address"],"certificate_validated":r.raw["certificate_validated"],
-        "dns_ms":r.dns_ms,"tcp_ms":r.conn_ms,"tls_ms":r.tls_ms,"first_byte_ms":r.first_byte_ms,"total_ms":r.total_ms,
-        "body_bytes":r.body_bytes,"body_limit":r.body_limit,"body_complete":r.body_complete,"target_reached":r.target_reached,"post_bytes":r.raw["post_bytes"],
+        "mode":r.raw["mode"],"dns_source":r.raw["dns_source"],"dns_ms":r.dns_ms,"tcp_ms":if r.raw["mode"] == "http3_head" {None}else{Some(r.conn_ms)},"tls_ms":r.tls_ms,"first_byte_ms":r.first_byte_ms,"total_ms":r.total_ms,
+        "body_bytes":r.body_bytes,"body_limit":r.body_limit,"body_complete":r.body_complete,"body_sha256":r.raw["body_sha256"],"target_reached":r.target_reached,"post_bytes":r.raw["post_bytes"],
         "tries":r.tries,"flaky":r.flaky,"up":r.up,"down":r.down,"termination":r.termination})
         })
         .collect()
@@ -1030,9 +1223,9 @@ fn measured(
         .filter(|row| {
             if row.group == "Clean" {
                 matches!(row.state.as_str(), "FAIL" | "FREEZE")
-                    || clean
-                        .get(&row.name)
-                        .is_some_and(|before| row.state == "OK" && row.tls_ms > *before + 500.)
+                    || clean.get(&row.name).is_some_and(|before| {
+                        row.state == "OK" && !row.healthy_connection(Some(*before))
+                    })
             } else {
                 failed <= 16
                     && matches!(row.state.as_str(), "FAIL" | "FREEZE")
@@ -1049,12 +1242,7 @@ fn measured(
     let mut eligible = first.iter().all(|row| {
         matches!(row.state.as_str(), "OK" | "FAIL" | "FREEZE")
             && !row.flaky
-            && (row.group != "Clean"
-                || (row.state == "OK"
-                    && row.tls_ms > 0.
-                    && clean
-                        .get(&row.name)
-                        .is_none_or(|before| row.tls_ms <= *before + 500.)))
+            && (row.group != "Clean" || row.healthy_connection(clean.get(&row.name).copied()))
     });
     if !retry_targets.is_empty() {
         let retry_parallel = arguments.retry_parallel();
@@ -1082,12 +1270,7 @@ fn measured(
                 .iter()
                 .find(|first| first.key() == row.key())
                 .is_some_and(|first| first.state == row.state)
-                && (row.group != "Clean"
-                    || (row.state == "OK"
-                        && row.tls_ms > 0.
-                        && clean
-                            .get(&row.name)
-                            .is_none_or(|before| row.tls_ms <= *before + 500.)))
+                && (row.group != "Clean" || row.healthy_connection(clean.get(&row.name).copied()))
         });
         merge_retry(&mut rows, &retry);
     }
@@ -1101,6 +1284,9 @@ fn controls(
     metadata: &Value,
     phase: &str,
 ) -> Result<Vec<Row>> {
+    if targets.is_empty() {
+        return Ok(Vec::new());
+    }
     let mut metadata = metadata.clone();
     metadata["Stage"] = json!(format!("control-{phase}"));
     let mut rows = Vec::new();
@@ -1142,10 +1328,7 @@ fn control_failures(targets: &[Target], before: &[Row], after: &[Row]) -> Vec<St
             ));
             continue;
         }
-        let healthy = |rows: &[&Row]| {
-            rows.iter()
-                .all(|row| row.state == "OK" && row.tls_ms.is_finite() && row.tls_ms > 0.)
-        };
+        let healthy = |rows: &[&Row]| rows.iter().all(|row| row.healthy_connection(None));
         if !healthy(&first) {
             failures.push(format!(
                 "Контрольный адрес {} не ответил до измерения.",
@@ -1160,8 +1343,8 @@ fn control_failures(targets: &[Target], before: &[Row], after: &[Row]) -> Vec<St
         }
         if healthy(&first)
             && healthy(&last)
-            && (first.iter().map(|row| row.tls_ms).sum::<f64>()
-                - last.iter().map(|row| row.tls_ms).sum::<f64>())
+            && (first.iter().map(|row| row.connection_ms()).sum::<f64>()
+                - last.iter().map(|row| row.connection_ms()).sum::<f64>())
             .abs()
                 / 2.
                 > 500.
@@ -1192,8 +1375,7 @@ fn fully_covered(base: &[Row], actual: &[Row]) -> bool {
         && base.iter().all(|row| {
             matches!(row.state.as_str(), "OK" | "FAIL" | "FREEZE")
                 && !row.flaky
-                && (row.group != "Clean"
-                    || (row.state == "OK" && row.tls_ms.is_finite() && row.tls_ms > 0.))
+                && (row.group != "Clean" || row.healthy_connection(None))
         })
         && actual.iter().all(|row| {
             row.state == "OK"
@@ -1202,11 +1384,7 @@ fn fully_covered(base: &[Row], actual: &[Row]) -> bool {
                     || base
                         .iter()
                         .find(|before| before.key() == row.key())
-                        .is_some_and(|before| {
-                            row.tls_ms.is_finite()
-                                && row.tls_ms > 0.
-                                && row.tls_ms <= before.tls_ms + 500.
-                        }))
+                        .is_some_and(|before| row.healthy_connection(Some(before.connection_ms()))))
         })
         && actual.iter().any(|row| row.group == "Clean")
         && actual.iter().any(|row| row.group != "Clean")
@@ -1379,7 +1557,7 @@ pub fn run(app: &App, arguments: &TestArgs) -> Result<Value> {
         "Неверные параметры автоподбора"
     );
     let settings = read_settings(&app.root)?;
-    let targets = read_targets(&app.root)?;
+    let targets = read_targets(&app.root, arguments)?;
     let native_hash = crate::controller_hash()?;
     let local_network = app.platform("network", json!({}))?;
     let local_context = local_network["key"]
@@ -1418,7 +1596,7 @@ pub fn run(app: &App, arguments: &TestArgs) -> Result<Value> {
         &hashes,
         Utc::now().timestamp(),
     );
-    let plan = json!({"schema":1,"policy":"native-quick-bounded-v3","context":local_context,"targets":targets,"strategies":initial.strategies,"deferred_history":initial.deferred,"queued_candidates":initial.queued,"settings":settings,
+    let plan = json!({"schema":1,"policy":"native-quick-diverse-v4","context":local_context,"targets":targets,"strategies":initial.strategies,"deferred_history":initial.deferred,"queued_candidates":initial.queued,"settings":settings,
         "rounds":arguments.rounds,"parallel":arguments.parallel(),"retry_parallel":arguments.retry_parallel(),"timeout_ms":arguments.timeout_ms,"report_only":arguments.report_only});
     if arguments.plan_only {
         return Ok(plan);
@@ -1453,6 +1631,8 @@ pub fn run(app: &App, arguments: &TestArgs) -> Result<Value> {
         "Файлы движка изменены"
     );
     let _guard = ControlGuard::acquire(&app.root, "strategy-test")?;
+    let _quick_edit = crate::console::QuickEditGuard::suspend()
+        .context("Не удалось настроить ввод консоли на время автоподбора")?;
     crate::ensure_controller_current()?;
     let network = app.platform("network", json!({}))?;
     let key = network["key"]
@@ -1563,7 +1743,7 @@ fn run_inner(
     // Read the complete run from the pinned package, after acquiring control.
     // Prompts before the lock may have allowed another window to change inputs.
     let settings = read_settings(snapshot.root())?;
-    let targets = read_targets(snapshot.root())?;
+    let targets = read_targets(snapshot.root(), arguments)?;
     let all = list_strategies(snapshot.root())?;
     capture_trial_autolist(snapshot.root())?;
     let native_hash = crate::controller_hash()?;
@@ -1639,6 +1819,10 @@ fn run_inner(
             targets.len()
         ),
     )?;
+    crate::selection_ui::progress(
+        app,
+        "Зелёный — ответило больше адресов, чем без обхода. Красный — меньше.",
+    )?;
     crate::selection_ui::detail(
         app,
         arguments.details,
@@ -1679,7 +1863,7 @@ fn run_inner(
         }
         crate::selection_ui::heading(app, "Проверяю соединение без обхода…")?;
         let baseline_started = Instant::now();
-        let mut round_ids = BTreeSet::new();
+        let mut round_ids = BTreeSet::<String>::new();
         let metadata = json!({"Schema":1,"RunId":run_id,"Stage":"main","Round":round,"CapturedNetworkKey":network_key,"CapturedInputsHash":snapshot.fingerprint(),"NativeIdentity":native_hash});
         let (base, base_eligible) = measured(
             &context,
@@ -1690,19 +1874,21 @@ fn run_inner(
             &BTreeMap::new(),
             &BTreeSet::new(),
         )?;
+        let round_targets = endpoints::for_round(&targets, &base);
         let clean = baseline(&base);
+        let base_counts = availability(&base);
         let base_timing = timing_summary(&base, baseline_started.elapsed().as_secs_f64() * 1000.);
         crate::selection_ui::run_summary(
             app,
             "Без обхода",
             &summary("0", &base, &BTreeMap::new()),
-            &availability(&base),
+            &base_counts,
             &base_timing,
             &base,
             crate::selection_ui::RunState {
                 qualified: base_eligible,
                 leader: false,
-                best_score: 0.,
+                response_delta: None,
                 details: arguments.details,
                 position: 0,
                 total: candidates.len(),
@@ -1713,9 +1899,16 @@ fn run_inner(
         table.insert("0".into(), base);
         let control_targets: Vec<_> = targets
             .iter()
-            .filter(|target| target.group == "Clean" && clean.contains_key(&target.name))
+            .filter(|target| {
+                target.group == "Clean"
+                    && clean.contains_key(&target.name)
+                    && target.probe_mode() != ProbeMode::Http3Head
+            })
             .take(3)
-            .cloned()
+            .map(|target| Target {
+                expected: None,
+                ..target.clone()
+            })
             .collect();
         let mut ordered = candidates.clone();
         shuffle(&mut ordered, &mut random);
@@ -1779,7 +1972,7 @@ fn run_inner(
                 .collect();
             let result = measured(
                 &context,
-                &targets,
+                &round_targets,
                 arguments,
                 &mut engine,
                 &metadata,
@@ -1798,12 +1991,10 @@ fn run_inner(
                 .entry(strategy.id.clone())
                 .and_modify(|qualified| *qualified &= stable)
                 .or_insert(stable);
-            let previous_best = table
+            let previous_best = round_ids
                 .iter()
-                .filter(|(id, _)| {
-                    id.as_str() != strategy.id && strategy_quality.get(*id) == Some(&true)
-                })
-                .map(|(id, rows)| summary(id, rows, &clean).score)
+                .filter(|id| strategy_quality.get(*id) == Some(&true))
+                .map(|id| summary(id, &table[id], &clean).score)
                 .reduce(f64::max);
             let confirmed = strategy_quality.get(&strategy.id) == Some(&true);
             crate::selection_ui::run_summary(
@@ -1817,9 +2008,7 @@ fn run_inner(
                     qualified: confirmed,
                     leader: confirmed
                         && previous_best.is_none_or(|score| run_summary.score >= score),
-                    best_score: previous_best
-                        .unwrap_or(run_summary.score)
-                        .max(run_summary.score),
+                    response_delta: counts.change_from(&base_counts),
                     details: arguments.details,
                     position: index + 1,
                     total: candidates.len(),
@@ -2072,11 +2261,59 @@ fn run_inner(
             );
             stop_trial(engine)?;
             let (actual, _) = actual?;
-            let measured = table
-                .get(id)
-                .context("Рабочая стратегия отсутствует в измерении")?;
-            let expected = final_reference(&working_reference, measured, &table["0"]);
-            let error = final_check(&expected, &actual)
+            // The retained command only needs to preserve its own working coverage.
+            let expected = if retained {
+                final_reference(&working_reference, &[], &[])
+            } else {
+                let measured = table
+                    .get(id)
+                    .context("Рабочая стратегия отсутствует в измерении")?;
+                final_reference(&working_reference, measured, &table["0"])
+            };
+            let (comparable, details) = endpoints::compare_final(
+                &targets,
+                &expected,
+                &actual,
+                |requests, previous| {
+                    let cmd = if previous {
+                        original_command.as_slice()
+                    } else {
+                        command
+                    };
+                    let mut stage_info = json!({"RunId":run_id, "Schema":1, "StrategyId":id, "CandidateCheck":check_index,
+                        "Stage": if previous { "dns-peer-previous" } else { "dns-peer-final" }});
+                    if previous {
+                        stage_info["StrategyId"] = json!(primary);
+                    }
+                    prepare_trial_inputs(snapshot.root(), &settings)?;
+                    let attempts = if previous { 2 } else { 1 };
+                    let parallel = arguments.retry_parallel();
+                    let budget = batch_budget(requests.len(), parallel, arguments.timeout_ms)?;
+                    let mut trial = Some(start_trial(
+                        snapshot.root(),
+                        cmd,
+                        budget * attempts + 30000,
+                    )?);
+                    let result = (|| {
+                        let mut rows = Vec::new();
+                        for attempt in 1..=attempts {
+                            rows.extend(probe_batch(
+                                &context,
+                                requests,
+                                parallel,
+                                arguments.timeout_ms,
+                                &mut trial,
+                                &stage_info,
+                                attempt as usize,
+                            )?);
+                        }
+                        Ok(rows)
+                    })();
+                    stop_trial(trial)?;
+                    result
+                },
+            )?;
+            let error = final_check(&expected, &comparable)
                 .err()
                 .map(|error| format!("{error:#}"));
             context.assert_current()?;
@@ -2089,7 +2326,7 @@ fn run_inner(
             Ok(crate::selection_decision::Check {
                 confirmed: error.is_none(),
                 error,
-                details: probe_details(&actual),
+                details,
             })
         };
         let mut primary_command_changed = false;
@@ -2212,7 +2449,7 @@ fn run_inner(
     let availability: BTreeMap<_, _> = table
         .iter()
         .filter(|(id, _)| id.as_str() != "0")
-        .map(|(id, rows)| (id.clone(), availability(rows)))
+        .map(|(id, rows)| (id.clone(), availability(rows).counts()))
         .collect();
     let mut report = json!({"schema":1,"run_id":run_id,"best":best,"trial_best":trial_best,"recommendation_status":recommendation_status,"final_checks":final_checks,"choice":choice,
         "selection_policy":crate::selection_latency::POLICY,"connection_selection":latency_preference,
@@ -2222,6 +2459,7 @@ fn run_inner(
         "skipped_ids":skipped,"rounds_measured":rounds_measured,"strategy_names":all.iter().map(|s|(&s.id,s.display_name())).collect::<BTreeMap<_,_>>(),"native_identity":native_hash,"context":result_context});
     report["parallel"] = json!(arguments.parallel());
     report["retry_parallel"] = json!(arguments.retry_parallel());
+    report["endpoint_policy"] = json!("baseline-peer-per-round-live-dns-final-v1");
     report["timeout_ms"] = json!(arguments.timeout_ms);
     Ok(report)
 }
@@ -2535,6 +2773,7 @@ mod tests {
             termination: "Complete".into(),
             tries: 1,
             flaky: false,
+            failed_retry: None,
             raw: json!({}),
         }
     }
@@ -2546,6 +2785,77 @@ mod tests {
         assert_eq!(summary("12", &rows, &BTreeMap::new()).score, 0.5);
         assert!(final_check(&rows, &[row("FAIL")]).is_err());
         assert!(final_check(&rows, &[row("OK")]).is_ok());
+    }
+
+    #[test]
+    fn dns_rotation_requires_matched_success_and_reproduced_previous_failure() {
+        let a = "192.0.2.134:443";
+        let b = "192.0.2.130:443";
+        let target: Target = serde_json::from_value(json!({
+            "group":"Discord","name":"avatar","url":"https://cdn.example.test/avatar"
+        }))
+        .unwrap();
+        let observed = |peer: &str, ok: bool| {
+            let mut sample = row(if ok { "OK" } else { "FAIL" });
+            sample.group = target.group.clone();
+            sample.name = target.name.clone();
+            sample.url = target.url.clone();
+            sample.raw = json!({"remote_address":peer,"resolved_addresses":[a,b],
+                "status_code":if ok {Some(200)} else {None},"body_bytes":if ok {128} else {0},
+                "stage":if ok {"Complete"} else {"Tls"},"termination":if ok {"Complete"} else {"TlsFailure"}});
+            sample
+        };
+        let targets = std::slice::from_ref(&target);
+        let expected = [observed(a, true)];
+        let actual = [observed(b, false)];
+        let round = endpoints::for_round(targets, &actual);
+        let job = round[0].job(5000, false);
+        assert_eq!(job.connect_ip, Some("192.0.2.130".parse().unwrap()));
+        assert_eq!(job.url, target.url);
+        assert!(target.job(5000, false).connect_ip.is_none());
+        for (candidate_ok, old_ok, pass) in [
+            (true, false, true),
+            (true, true, false),
+            (false, false, false),
+        ] {
+            let (compared, details) =
+                endpoints::compare_final(targets, &expected, &actual, |jobs, previous| {
+                    assert_eq!(jobs.len(), 1);
+                    assert_eq!(jobs[0].url, target.url);
+                    let peer = if previous { b } else { a };
+                    assert_eq!(jobs[0].peer.unwrap().to_string(), peer);
+                    Ok(vec![
+                        observed(
+                            peer,
+                            if previous { old_ok } else { candidate_ok }
+                        );
+                        if previous { 2 } else { 1 }
+                    ])
+                })
+                .unwrap();
+            assert_eq!(final_check(&expected, &compared).is_ok(), pass);
+            assert_eq!(details[0]["state"], "FAIL");
+            assert_eq!(details[0]["peer_comparison"]["shared_failure"], pass);
+        }
+        let mut retired = observed(b, false);
+        retired.raw["resolved_addresses"] = json!([b]);
+        let mut different_retry = observed(b, false);
+        different_retry.failed_retry = Some(observed(a, false).raw);
+        for unpaired in [observed(a, false), retired, different_retry] {
+            let (compared, _) =
+                endpoints::compare_final(targets, &expected, &[unpaired], |_, _| {
+                    panic!("same-peer failure or stale address must not be replaced")
+                })
+                .unwrap();
+            assert!(final_check(&expected, &compared).is_err());
+        }
+        let mut raw = observation(&round[0]);
+        raw["dns_source"] = json!("connect_ip override");
+        raw["resolved_addresses"] = json!([b]);
+        raw["remote_address"] = json!(a);
+        assert!(convert(&round[0], raw.clone(), Utc::now()).is_err());
+        raw["remote_address"] = json!(b);
+        assert!(convert(&round[0], raw, Utc::now()).is_ok());
     }
 
     #[test]
@@ -2606,7 +2916,7 @@ mod tests {
 
         let expected = final_reference(&working, &measured, std::slice::from_ref(&clean));
         final_check(&expected, &actual).unwrap();
-        assert_eq!(availability(&actual)["ok"], 1);
+        assert_eq!(availability(&actual).ok, 1);
         assert_eq!(actual[0].state, "FAIL");
 
         let mut stable_reference = working.clone();
@@ -2708,8 +3018,33 @@ mod tests {
         control.group = "Clean".into();
         let absent = row("NA");
         let rows = vec![recovered, timed_out, control, absent];
-        assert_eq!(availability(&rows), json!({"ok":1,"total":2}));
+        assert_eq!(availability(&rows).counts(), json!({"ok":1,"total":2}));
         assert_eq!(summary("50", &rows, &BTreeMap::new()).ok, 0.5);
+    }
+    #[test]
+    fn response_delta_uses_the_same_available_targets_in_any_worker_order() {
+        let first = row("OK");
+        let mut second = row("FAIL");
+        second.name = "second".into();
+        let baseline = availability(&[first.clone(), second.clone()]);
+        second.state = "OK".into();
+        second.flaky = true;
+        assert_eq!(
+            availability(&[second.clone(), first.clone()]).change_from(&baseline),
+            Some(1)
+        );
+        let mut absent = first;
+        absent.state = "NA".into();
+        let before = availability(&[absent.clone(), second.clone()]);
+        second.name = "different".into();
+        assert_eq!(
+            availability(&[absent.clone(), second]).change_from(&before),
+            None
+        );
+        assert_eq!(
+            availability(&[absent]).change_from(&availability(&[])),
+            None
+        );
     }
     #[test]
     fn one_unstable_trial_does_not_discard_other_confirmed_strategies() {
@@ -2776,6 +3111,27 @@ mod tests {
             &[row("OK"), clean]
         ));
     }
+
+    #[test]
+    fn http_control_uses_tcp_latency_for_coverage_scoring_and_validation() {
+        let mut clean = row("OK");
+        clean.group = "Clean".into();
+        clean.url = "http://example.test/connecttest.txt".into();
+        clean.tls_ms = 0.;
+        let baseline_rows = [row("OK"), clean.clone()];
+        let baseline_times = baseline(&baseline_rows);
+        assert_eq!(baseline_times[&clean.name], clean.conn_ms);
+        assert!(fully_covered(&baseline_rows, &baseline_rows));
+        let mut slow = baseline_rows.clone();
+        slow[1].conn_ms += 501.;
+        assert!(!fully_covered(&baseline_rows, &slow));
+        assert_eq!(summary("1", &slow, &baseline_times).harm, 1);
+        assert!(final_check(&baseline_rows, &slow).is_err());
+        assert!(!crate::selection_latency::preserves_services(
+            &probe_details(&baseline_rows[1..]),
+            &probe_details(&slow[1..])
+        ));
+    }
     #[test]
     fn family_normalization_retains_protocol_and_fooling_differences() {
         let mut first = Strategy {
@@ -2806,12 +3162,105 @@ mod tests {
     }
 
     #[test]
+    fn file_checks_require_the_expected_http_status_size_and_eof() {
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir(root.path().join("tools")).unwrap();
+        let file = root.path().join("tools/targets.txt");
+        fs::write(
+            &file,
+            "Game.store GET 200 91315 2c073e9176cd934933b5914534017ffe89607b91a4966fea392291026b0eb7f5 = https://example.test/file?id=1\n\
+            QUIC.google H3 204 0 = https://example.test/check\n\
+            Clean.basic = https://example.test/\n\
+            Clean.plain GET 200 22 = http://example.test/connect.txt\n",
+        )
+        .unwrap();
+        let targets = read_targets(root.path(), &parse_test(&[])).unwrap();
+        let target = &targets[0];
+        let job = target.job(3000, false);
+        assert_eq!(job.body_limit, 91316);
+        assert_eq!(job.mode, ProbeMode::FullGet);
+        assert_eq!(job.url, "https://example.test/file?id=1");
+        assert_eq!(targets[1].job(3000, false).method.as_deref(), Some("HEAD"));
+        assert_eq!(targets[2].job(3000, true).mode, ProbeMode::Range);
+        let ab = read_targets(
+            root.path(),
+            &parse_test(&["--compare-a", "1", "--compare-b", "2"]),
+        )
+        .unwrap();
+        assert_eq!(
+            ab.iter().map(|t| t.name.as_str()).collect::<Vec<_>>(),
+            ["store", "basic"]
+        );
+        let hash = target.expected.as_ref().unwrap().sha256.as_ref().unwrap();
+
+        for (code, size, termination, expected) in [
+            (200, 91315, "Complete", "OK"),
+            (403, 91315, "Complete", "FAIL"),
+            (404, 128, "Complete", "FAIL"),
+            (200, 16384, "Complete", "FAIL"),
+            (200, 16384, "Timeout", "FREEZE"),
+            (200, 91316, "BodyLimit", "FAIL"),
+        ] {
+            let mut value = observation(target);
+            for (key, field) in [
+                ("mode", json!("full_get")),
+                ("status_code", json!(code)),
+                ("body_limit", json!(job.body_limit)),
+                ("body_bytes", json!(size)),
+                ("received_body_bytes", json!(size)),
+                ("body_sha256", json!(hash)),
+                ("termination", json!(termination)),
+                ("body_complete", json!(termination == "Complete")),
+                ("target_reached", json!(termination == "BodyLimit")),
+            ] {
+                value[key] = field;
+            }
+            assert_eq!(convert(target, value, Utc::now()).unwrap().state, expected);
+        }
+        let mut substituted = observation(target);
+        for (key, field) in [
+            ("mode", json!("full_get")),
+            ("body_limit", json!(91316)),
+            ("body_bytes", json!(91315)),
+            ("received_body_bytes", json!(91315)),
+            ("body_sha256", json!("0".repeat(64))),
+        ] {
+            substituted[key] = field;
+        }
+        assert_eq!(
+            convert(target, substituted, Utc::now()).unwrap().state,
+            "FAIL"
+        );
+        assert!(convert(&targets[1], observation(&targets[1]), Utc::now()).is_err());
+        for fields in [
+            "GET 200 4..1",
+            "H3 204 1",
+            "GET 200 1048576",
+            "GET 404 0",
+            "GET 200 22 invalid-sha",
+            "typo",
+        ] {
+            fs::write(
+                &file,
+                format!("Game.store {fields} = https://example.test/"),
+            )
+            .unwrap();
+            assert!(
+                read_targets(root.path(), &parse_test(&[])).is_err(),
+                "{fields}"
+            );
+        }
+    }
+
+    #[test]
     fn worker_batch_requires_one_complete_typed_observation_per_target() {
         let target = Target {
             group: "Clean".into(),
             name: "fixture".into(),
             url: "https://fixture.invalid/".into(),
             post: false,
+            expected: None,
+            peer: None,
         };
         let value = observation(&target);
         let bytes = serde_json::to_vec(&value).unwrap();
@@ -2854,6 +3303,8 @@ mod tests {
             name: "fixture".into(),
             url: "https://fixture.invalid/".into(),
             post: false,
+            expected: None,
+            peer: None,
         };
         for (key, value) in [
             ("body_complete", json!(false)),
@@ -2892,21 +3343,22 @@ mod tests {
         assert!(batch_budget(0, 1, 5000).is_err());
     }
 
+    fn parse_test(flags: &[&str]) -> TestArgs {
+        use clap::Parser;
+        let cli = crate::cli::Cli::try_parse_from(
+            ["zapret-rust", "test"]
+                .into_iter()
+                .chain(flags.iter().copied()),
+        )
+        .unwrap();
+        let Some(crate::cli::Action::Test(args)) = cli.action else {
+            panic!("expected test arguments");
+        };
+        args
+    }
+
     #[test]
     fn full_pick_defaults_use_wider_batches_without_overriding_explicit_parallelism() {
-        use clap::Parser;
-        let parse_test = |flags: &[&str]| {
-            let cli = crate::cli::Cli::try_parse_from(
-                ["zapret-rust", "test"]
-                    .into_iter()
-                    .chain(flags.iter().copied()),
-            )
-            .unwrap();
-            let Some(crate::cli::Action::Test(args)) = cli.action else {
-                panic!("expected test arguments");
-            };
-            args
-        };
         let widths = |args: TestArgs| (args.parallel(), args.retry_parallel());
         assert_eq!(widths(parse_test(&[])), (16, 4));
         assert_eq!(widths(parse_test(&["--full"])), (32, 8));
@@ -3047,6 +3499,8 @@ mod tests {
                     name: name.into(),
                     url: format!("https://{name}.invalid/"),
                     post: false,
+                    expected: None,
+                    peer: None,
                 }
             })
             .collect();
@@ -3098,6 +3552,8 @@ mod tests {
             name: "fixture".into(),
             url: "https://example.com/".into(),
             post: false,
+            expected: None,
+            peer: None,
         };
         let targets = [
             target.clone(),

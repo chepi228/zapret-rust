@@ -489,5 +489,8 @@ pub fn test_strategy_ids(
             ids.insert(s.id);
         }
     }
-    Ok(all.into_iter().filter(|s| ids.contains(&s.id)).collect())
+    let (mut preferred, others): (Vec<_>, Vec<_>) =
+        all.into_iter().partition(|s| ids.contains(&s.id));
+    preferred.extend(others);
+    Ok(preferred)
 }

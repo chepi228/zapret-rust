@@ -14,8 +14,8 @@ pub struct Comparison {
     pub regressions: usize,
     pub gain_ms: f64,
     pub gain_percent: f64,
-    pub reference_tcp_ms: f64,
-    pub candidate_tcp_ms: f64,
+    pub reference_tcp_ms: Option<f64>,
+    pub candidate_tcp_ms: Option<f64>,
     pub reference_tls_ms: f64,
     pub candidate_tls_ms: f64,
     pub reference_connect_ms: f64,
@@ -54,15 +54,23 @@ pub fn eligible(reference: &RankRow, candidate: &RankRow) -> bool {
         && reference.harm == 0
         && candidate.harm == 0
         && candidate.freeze == 0
-        && ["NBA2K", "EAC", "YouTube", "Discord", "SoundCloud"]
-            .iter()
-            .all(|group| {
-                let total = reference.group_totals.get(*group).copied().unwrap_or(0);
-                total == 0
-                    || (candidate.group_totals.get(*group) == Some(&total)
-                        && candidate.groups.get(*group).copied().unwrap_or(0.)
-                            >= reference.groups.get(*group).copied().unwrap_or(0.))
-            })
+        && [
+            "NBA2K",
+            "EAC",
+            "YouTube",
+            "Discord",
+            "SoundCloud",
+            "QUIC",
+            "CDN",
+        ]
+        .iter()
+        .all(|group| {
+            let total = reference.group_totals.get(*group).copied().unwrap_or(0);
+            total == 0
+                || (candidate.group_totals.get(*group) == Some(&total)
+                    && candidate.groups.get(*group).copied().unwrap_or(0.)
+                        >= reference.groups.get(*group).copied().unwrap_or(0.))
+        })
 }
 
 struct Sample {
@@ -74,7 +82,7 @@ struct Sample {
     body_bytes: u64,
     post_bytes: u64,
     dns: f64,
-    tcp: f64,
+    tcp: Option<f64>,
     connect: f64,
     first_byte: f64,
     total: f64,
@@ -115,8 +123,8 @@ pub fn timing(rows: &[Value]) -> Timing {
             .count(),
         samples: valid.len(),
         dns_ms: med(|row| row.dns),
-        tcp_ms: med(|row| row.tcp),
-        tls_ms: med(|row| row.connect - row.tcp),
+        tcp_ms: nonempty_median(valid.values().filter_map(|row| row.tcp).collect()),
+        tls_ms: med(|row| row.connect - row.tcp.unwrap_or(0.)),
         first_byte_ms: med(|row| row.first_byte),
         total_ms: med(|row| row.total),
         p95_ms: (!valid.is_empty()).then(|| p95(valid.values().map(|row| row.total).collect())),
@@ -158,12 +166,25 @@ pub fn preserves_services(reference: &[Value], candidate: &[Value]) -> bool {
                         && row["url"] == before["url"]
                 })
                 .is_some_and(|after| {
+                    let time = if before["url"]
+                        .as_str()
+                        .is_some_and(|url| url.starts_with("http://"))
+                    {
+                        "tcp_ms"
+                    } else {
+                        "tls_ms"
+                    };
                     verified_response(after)
                         && (before["group"] != "Clean"
-                            || before["tls_ms"]
-                                .as_f64()
-                                .zip(after["tls_ms"].as_f64())
-                                .is_some_and(|(a, b)| b <= a + 500.))
+                            || before[time].as_f64().zip(after[time].as_f64()).is_some_and(
+                                |(a, b)| {
+                                    a.is_finite()
+                                        && a > 0.
+                                        && b.is_finite()
+                                        && b > 0.
+                                        && b <= a + 500.
+                                },
+                            ))
                 })
         })
         && candidate.iter().filter(|row| row["flaky"] == true).count()
@@ -184,19 +205,23 @@ fn sample(row: &Value) -> Option<(String, Sample)> {
     let group = row["group"].as_str()?;
     let url = row["url"].as_str()?;
     let dns = row["dns_ms"].as_f64()?;
-    let tcp = row["tcp_ms"].as_f64()? - dns;
+    let tcp = if row["mode"] == "http3_head" {
+        None
+    } else {
+        Some(row["tcp_ms"].as_f64()? - dns)
+    };
     let connect = if url.starts_with("https://") {
         row["tls_ms"].as_f64()? - dns
     } else {
-        tcp
+        tcp?
     };
     let first_byte = row["first_byte_ms"].as_f64()?;
     let total = row["total_ms"].as_f64()?;
-    if ![dns, tcp, connect, first_byte, total]
+    if ![dns, tcp.unwrap_or(0.), connect, first_byte, total]
         .iter()
         .all(|value| value.is_finite() && *value >= 0.)
         || total <= 0.
-        || connect < tcp
+        || connect < tcp.unwrap_or(0.)
         || first_byte + 0.001 < dns + connect
         || total + 0.001 < first_byte
     {
@@ -269,6 +294,9 @@ fn median(mut values: Vec<f64>) -> f64 {
         values[n / 2]
     }
 }
+fn nonempty_median(values: Vec<f64>) -> Option<f64> {
+    (!values.is_empty()).then(|| median(values))
+}
 
 pub fn compare(reference: &[Value], candidate: &[Value]) -> Option<Comparison> {
     let reference = samples(reference)?;
@@ -288,8 +316,8 @@ pub fn compare(reference: &[Value], candidate: &[Value]) -> Option<Comparison> {
     }
     let pairs = common;
     let gains: Vec<_> = pairs.iter().map(|(_, a, b)| a.total - b.total).collect();
-    let reference_tcp_ms = median(pairs.iter().map(|(_, a, _)| a.tcp).collect());
-    let candidate_tcp_ms = median(pairs.iter().map(|(_, _, b)| b.tcp).collect());
+    let reference_tcp_ms = nonempty_median(pairs.iter().filter_map(|(_, a, _)| a.tcp).collect());
+    let candidate_tcp_ms = nonempty_median(pairs.iter().filter_map(|(_, _, b)| b.tcp).collect());
     let reference_p95_ms = p95(pairs.iter().map(|(_, a, _)| a.total).collect());
     let candidate_p95_ms = p95(pairs.iter().map(|(_, _, b)| b.total).collect());
     let mut groups = BTreeMap::<&str, (Vec<f64>, Vec<f64>)>::new();
@@ -325,8 +353,18 @@ pub fn compare(reference: &[Value], candidate: &[Value]) -> Option<Comparison> {
         ),
         reference_tcp_ms,
         candidate_tcp_ms,
-        reference_tls_ms: median(pairs.iter().map(|(_, a, _)| a.connect - a.tcp).collect()),
-        candidate_tls_ms: median(pairs.iter().map(|(_, _, b)| b.connect - b.tcp).collect()),
+        reference_tls_ms: median(
+            pairs
+                .iter()
+                .map(|(_, a, _)| a.connect - a.tcp.unwrap_or(0.))
+                .collect(),
+        ),
+        candidate_tls_ms: median(
+            pairs
+                .iter()
+                .map(|(_, _, b)| b.connect - b.tcp.unwrap_or(0.))
+                .collect(),
+        ),
         reference_connect_ms: median(pairs.iter().map(|(_, a, _)| a.connect).collect()),
         candidate_connect_ms: median(pairs.iter().map(|(_, _, b)| b.connect).collect()),
         reference_total_ms: median(pairs.iter().map(|(_, a, _)| a.total).collect()),

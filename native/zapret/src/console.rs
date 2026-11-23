@@ -5,12 +5,54 @@ use std::io::{self, IsTerminal, Write};
 use windows_sys::Win32::{
     Foundation::HANDLE,
     System::Console::{
-        CONSOLE_SCREEN_BUFFER_INFO, COORD, ENABLE_VIRTUAL_TERMINAL_PROCESSING,
-        FillConsoleOutputAttribute, FillConsoleOutputCharacterW, GetConsoleMode,
-        GetConsoleScreenBufferInfo, GetStdHandle, STD_OUTPUT_HANDLE, SetConsoleCursorPosition,
-        SetConsoleMode, SetConsoleTextAttribute,
+        CONSOLE_SCREEN_BUFFER_INFO, COORD, ENABLE_EXTENDED_FLAGS, ENABLE_QUICK_EDIT_MODE,
+        ENABLE_VIRTUAL_TERMINAL_PROCESSING, FillConsoleOutputAttribute,
+        FillConsoleOutputCharacterW, GetConsoleMode, GetConsoleScreenBufferInfo, GetStdHandle,
+        STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, SetConsoleCursorPosition, SetConsoleMode,
+        SetConsoleTextAttribute,
     },
 };
+
+/// Classic conhost suspends console writes while a mouse selection is active.
+/// Scope the input-mode change to the measurement holding the package control lock.
+pub(crate) struct QuickEditGuard {
+    input: HANDLE,
+    original_mode: u32,
+}
+
+impl QuickEditGuard {
+    pub(crate) fn suspend() -> io::Result<Option<Self>> {
+        if !io::stdout().is_terminal() {
+            return Ok(None);
+        }
+        let input = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
+        let mut original_mode = 0;
+        if unsafe { GetConsoleMode(input, &mut original_mode) } == 0
+            || original_mode & ENABLE_QUICK_EDIT_MODE == 0
+        {
+            return Ok(None);
+        }
+        let mode = (original_mode | ENABLE_EXTENDED_FLAGS) & !ENABLE_QUICK_EDIT_MODE;
+        if unsafe { SetConsoleMode(input, mode) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Some(Self {
+            input,
+            original_mode,
+        }))
+    }
+}
+
+impl Drop for QuickEditGuard {
+    fn drop(&mut self) {
+        let mut current = 0;
+        if unsafe { GetConsoleMode(self.input, &mut current) } != 0 {
+            let flags = ENABLE_EXTENDED_FLAGS | ENABLE_QUICK_EDIT_MODE;
+            let restored = (current & !flags) | (self.original_mode & flags);
+            unsafe { SetConsoleMode(self.input, restored) };
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Tone {

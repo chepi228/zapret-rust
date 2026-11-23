@@ -423,8 +423,8 @@ cargo zapret build --install
 cargo zapret check-install
 cargo zapret build-ring --native-windows
 cargo zapret package --skip-compile --candidate dist/native/native-engine-candidate
-cargo zapret check-package dist\zapret-rust-native-v1.0.zip --output dist\native\smoke.json
-cargo zapret check-menu dist\zapret-rust-native-v1.0.zip --output dist\native\menu.json
+cargo zapret check-package dist\zapret-rust-native-v1.1.zip --output dist\native\smoke.json
+cargo zapret check-menu dist\zapret-rust-native-v1.1.zip --output dist\native\menu.json
 cargo zapret check-probe bin\zapret-rust.exe --subcommand probe --output dist\native\probe.json
 ```
 
@@ -474,11 +474,17 @@ the current primary. Stable working DPI coverage, user services and ordinary-sit
 latency remain required; retry-only synthetic DPI responses stay in the report
 and score without vetoing the final result. Successful explicit application starts
 the accepted configuration even when the bypass was stopped before selection.
-Quick tests defer clearly inferior strategies using a local context-scoped cache;
-near winners, the primary, unmeasured/changed files and service specialists stay.
-Deferred strategies return after five further runs or seven days; a changed
-network/input signature resets learning. Full and manual selection retain all
-profiles. Report-only tests do not update this learning cache.
+Quick tests select up to 18 profiles from all valid installed strategies. They keep the
+primary and recent winners, then explore less recently measured profiles across different
+families and section settings. The local cache keeps up to eight network/input contexts.
+Deferred strategies become eligible after five further runs or seven days. Report-only
+tests leave the cache intact and full selection covers all valid profiles.
+
+In `targets.txt`, an optional method, status and byte count or inclusive range can
+follow the target name. `GET 200 91315` requires a complete file of that size.
+An optional trailing SHA-256 verifies its bytes. The finalist A/B handshake comparison uses the TCP/HTTPS subset.
+`H3 204 0` checks HTTPS HEAD over QUIC with system certificate verification.
+An unannotated target retains its original bounded reachability check.
 `provider-check` performs the full report-only strategy workflow and writes a
 provider-named shareable report; `provider-info` only reads ISP/IP information.
 `provider-check --args '{"plan_only":true}' inspects the full workflow without

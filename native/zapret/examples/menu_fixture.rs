@@ -267,7 +267,7 @@ mod interrupt {
 }
 
 mod selection_learning {
-    pub const QUICK_STRATEGY_LIMIT: usize = 12;
+    pub const QUICK_STRATEGY_LIMIT: usize = 18;
 }
 
 mod diagnostic_report {

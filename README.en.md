@@ -1,36 +1,80 @@
-# zapret rust 1.0
+# zapret-rust 1.1
 
-DPI circumvention for YouTube and Discord with automatic strategy selection and an optional local Telegram proxy. The Windows x64 build uses [zapret2](https://github.com/bol-van/zapret2) and [Flowseal strategies](https://github.com/Flowseal/zapret-discord-youtube). The menu is in Russian.
+zapret-rust helps Windows users reach YouTube, Discord and other services on connections affected by deep packet inspection (DPI). A single BAT menu lets you compare profiles on your own network, start a local Telegram Desktop proxy and see where a connection fails.
 
-[Downloads and SHA-256 checksums](https://github.com/chepi228/zapret-rust/releases/latest) · [Русский](README.md)
+**[Download the Windows 10/11 x64 ZIP](https://github.com/chepi228/zapret-rust/releases/download/v1.1/zapret-rust-native-v1.1.zip)** · [All 1.1 release files](https://github.com/chepi228/zapret-rust/releases/tag/v1.1) · [Changelog](CHANGELOG.md) · [Русский](README.md)
 
-## Windows
+## Start on Windows
 
-1. Extract the ZIP, RAR or 7z archive. Run `zapret-rust.bat` and approve the Windows elevation prompt.
-2. Select **6** to check the connection and **1** to start. Use **3** for automatic strategy selection or **5** for manual selection.
-3. Use **4** to manage the local Telegram proxy, **7 → 6** for Windows startup and **7 → 9** for built-in updates.
+1. Extract the entire ZIP into a permanent folder, for example `C:\Tools\zapret-rust`.
+2. Open `zapret-rust.bat` in that folder and approve the Windows administrator prompt. Keep the launcher alongside `bin`, `lists`, `strategies` and `tools`.
+3. Choose **1** to start. Open the service you want to use and try an everyday action such as playing a video, loading an image or joining a voice call.
+4. If the service still loads slowly, choose **3 → 1**. The quick test tries profiles on the current connection. Run it between games and calls because it temporarily stops the active bypass to take measurements.
 
-The native Rust application handles the menu, diagnostics, strategy selection, Windows services and Telegram. Standard profiles are built into the packet engine, and Luna Core runs custom Lua scripts. Rust ownership and bounds checks help prevent resource and memory errors.
+**Upgrading from 1.0?** Open your existing BAT and choose **7 → 9**. Confirm the update and reopen the same BAT if prompted. The updater verifies the archive SHA-256 and keeps your settings, Telegram data and custom lists.
 
-The standard Windows x64 package uses the project's Rust engine, controller, worker, Telegram integration and ring library. It depends on the third-party WinDivert driver and Windows system libraries. [Engine build and package variants](native/zapret-ring-ffi/README.md#native-windows-engine).
+## Read the results
 
-The GitHub language chart covers the Rust implementation. The rules in `.gitattributes` exclude the BAT launcher, Linux installer, C references, test scripts and legacy compatibility files from the chart.
+The first row is the baseline with the bypass off. The quick test tries up to **18 strategies**. Version 1.1 ships with **86 targets**, including controls. The tests cover pages, downloads, images and HTTP/3. The response count excludes controls and probes that could not be measured.
 
-## Linux
+| During a trial | Meaning |
+| --- | --- |
+| Green, e.g. `32/68 (+4)` | Four more targets responded than in the baseline. |
+| Neutral, e.g. `28/68 (=)` | The same number responded. |
+| Red, e.g. `26/68 (-2)` | Two fewer targets responded. |
+| Yellow | The controls were unstable or the measured target set changed. |
+| Score and score leader | Retries and regressions on control sites affect the score used to select finalists. |
 
-The Linux installer verifies and runs the interactive setup from upstream [zapret2 v1.0.7](https://github.com/bol-van/zapret2/releases/tag/v1.0.7). The Rust engine and Windows menu are Windows features in this release.
+The final check runs the candidate in its working configuration. In the final table, green means it passed and red means it failed. If the proposed configuration is rejected, the summary gives the reason and names the profile that was kept. Choose **3 → 5** to reopen the latest result. The summary lists the detailed report file.
+
+Press **Ctrl+C** to cancel. Version 1.1 temporarily disables mouse text selection in the classic Windows console during a run so an accidental click cannot pause output halfway through.
+
+## Menu shortcuts
+
+| Task | Menu |
+| --- | --- |
+| Start or restart | **1** |
+| Stop running zapret instances, including instances from other folders | **2** |
+| Try all strategies or add a browser check | **3 → 2** or **3 → 3** |
+| Pick a strategy manually | **5** |
+| Diagnose the connection, VPN, proxy and conflicts | **6** |
+| Configure Windows startup | **7 → 6** |
+| Check for updates | **7 → 9** |
+| Check DNS, TCP, TLS and HTTP separately | **8 → 11** |
+| Remove the Windows registration | **7 → 11** |
+
+### Telegram Desktop
+
+Choose **4 → 1**, then accept the proxy link in Telegram Desktop. The bridge listens on `127.0.0.1`. Choose **4 → 3** to change its port or **4 → 2** to stop it.
+
+### Troubleshooting
+
+- If Discord opens but images fail, check the Discord rows in **3 → 5**. For voice calls, use **8 → 12**.
+- If the browser behaves differently from the quick test, **8 → 10** checks the browser's actual HTTP/2 and HTTP/3 connections. Use **6** to see whether a VPN or proxy is active.
+- If a profile stops working after switching networks, run **3 → 1** on the connection you intend to use. **8 → 4** collects settings and logs in one diagnostic report.
+
+The Windows guide covers all menu options, custom lists and recovery after an interrupted update. [Windows guide in Russian](https://github.com/chepi228/zapret-rust/blob/v1.1/docs/windows.md)
+
+## Downloads and Linux
+
+All Windows archives contain the same `zapret-rust` folder. Windows can open the ZIP directly. [ZIP](https://github.com/chepi228/zapret-rust/releases/download/v1.1/zapret-rust-native-v1.1.zip) · [7z](https://github.com/chepi228/zapret-rust/releases/download/v1.1/zapret-rust-v1.1-windows-x64.7z) · [RAR](https://github.com/chepi228/zapret-rust/releases/download/v1.1/zapret-rust-v1.1-windows-x64.rar) · [SHA-256 checksums](https://github.com/chepi228/zapret-rust/releases/download/v1.1/SHA256SUMS.txt)
+
+The separate Linux installer downloads upstream **zapret2 v1.0.7**, verifies its SHA-256 and opens its interactive setup. Add `--prepare-only` to prepare the files without installing the system service. [Linux installer](https://github.com/chepi228/zapret-rust/releases/download/v1.1/zapret-rust-v1.1-linux-install.sh) · [Linux guide in Russian](https://github.com/chepi228/zapret-rust/blob/v1.1/docs/linux.md)
 
 ```sh
-sh zapret-rust-v1.0-linux-install.sh
+sh zapret-rust-v1.1-linux-install.sh
 ```
 
-Use `--prepare-only` to unpack and prepare the program before running the system setup. See the [Linux instructions](https://github.com/chepi228/zapret-rust/blob/v1.0/docs/linux.md).
+## Components and credits
+
+The standard Windows x64 package runs the project's Rust controller, worker, packet engine, ring library and Telegram bridge. Standard profiles are built in. Luna Core runs custom Lua scripts. Windows packet capture uses the third-party WinDivert driver and Windows system APIs. The source tree also contains test references and compatibility builds. [Engine and package variants](https://github.com/chepi228/zapret-rust/blob/v1.1/native/zapret-ring-ffi/README.md#native-windows-engine)
+
+The project builds on zapret2 and work by Flowseal. Project code is licensed under MIT, and bundled third-party components retain their respective licenses. [zapret2](https://github.com/bol-van/zapret2) · [Flowseal strategies](https://github.com/Flowseal/zapret-discord-youtube) · [TG WS Proxy](https://github.com/Flowseal/tg-ws-proxy) · [MIT](LICENSE) · [Third-party notices](THIRD-PARTY-NOTICES.md)
+
+The GitHub language chart counts Rust sources according to the repository's `.gitattributes`. The BAT launcher, Linux installer and historical test references are excluded from the chart. [Language chart rules](https://github.com/chepi228/zapret-rust/blob/v1.1/.gitattributes)
 
 ## Contact and support
 
-Telegram [@chepi1](https://t.me/chepi1).
+Contact the maintainer on Telegram. [@chepi1](https://t.me/chepi1)
 
-USDT on TRC-20  
-`TM9NUBAggxULA56T4wYrTyxfQX4bPMjDM9`
-
-Project source is [MIT](LICENSE). [Third-party notices](THIRD-PARTY-NOTICES.md) document bundled components and their source code.
+To support development, send USDT on the TRC-20 network to `TM9NUBAggxULA56T4wYrTyxfQX4bPMjDM9`.

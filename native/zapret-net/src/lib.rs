@@ -20,7 +20,7 @@ use anyhow::{Context, Result, bail};
 pub use diagnostic::diagnostics;
 pub use http::{download, fetch};
 pub use latency::{LatencyOutcome, LatencySample, LatencyStore, LatencyStream, LatencySummary};
-pub use protocol::{Job, Observation, Stage, TcpAttempt, Termination};
+pub use protocol::{Job, MAX_BODY_LIMIT, Observation, ProbeMode, Stage, TcpAttempt, Termination};
 use std::{
     collections::VecDeque,
     io::{Read, Write},
@@ -181,7 +181,7 @@ async fn batch(
                     start,
                     deadline,
                     cancellation.clone(),
-                    options.ca_file.is_some(),
+                    options.ca_file.clone(),
                     post_body.clone(),
                 ));
             }

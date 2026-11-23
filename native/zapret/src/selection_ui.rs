@@ -5,24 +5,30 @@ fn primary_answer(text: &str) -> Option<bool> {
     crate::confirmation::answer(text)
 }
 
-fn result_tone(qualified: bool, leader: bool, harm: usize, score: f64, best: f64) -> Tone {
-    if !qualified {
-        Tone::Warning
-    } else if leader {
-        Tone::Good
-    } else if harm >= 3 || best - score >= 10. {
-        Tone::Bad
-    } else if best - score <= 2. {
-        Tone::Good
-    } else {
-        Tone::Text
+fn trial_tone(qualified: bool, response_delta: Option<i64>) -> Tone {
+    match response_delta {
+        Some(delta) if qualified => match delta.cmp(&0) {
+            std::cmp::Ordering::Greater => Tone::Good,
+            std::cmp::Ordering::Less => Tone::Bad,
+            std::cmp::Ordering::Equal => Tone::Text,
+        },
+        _ => Tone::Warning,
+    }
+}
+
+fn final_status(report: &Value, id: &str) -> (&'static str, Tone) {
+    match report["final_checks"][id]["confirmed"].as_bool() {
+        Some(false) => ("финал не пройден", Tone::Bad),
+        _ if report["strategy_quality"][id] == false => ("нестабильно", Tone::Warning),
+        Some(true) => ("финал пройден", Tone::Good),
+        None => ("без финала", Tone::Text),
     }
 }
 
 pub struct RunState {
     pub qualified: bool,
     pub leader: bool,
-    pub best_score: f64,
+    pub response_delta: Option<i64>,
     pub details: bool,
     pub position: usize,
     pub total: usize,
@@ -49,14 +55,8 @@ pub fn primary_frame(report: &Value, viewport: Viewport) -> Frame {
     rows.sort_by_key(|row| row["id"].as_str() != Some(best));
     for row in rows.into_iter().take(3) {
         let id = row["id"].as_str().unwrap_or("");
-        let confirmed = report["final_checks"][id]["confirmed"].as_bool();
-        let (label, tone) = if confirmed == Some(false) {
-            ("ФИНАЛ НЕ ПРОЙДЕН", Tone::Bad)
-        } else if id == best {
-            ("ПОДТВЕРЖДЕНА", Tone::Good)
-        } else {
-            ("ОДИНОЧНЫЙ ТЕСТ", Tone::Text)
-        };
+        let (label, tone) = final_status(report, id);
+        let label = label.to_uppercase();
         frame.row(
             &format!(
                 " {label}: {} · балл {}",
@@ -423,6 +423,28 @@ fn compact_result(
             frame.row(" Проверка не меняла основную стратегию.", Tone::Text);
         }
     }
+    let partial: Vec<_> = report["final_details"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|row| row["peer_comparison"]["shared_failure"] == true)
+        .map(|row| {
+            format!(
+                "{}/{}",
+                row["group"].as_str().unwrap_or(""),
+                row["name"].as_str().unwrap_or("")
+            )
+        })
+        .collect();
+    if !partial.is_empty() {
+        frame.row(
+            &format!(
+                " Доступность зависит от IP сервера. В обоих режимах был сбой для {}.",
+                partial.join(", ")
+            ),
+            Tone::Warning,
+        );
+    }
     if report["startup"]["requested"] == false && report["startup"]["reason"] == "BypassWasStopped"
     {
         frame.row(
@@ -483,17 +505,10 @@ fn compact_result(
     ordered.sort_by_key(|row| row["id"].as_str() != Some(best));
     for row in ordered.into_iter().take(3) {
         let id = row["id"].as_str().unwrap_or("");
-        let confirmed = report["final_checks"][id]["confirmed"].as_bool();
-        let flag = if confirmed == Some(false) {
-            " · финал не пройден"
-        } else if confirmed == Some(true) {
-            " · проверена"
-        } else {
-            ""
-        };
+        let (flag, tone) = final_status(report, id);
         frame.row(
             &format!(
-                " {} · {}{}{}{}",
+                " {} · {} · {}{}{}",
                 name(report, id),
                 row["score"]
                     .as_f64()
@@ -507,13 +522,7 @@ fn compact_result(
                     .map(|(total, _, _)| format!(" · всего {total:.0} мс"))
                     .unwrap_or_default()
             ),
-            if confirmed == Some(false) {
-                Tone::Bad
-            } else if report["strategy_quality"][id] == false {
-                Tone::Warning
-            } else {
-                Tone::Good
-            },
+            tone,
         );
     }
     if full_request_policy(report) {
@@ -620,11 +629,6 @@ fn ranking_frame(
     let has_timing = report["timings"]
         .as_object()
         .is_some_and(|map| !map.is_empty());
-    let best_score = rows
-        .iter()
-        .filter(|row| report["strategy_quality"][row["id"].as_str().unwrap_or("")] != false)
-        .filter_map(|row| row["score"].as_f64())
-        .fold(f64::NEG_INFINITY, f64::max);
     let recommendation_confirmed = report["recommendation_status"] == "confirmed"
         && report["final_checks"][best]["confirmed"] == true;
     let name_width = viewport
@@ -686,28 +690,7 @@ fn ranking_frame(
                 None => text.push_str(&format!(" {:>8} {:>8}", "—", "—")),
             }
         }
-        frame.row(
-            &text,
-            if failed_final {
-                Tone::Bad
-            } else if unconfirmed
-                || (id == best
-                    && report["validation_error"].is_string()
-                    && !recommendation_confirmed)
-            {
-                Tone::Warning
-            } else if id == best {
-                Tone::Good
-            } else {
-                result_tone(
-                    true,
-                    false,
-                    row["harm"].as_u64().unwrap_or(0) as usize,
-                    row["score"].as_f64().unwrap_or(best_score),
-                    best_score,
-                )
-            },
-        );
+        frame.row(&text, final_status(report, id).1);
     }
     if shown < rows.len() {
         frame.row(
@@ -720,7 +703,7 @@ fn ranking_frame(
         Tone::Text,
     );
     frame.row(
-        " Зелёный — лидеры теста; красный — слабый результат или отказ в финале.",
+        " Зелёный — финал пройден. Красный — финал не пройден.",
         Tone::Secondary,
     );
     frame.separator("");
@@ -787,7 +770,7 @@ fn ranking_frame(
         {
             Tone::Warning
         } else {
-            Tone::Good
+            Tone::Text
         },
     );
     if recommendation_confirmed {
@@ -945,7 +928,7 @@ pub fn result_text(report: &Value) -> Option<String> {
     if report["timings"].is_object() {
         text.push_str("\r\n\r\nСводка по стратегиям\r\n");
         if full_request_policy(report) {
-            text.push_str("Полное время тестового запроса: DNS, TCP, TLS, ответ и передача данных до конца ответа или лимита 64 КиБ. Медиана и P95 — по стабильным успешным запросам всех групп; ошибки и повторы учитываются отдельно. TCP и TLS в этой сводке — длительности отдельных этапов.\r\n");
+            text.push_str("Время запроса включает DNS, подключение и чтение до конца ответа или лимита адреса. Медиана и P95 учитывают стабильные успешные запросы всех групп. Для HTTP/3 измеряется рукопожатие QUIC через UDP.\r\n");
         }
         for row in report["rows"].as_array().into_iter().flatten() {
             let id = row["id"].as_str().unwrap_or("");
@@ -976,6 +959,8 @@ pub fn result_text(report: &Value) -> Option<String> {
             let mut parts = Vec::new();
             for (key, label) in [
                 ("DPI", "16–20 КБ"),
+                ("CDN", "файлы CDN"),
+                ("QUIC", "HTTP/3"),
                 ("Discord", "Discord"),
                 ("YouTube", "YouTube"),
                 ("SoundCloud", "SoundCloud"),
@@ -1088,7 +1073,7 @@ fn detail_line(row: &Value) -> String {
             .map(|v| format!("{v:.0}"))
             .unwrap_or_else(|| "—".into())
     };
-    format!(
+    let mut line = format!(
         "  {}/{} | {} | HTTP {} | DNS {} мс | TCP {} мс | TLS {} мс | всего {} мс | отправлено {} / получено {} байт{}{}",
         field("group"),
         field("name"),
@@ -1110,14 +1095,34 @@ fn detail_line(row: &Value) -> String {
         } else {
             ""
         }
-    )
+    );
+    if let Some(check) = row["peer_comparison"].as_object() {
+        line.push_str(&format!(
+            " | IP из DNS {}.",
+            check["dns_peer"].as_str().unwrap_or("—")
+        ));
+        for (field, label) in [
+            ("candidate_replays", "Кандидат"),
+            ("previous_controls", "Прежний режим"),
+        ] {
+            for result in check[field].as_array().into_iter().flatten() {
+                line.push_str(&format!(
+                    " {} {} — {}.",
+                    label,
+                    result["remote_address"].as_str().unwrap_or("—"),
+                    result["state"].as_str().unwrap_or("—")
+                ));
+            }
+        }
+    }
+    line
 }
 
 pub fn run_summary(
     app: &crate::App,
     name: &str,
     summary: &zapret_core::RankRow,
-    counts: &Value,
+    counts: &crate::selection::Availability,
     timing: &Value,
     rows: &[crate::selection::Row],
     state: RunState,
@@ -1132,25 +1137,28 @@ pub fn run_summary(
             .map(|v| format!("{v:.0}"))
             .unwrap_or_else(|| "—".into())
     };
-    let tone = if summary.id == "0" {
+    let baseline = summary.id == "0";
+    let tone = if baseline {
         Tone::Secondary
     } else {
-        result_tone(
-            state.qualified,
-            state.leader,
-            summary.harm,
-            summary.score,
-            state.best_score,
-        )
+        trial_tone(state.qualified, state.response_delta)
+    };
+    let change = match (baseline, state.response_delta) {
+        (true, _) => String::new(),
+        (_, Some(0)) => " (=)".into(),
+        (_, Some(delta)) => format!(" ({delta:+})"),
+        (_, None) => " (нет общей базы)".into(),
+    };
+    let marker = if baseline {
+        ""
+    } else if !state.qualified {
+        " · нестабильно"
+    } else if state.leader {
+        " · лидер по баллу"
+    } else {
+        ""
     };
     if !state.details {
-        let marker = if !state.qualified {
-            " · нестабильно"
-        } else if state.leader {
-            " · лидер"
-        } else {
-            ""
-        };
         let prefix = if state.position > 0 {
             format!("[{:02}/{:02}] ", state.position, state.total)
         } else {
@@ -1158,10 +1166,11 @@ pub fn run_summary(
         };
         crate::console::line(
             &format!(
-                "{prefix}{} · {}/{} · TCP {} / TLS {} · всего {} мс{marker}",
+                "{prefix}{} · {}/{}{change} · балл {} · TCP {} / TLS {} · всего {} мс{marker}",
                 label(name, 24),
-                counts["ok"],
-                counts["total"],
+                counts.ok,
+                counts.total(),
+                points(summary.score),
                 timing["overall"]["tcp_ms"]
                     .as_f64()
                     .map(|v| format!("{v:.0}"))
@@ -1179,26 +1188,12 @@ pub fn run_summary(
         )?;
         return Ok(());
     }
-    if summary.id != "0" {
-        let label = if !state.qualified {
-            "КОНТРОЛЬ НЕ ПОДТВЕРЖДЁН"
-        } else if state.leader {
-            "ЛИДЕР В ТЕСТЕ"
-        } else if tone == Tone::Good {
-            "БЛИЗКО К ЛИДЕРУ"
-        } else if tone == Tone::Bad {
-            "СЛАБЫЙ РЕЗУЛЬТАТ"
-        } else {
-            "РЕЗУЛЬТАТ"
-        };
-        crate::console::line(&format!("  {label}: {name}"), tone)?;
-    }
     crate::console::line(
         &format!(
-            "  {name}: балл {} | ответили {}/{} | зачёт {}/{} | вред {}/{} | зависаний {} | TCP ~{} мс | TLS ~{} мс | время {} с",
+            "  {name}: балл {} | ответили {}/{}{change} | зачёт {}/{} | вред {}/{} | зависаний {} | TCP ~{} мс | TLS ~{} мс | время {} с{marker}",
             points(summary.score),
-            counts["ok"],
-            counts["total"],
+            counts.ok,
+            counts.total(),
             points(summary.ok),
             summary.total,
             summary.harm,
@@ -1216,6 +1211,8 @@ pub fn run_summary(
     let mut groups = Vec::new();
     for (key, label) in [
         ("DPI", "16–20 КБ"),
+        ("CDN", "файлы CDN"),
+        ("QUIC", "HTTP/3"),
         ("Discord", "Discord"),
         ("YouTube", "YouTube"),
         ("SoundCloud", "SoundCloud"),
@@ -1390,11 +1387,31 @@ mod tests {
     }
 
     #[test]
-    fn leader_bad_and_unconfirmed_results_have_distinct_meaningful_colors() {
-        assert_eq!(result_tone(true, true, 0, 50., 50.), Tone::Good);
-        assert_eq!(result_tone(true, false, 6, 20., 50.), Tone::Bad);
-        assert_eq!(result_tone(false, false, 0, 51., 50.), Tone::Warning);
-        assert_eq!(result_tone(true, false, 0, 47., 50.), Tone::Text);
+    fn trial_colors_use_the_visible_response_change_with_control_failures_taking_priority() {
+        assert_eq!(trial_tone(true, Some(1)), Tone::Good);
+        assert_eq!(trial_tone(true, Some(-1)), Tone::Bad);
+        assert_eq!(trial_tone(true, Some(0)), Tone::Text);
+        assert_eq!(trial_tone(true, None), Tone::Warning);
+        assert_eq!(trial_tone(false, Some(8)), Tone::Warning);
+    }
+
+    #[test]
+    fn both_result_tables_keep_untested_finalists_neutral() {
+        let mut data = report();
+        data["final_checks"] = json!({"52":{"confirmed":true}});
+        for mode in ["compact", "detailed"] {
+            data["presentation"] = json!(mode);
+            let frame = result_frame(
+                &data,
+                Viewport {
+                    columns: 100,
+                    rows: 80,
+                },
+            )
+            .unwrap();
+            assert!(frame.has_tone(Tone::Text, "ALT11 белый 1"));
+            assert!(frame.has_tone(Tone::Good, "ALT11 белый 3"));
+        }
     }
     use serde_json::json;
 

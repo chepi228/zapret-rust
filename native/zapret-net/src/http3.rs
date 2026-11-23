@@ -9,7 +9,12 @@ use quinn::{
 };
 use rustls::pki_types::{CertificateDer, pem::PemObject};
 use rustls_platform_verifier::Verifier;
-use std::{path::Path, sync::Arc, time::Duration};
+use std::{
+    net::SocketAddr,
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
+};
 use tokio::{
     net::lookup_host,
     sync::oneshot,
@@ -78,15 +83,23 @@ fn client_config(ca_file: Option<&Path>) -> Result<quinn::ClientConfig> {
     )))
 }
 
-async fn connect(url: &Url, config: &quinn::ClientConfig) -> Result<Connection> {
+async fn addresses(url: &Url) -> Result<Vec<SocketAddr>> {
     let host = http::hostname(url);
     let port = url.port_or_known_default().context("URL port")?;
-    let addresses: Vec<_> = lookup_host((host.as_str(), port))
+    Ok(lookup_host((host.as_str(), port))
         .await
         .context("DNS lookup failed")?
         .take(16)
-        .collect();
-    let addresses = connection_order(&addresses);
+        .collect())
+}
+
+async fn connect(
+    url: &Url,
+    config: &quinn::ClientConfig,
+    addresses: &[SocketAddr],
+) -> Result<Connection> {
+    let host = http::hostname(url);
+    let addresses = connection_order(addresses);
     let alternatives = addresses.len().saturating_sub(2);
     // Try the preferred address first. A second attempt can run alongside it
     // after a short delay, so an unavailable address family cannot block HEAD.
@@ -133,8 +146,23 @@ async fn connect(url: &Url, config: &quinn::ClientConfig) -> Result<Connection> 
     Err(error.unwrap_or_else(|| anyhow::anyhow!("Resolver returned no addresses")))
 }
 
-async fn head(url: &Url, config: &quinn::ClientConfig) -> Result<Response<()>> {
-    let connection = connect(url, config).await?;
+pub(crate) struct HeadResult {
+    pub headers: Response<()>,
+    pub remote: SocketAddr,
+    pub handshake_ms: f64,
+    pub headers_ms: f64,
+}
+
+async fn head(
+    url: &Url,
+    config: &quinn::ClientConfig,
+    addresses: &[SocketAddr],
+) -> Result<HeadResult> {
+    let start = Instant::now();
+    let connection = connect(url, config, addresses).await?;
+    let handshake_ms = crate::probe::elapsed_ms(start);
+    let remote = connection.remote_address();
+    let start = Instant::now();
     let protocol = connection
         .handshake_data()
         .and_then(|data| data.downcast::<HandshakeData>().ok())
@@ -160,7 +188,7 @@ async fn head(url: &Url, config: &quinn::ClientConfig) -> Result<Response<()>> {
             loop {
                 let response = stream.recv_response().await?;
                 if !response.status().is_informational() {
-                    return Ok(response);
+                    return Ok(HeadResult {headers: response, remote, handshake_ms, headers_ms: crate::probe::elapsed_ms(start)});
                 }
             }
         } => response,
@@ -171,7 +199,7 @@ async fn head(url: &Url, config: &quinn::ClientConfig) -> Result<Response<()>> {
 async fn request_headers(mut url: Url, ca_file: Option<&Path>) -> Result<ResponseHeaders> {
     let config = client_config(ca_file).context("Configure QUIC TLS")?;
     for redirects in 0..=MAX_REDIRECTS {
-        let headers = head(&url, &config).await?;
+        let headers = head(&url, &config, &addresses(&url).await?).await?.headers;
         let status = headers.status().as_u16();
         if matches!(status, 301 | 302 | 303 | 307 | 308) {
             ensure!(redirects < MAX_REDIRECTS, "HTTP/3 redirect limit exceeded");
@@ -203,19 +231,41 @@ pub(crate) async fn request(
     let ca_file = ca_file.map(Path::to_owned);
     // OS certificate verification can block inside the QUIC driver. Keep the
     // calling runtime free to enforce the deadline and respond to cancellation.
+    timeout_at(
+        deadline,
+        isolated(async move { request_headers(url, ca_file.as_deref()).await }),
+    )
+    .await?
+}
+
+pub(crate) async fn probe_head(
+    url: Url,
+    addresses: Vec<SocketAddr>,
+    ca_file: Option<PathBuf>,
+) -> Result<HeadResult> {
+    isolated(async move {
+        let config = client_config(ca_file.as_deref())?;
+        head(&url, &config, &addresses).await
+    })
+    .await
+}
+
+// Keep blocking certificate checks off the batch runtime. Dropping the caller cancels the request.
+async fn isolated<T: Send + 'static>(
+    request: impl Future<Output = Result<T>> + Send + 'static,
+) -> Result<T> {
     let (_cancel_on_drop, stopped) = oneshot::channel::<()>();
-    let worker = tokio::task::spawn_blocking(move || {
+    tokio::task::spawn_blocking(move || {
         crate::runtime(async {
             tokio::select! {
                 biased;
                 _ = stopped => anyhow::bail!("HTTP/3 request cancelled"),
-                result = timeout_at(deadline, request_headers(url, ca_file.as_deref())) => result?,
+                result = request => result,
             }
         })
-    });
-    timeout_at(deadline, worker)
-        .await?
-        .context("HTTP/3 task failed")?
+    })
+    .await
+    .context("HTTP/3 task failed")?
 }
 
 #[cfg(test)]
@@ -335,6 +385,30 @@ mod tests {
                 .err()
                 .unwrap();
             assert_eq!(failure(&deadline), "Timeout", "{deadline:#}");
+            let job = crate::Job {
+                version: 1,
+                id: "quic".into(),
+                url: url("localhost", "/redirect").to_string(),
+                timeout_ms: 3000,
+                body_limit: 1,
+                post_bytes: 0,
+                method: Some("HEAD".into()),
+                mode: crate::ProbeMode::Http3Head,
+                connect_ip: Some("127.0.0.1".parse()?),
+            };
+            let options = crate::BatchOptions {
+                ca_file: Some(ca.clone()),
+                ..Default::default()
+            };
+            let row = tokio::task::spawn_blocking(move || crate::probe(&[job], &options))
+                .await??
+                .pop()
+                .unwrap();
+            assert_eq!(row.status_code, Some(302)); // Judge the specified endpoint itself.
+            assert_eq!(row.mode, crate::ProbeMode::Http3Head);
+            assert_eq!(row.termination, crate::Termination::Complete);
+            assert_eq!(row.remote_address, Some(format!("127.0.0.1:{port}")));
+            assert!(row.certificate_validated && row.tcp_ms.is_none() && row.tls_ms.is_some());
             for (path, message) in [
                 ("/downgrade", "redirect must use https"),
                 ("/loop", "redirect limit exceeded"),

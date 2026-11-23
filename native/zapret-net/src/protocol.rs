@@ -4,6 +4,16 @@ use serde::{Deserialize, Serialize};
 use url::Url;
 
 pub const MAX_INPUT: u64 = 1_048_576;
+pub const MAX_BODY_LIMIT: usize = 1_048_576;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProbeMode {
+    #[default]
+    Range,
+    FullGet,
+    Http3Head,
+}
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -19,6 +29,8 @@ pub struct Job {
     pub post_bytes: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub method: Option<String>,
+    #[serde(default)]
+    pub mode: ProbeMode,
     pub connect_ip: Option<IpAddr>,
 }
 
@@ -58,7 +70,7 @@ pub fn read_jobs(reader: impl Read) -> Result<Vec<Target>, String> {
             || job.id.len() > 128
             || !ids.insert(job.id.clone())
             || !(1..=60000).contains(&job.timeout_ms)
-            || !(1..=1_048_576).contains(&job.body_limit)
+            || !(1..=MAX_BODY_LIMIT).contains(&job.body_limit)
             || job.post_bytes > 65536
             || job
                 .method
@@ -70,6 +82,18 @@ pub fn read_jobs(reader: impl Read) -> Result<Vec<Target>, String> {
             return Err(format!("line {}: invalid limits, version or id", index + 1));
         }
         let url = Url::parse(&job.url).map_err(|error| format!("line {}: {error}", index + 1))?;
+        let method =
+            job.method
+                .as_deref()
+                .unwrap_or(if job.post_bytes == 0 { "GET" } else { "POST" });
+        if (job.mode == ProbeMode::FullGet && method != "GET")
+            || (job.mode == ProbeMode::Http3Head && (url.scheme() != "https" || method != "HEAD"))
+        {
+            return Err(format!(
+                "line {}: method or URL incompatible with probe mode",
+                index + 1
+            ));
+        }
         if !matches!(url.scheme(), "http" | "https")
             || url.host().is_none()
             || !url.username().is_empty()
@@ -124,12 +148,16 @@ pub struct Observation {
     pub worker_version: String,
     pub id: String,
     pub url: String,
+    #[serde(default)]
+    pub mode: ProbeMode,
     pub stage: Stage,
     pub termination: Termination,
     pub error: Option<String>,
     pub status_code: Option<u16>,
     pub body_bytes: usize,
     pub received_body_bytes: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body_sha256: Option<String>,
     pub body_limit: usize,
     pub body_complete: bool,
     pub target_reached: bool,
@@ -166,12 +194,14 @@ impl Observation {
             worker_version: env!("CARGO_PKG_VERSION").into(),
             id: target.job.id.clone(),
             url: target.job.url.clone(),
+            mode: target.job.mode,
             stage: Stage::Queued,
             termination,
             error: None,
             status_code: None,
             body_bytes: 0,
             received_body_bytes: 0,
+            body_sha256: None,
             body_limit: target.job.body_limit,
             body_complete: false,
             target_reached: false,
@@ -183,7 +213,9 @@ impl Observation {
             resolved_addresses: Vec::new(),
             tcp_attempts: Vec::new(),
             remote_address: None,
-            tls_backend: (if cfg!(windows) {
+            tls_backend: (if target.job.mode == ProbeMode::Http3Head {
+                "rustls"
+            } else if cfg!(windows) {
                 "Schannel"
             } else if cfg!(target_os = "macos") {
                 "SecurityFramework"
@@ -191,7 +223,12 @@ impl Observation {
                 "OpenSSL"
             })
             .into(),
-            tls_profile: "native-tls defaults; TLS >= 1.2; ALPN http/1.1; system trust".into(),
+            tls_profile: if target.job.mode == ProbeMode::Http3Head {
+                "QUIC TLS 1.3; ALPN h3; platform verifier"
+            } else {
+                "native-tls defaults; TLS >= 1.2; ALPN http/1.1; system trust"
+            }
+            .into(),
             trust_source: "System".into(),
             certificate_validated: false,
             dns_ms: None,

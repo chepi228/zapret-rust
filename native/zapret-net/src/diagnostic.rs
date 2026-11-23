@@ -62,7 +62,11 @@ pub(crate) fn targets(root: &Path, args: &Value, all: bool) -> Result<Vec<Target
             let Some((key, url)) = line.split_once('=') else {
                 continue;
             };
-            let Some((group, name)) = key.trim().split_once('.') else {
+            let Some((group, name)) = key
+                .split_ascii_whitespace()
+                .next()
+                .and_then(|id| id.split_once('.'))
+            else {
                 continue;
             };
             if group.is_empty()

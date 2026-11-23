@@ -1,6 +1,7 @@
 use std::{
     convert::Infallible,
     net::SocketAddr,
+    path::PathBuf,
     pin::Pin,
     sync::{
         Arc,
@@ -17,6 +18,7 @@ use hyper::{
     client::conn::http1,
 };
 use hyper_util::rt::TokioIo;
+use sha2::{Digest, Sha256};
 use tokio::{
     io::{AsyncRead, AsyncWrite},
     net::{TcpStream, lookup_host},
@@ -27,7 +29,7 @@ use tokio::{
 use tokio_native_tls::TlsConnector;
 use url::{Host, Position};
 
-use crate::protocol::{Observation, Stage, Target, Termination};
+use crate::protocol::{Observation, ProbeMode, Stage, Target, Termination};
 #[cfg(test)]
 use tokio::time::timeout;
 
@@ -50,11 +52,11 @@ pub async fn run_probe(
     batch_start: Instant,
     deadline: Instant,
     mut cancellation: watch::Receiver<bool>,
-    extra_ca: bool,
+    ca_file: Option<PathBuf>,
     post_body: Option<Arc<[u8]>>,
 ) -> Observation {
     let mut row = Observation::queued(&target, Termination::Cancelled);
-    if extra_ca {
+    if ca_file.is_some() {
         row.trust_source = "SystemPlusExtraCa".into();
     }
     if *cancellation.borrow() {
@@ -73,7 +75,7 @@ pub async fn run_probe(
     let outcome = tokio::select! {
         biased;
         _ = cancellation.changed() => Termination::Cancelled,
-        result = timeout_at(cutoff, execute(&target, &connector, &mut row, provided.clone(), post_body.as_deref())) => {
+        result = timeout_at(cutoff, execute(&target, &connector, &mut row, provided.clone(), post_body.as_deref(), ca_file)) => {
             match result {
                 Ok(Ok(termination)) => termination,
                 Ok(Err((termination, error))) => {
@@ -100,6 +102,7 @@ async fn execute(
     row: &mut Observation,
     provided: Arc<AtomicUsize>,
     post_body: Option<&[u8]>,
+    ca_file: Option<PathBuf>,
 ) -> Result<Termination, ProbeError> {
     let host = match target.url.host().expect("validated URL") {
         Host::Domain(name) => name.to_owned(),
@@ -135,6 +138,27 @@ async fn execute(
         ));
     }
 
+    if target.job.mode == ProbeMode::Http3Head {
+        row.stage = Stage::Tls;
+        let response = crate::http3::probe_head(target.url.clone(), addresses, ca_file)
+            .await
+            .map_err(|error| {
+                let cause = match crate::http3::failure(&error) {
+                    "Timeout" => Termination::Timeout,
+                    "TlsFailure" => Termination::TlsFailure,
+                    _ => Termination::HttpFailure,
+                };
+                (cause, format!("{error:#}"))
+            })?;
+        row.remote_address = Some(response.remote.to_string());
+        row.tls_ms = Some(response.handshake_ms);
+        row.headers_ms = Some(response.headers_ms);
+        row.certificate_validated = true;
+        row.status_code = Some(response.headers.status().as_u16());
+        row.body_complete = true;
+        row.stage = Stage::Complete;
+        return Ok(Termination::Complete);
+    }
     row.stage = Stage::Tcp;
     let start = Instant::now();
     let stream = connect(&addresses, row).await?;
@@ -208,8 +232,13 @@ where
         .header("host", authority)
         .header("connection", "close")
         .header("accept", "*/*")
-        .header("range", format!("bytes=0-{}", target.job.body_limit - 1))
-        .header("user-agent", "zapret-rust-probe/0.1.0")
+        .header("user-agent", "zapret-rust-probe/0.1.0");
+    let request = if target.job.mode == ProbeMode::FullGet {
+        request.header("accept-encoding", "identity")
+    } else {
+        request.header("range", format!("bytes=0-{}", target.job.body_limit - 1))
+    };
+    let request = request
         .body(CountedBody {
             bytes: Some(match post_body {
                 Some(body) => Bytes::copy_from_slice(&body[..target.job.post_bytes]),
@@ -226,6 +255,7 @@ where
     row.status_code = Some(response.status().as_u16());
     row.stage = Stage::Body;
     let mut body = response.into_body();
+    let mut digest = (target.job.mode == ProbeMode::FullGet).then(Sha256::new);
     while let Some(frame) = body.frame().await {
         let frame = frame.map_err(|error| (Termination::TransferError, error.to_string()))?;
         if let Some(data) = frame.data_ref() {
@@ -236,8 +266,12 @@ where
                 row.target_reached = true;
                 return Ok(Termination::BodyLimit);
             }
+            if let Some(hash) = &mut digest {
+                hash.update(data);
+            }
         }
     }
+    row.body_sha256 = digest.map(|hash| format!("{:x}", hash.finalize()));
     row.body_complete = true;
     row.stage = Stage::Complete;
     Ok(Termination::Complete)
@@ -409,7 +443,7 @@ mod tests {
             start,
             start + Duration::from_secs(5),
             cancellation,
-            false,
+            None,
             None,
         ));
         received.await.unwrap();

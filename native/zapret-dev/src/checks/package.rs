@@ -269,16 +269,22 @@ pub(crate) fn run(archive: &Path, output: &Path) -> Result<()> {
         fs::write(&queue, source)?;
         let settings_before = fs::read(&settings_path)?;
         let lab = runner.json(&["lab", "--dir", laboratory.to_str().unwrap(), "--plan-only"])?;
+        let tcp_targets: Vec<_> = plan["targets"]
+            .as_array()
+            .context("missing selection plan targets")?
+            .iter()
+            .filter(|target| target["expected"]["mode"] != "http3_head")
+            .collect();
         evidence.check(
             lab["plan_only"] == true
                 && lab["queues"][0]["blocks"]
                     .as_array()
                     .is_some_and(|blocks| blocks.len() == 3)
-                && lab["targets"] == plan["targets"]
+                && lab["targets"] == json!(tcp_targets)
                 && fs::read_to_string(&queue)? == source
                 && fs::read(&settings_path)? == settings_before
                 && !laboratory.join("lab.log").exists(),
-            "native lab plan parses trials and current targets without bypass control",
+            "native lab plan parses trials and includes every TCP target in order",
         )?;
         fs::write(&queue, "@ invalid\n--lua-init=@arbitrary.lua\n")?;
         runner.raw(

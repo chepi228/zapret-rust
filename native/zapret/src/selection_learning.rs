@@ -1,13 +1,15 @@
 //! Local quick-test learning. Complete/manual pools never lose a strategy.
-use anyhow::Result;
+use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, path::Path};
 use zapret_core::{RankRow, Strategy};
 
 pub const FILE: &str = "runtime/test-selection-cache.json";
-pub(crate) const QUICK_STRATEGY_LIMIT: usize = 12;
+pub(crate) const QUICK_STRATEGY_LIMIT: usize = 18;
 const PRIORITY_SLOTS: usize = 6;
 const MAX_AGE: i64 = 7 * 24 * 60 * 60;
+const CACHE_BYTES: usize = 2 * 1024 * 1024;
+const MAX_CONTEXTS: usize = 8;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct Entry {
@@ -31,6 +33,36 @@ pub struct Plan {
     pub queued: Vec<String>,
 }
 
+#[derive(Serialize, Deserialize, Default)]
+struct ContextHistory {
+    contexts: Vec<Cache>,
+}
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum SavedHistory {
+    Contexts(ContextHistory),
+    Legacy(Cache),
+}
+
+fn read_history(root: &Path) -> Vec<Cache> {
+    let history = zapret_core::read_bounded(&root.join(FILE), CACHE_BYTES as u64)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok());
+    let mut contexts = match history {
+        Some(SavedHistory::Contexts(history)) if history.contexts.len() <= MAX_CONTEXTS => {
+            history.contexts
+        }
+        Some(SavedHistory::Legacy(cache)) => vec![cache],
+        _ => Vec::new(),
+    };
+    contexts.retain(|cache| {
+        cache.schema == 1
+            && cache.entries.len() <= 512
+            && cache.entries.values().all(|entry| entry.samples.len() <= 3)
+    });
+    contexts
+}
+
 impl Cache {
     pub fn new(context: &str) -> Self {
         Self {
@@ -41,19 +73,28 @@ impl Cache {
         }
     }
     pub fn load(root: &Path, context: &str) -> Self {
-        zapret_core::read_bounded(&root.join(FILE), 2 * 1024 * 1024)
-            .ok()
-            .and_then(|bytes| serde_json::from_slice::<Self>(&bytes).ok())
-            .filter(|cache| {
-                cache.schema == 1
-                    && cache.context == context
-                    && cache.entries.len() <= 512
-                    && cache.entries.values().all(|entry| entry.samples.len() <= 3)
-            })
+        read_history(root)
+            .into_iter()
+            .find(|cache| cache.context == context)
             .unwrap_or_else(|| Self::new(context))
     }
     pub fn save(&self, root: &Path) -> Result<()> {
-        zapret_core::atomic_write(&root.join(FILE), &serde_json::to_vec_pretty(self)?)
+        let mut contexts = read_history(root);
+        contexts.retain(|cache| cache.context != self.context);
+        contexts.insert(0, self.clone());
+        contexts.truncate(MAX_CONTEXTS);
+        let mut history = ContextHistory { contexts };
+        loop {
+            let bytes = serde_json::to_vec(&history)?;
+            if bytes.len() <= CACHE_BYTES {
+                return zapret_core::atomic_write(&root.join(FILE), &bytes);
+            }
+            ensure!(
+                history.contexts.len() > 1,
+                "История подключения превышает лимит файла"
+            );
+            history.contexts.pop();
+        }
     }
     pub fn observe(
         &mut self,
@@ -228,7 +269,15 @@ impl Cache {
         }
         if let Some((_, best)) = known.first() {
             let best = best.samples.last().unwrap();
-            for group in ["YouTube", "Discord", "NBA2K", "EAC", "SoundCloud"] {
+            for group in [
+                "YouTube",
+                "Discord",
+                "NBA2K",
+                "QUIC",
+                "CDN",
+                "EAC",
+                "SoundCloud",
+            ] {
                 if ids.len() >= PRIORITY_SLOTS {
                     break;
                 }
@@ -250,31 +299,50 @@ impl Cache {
                 }
             }
         }
-        for id in ["31", "32", "52", "58", "50", "11"] {
-            if ids.len() >= PRIORITY_SLOTS {
-                break;
-            }
-            add(&mut ids, id);
-        }
         for (id, _) in known {
             if ids.len() >= PRIORITY_SLOTS {
                 break;
             }
             add(&mut ids, id);
         }
+        let families: BTreeMap<_, _> = pool
+            .iter()
+            .map(|s| (&s.id, crate::selection::family(s)))
+            .collect();
+        let generations: BTreeMap<_, _> = known
+            .iter()
+            .map(|(id, entry)| (id.as_str(), entry.generation.saturating_add(1)))
+            .collect();
+        let mut represented = BTreeMap::<&str, usize>::new();
+        for id in &ids {
+            *represented.entry(&families[id]).or_default() += 1;
+        }
+        // Visit unmeasured and older profiles first. Within that cohort spread the slots across
+        // families, then prefer the profile differing in the most sections from its closest peer.
         let mut exploration: Vec<_> = pool.iter().filter(|s| !ids.contains(&s.id)).collect();
-        exploration.sort_by_key(|s| {
-            known
-                .iter()
-                .find(|(id, _)| ***id == s.id)
-                .map_or(0, |(_, entry)| entry.generation.saturating_add(1))
-        });
-        // Fill the remaining slots with unmeasured and least recently tested strategies.
-        for strategy in exploration {
-            if ids.len() >= QUICK_STRATEGY_LIMIT {
+        let mut selected: Vec<_> = pool.iter().filter(|s| ids.contains(&s.id)).collect();
+        while ids.len() < QUICK_STRATEGY_LIMIT {
+            let Some((index, _)) = exploration.iter().enumerate().min_by_key(|(_, strategy)| {
+                let distance = selected
+                    .iter()
+                    .map(|other| section_distance(strategy, other))
+                    .min()
+                    .unwrap_or(0);
+                (
+                    generations.get(strategy.id.as_str()).copied().unwrap_or(0),
+                    represented
+                        .get(families[&strategy.id].as_str())
+                        .copied()
+                        .unwrap_or(0),
+                    std::cmp::Reverse(distance),
+                )
+            }) else {
                 break;
-            }
-            add(&mut ids, &strategy.id);
+            };
+            let next = exploration.remove(index);
+            *represented.entry(&families[&next.id]).or_default() += 1;
+            ids.push(next.id.clone());
+            selected.push(next);
         }
         let queued = pool
             .iter()
@@ -293,10 +361,58 @@ impl Cache {
     }
 }
 
+fn section_distance(a: &Strategy, b: &Strategy) -> usize {
+    zapret_core::SECTIONS
+        .iter()
+        .copied()
+        .chain(["ipset_tcp", "ipset_udp"])
+        .filter(|section| {
+            a.sections.get(*section) != b.sections.get(*section)
+                || a.match_l3.get(*section) != b.match_l3.get(*section)
+        })
+        .count()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     const NOW: i64 = 2_000_000_000;
+    #[test]
+    fn late_distinct_families_and_udp_variants_enter_a_cold_pick_before_duplicates() {
+        let mut all: Vec<_> = (1..=30)
+            .map(|id| Strategy {
+                id: id.to_string(),
+                ..Default::default()
+            })
+            .collect();
+        all[28]
+            .sections
+            .insert("general".into(), vec!["distinct TCP section".into()]);
+        all[29]
+            .sections
+            .insert("quic".into(), vec!["distinct UDP section".into()]);
+        let plan = Cache::new("new").plan(&all, &all, "1", false, &BTreeMap::new(), NOW);
+        assert_eq!(plan.strategies[0].id, "1");
+        let first: Vec<_> = plan.strategies[..3].iter().map(|s| s.id.as_str()).collect();
+        assert!(first.contains(&"29") && first.contains(&"30"));
+    }
+
+    #[test]
+    fn returning_to_a_network_restores_its_own_history_including_legacy_data() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("runtime")).unwrap();
+        let a = learned();
+        std::fs::write(root.path().join(FILE), serde_json::to_vec(&a).unwrap()).unwrap();
+        let mut b = Cache::new("mobile");
+        b.generation = 2;
+        b.save(root.path()).unwrap();
+        assert_eq!(Cache::load(root.path(), "mobile").generation, 2);
+        assert_eq!(
+            Cache::load(root.path(), &a.context).entries.len(),
+            a.entries.len()
+        );
+        assert!(Cache::load(root.path(), "new").entries.is_empty());
+    }
     #[test]
     fn ordinary_pick_is_bounded_even_without_history_while_full_keeps_all_41() {
         let all: Vec<_> = (1..=41)
@@ -308,7 +424,7 @@ mod tests {
         let hashes = all.iter().map(|s| (s.id.clone(), s.id.clone())).collect();
         let cache = Cache::new("cold-network");
         let quick = cache.plan(&all, &all, "40", false, &hashes, NOW);
-        assert_eq!(quick.strategies.len(), 12);
+        assert_eq!(quick.strategies.len(), QUICK_STRATEGY_LIMIT);
         assert_eq!(quick.queued.len(), all.len() - quick.strategies.len());
         assert!(quick.strategies.iter().any(|s| s.id == "40"));
         let full = cache.plan(&all, &all, "40", true, &hashes, NOW);
@@ -350,12 +466,12 @@ mod tests {
         );
         let next = cache.plan(&all, &all, "40", false, &hashes, NOW + 1);
         assert!(next.strategies.iter().any(|s| s.id == "40"));
-        assert_eq!(
+        assert!(
             next.strategies
                 .iter()
                 .filter(|s| first.queued.contains(&s.id))
-                .count(),
-            6
+                .count()
+                >= QUICK_STRATEGY_LIMIT - PRIORITY_SLOTS
         );
     }
     fn strategies() -> Vec<Strategy> {

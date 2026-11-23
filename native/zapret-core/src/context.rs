@@ -3,7 +3,7 @@ use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, fs, io::ErrorKind, path::Path};
 
-pub const PACKAGE_VERSION: &str = "1.0";
+pub const PACKAGE_VERSION: &str = "1.1";
 // Frozen PowerShell signatures retain their historical release identity.
 const LEGACY_PACKAGE_VERSION: &str = "2.2";
 const SCORE_CODE: [&str; 20] = [

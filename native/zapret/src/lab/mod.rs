@@ -113,7 +113,11 @@ fn targets(root: &Path) -> Result<Vec<Target>> {
     } else {
         root.join("tools/dpi-suite.json")
     };
-    selection::read_targets_with_suite(root, &suite)
+    let mut targets = selection::read_targets_with_suite(root, &suite)?;
+    // The laboratory capture filter only includes TCP.
+    targets.retain(|t| t.probe_mode() != zapret_net::ProbeMode::Http3Head);
+    ensure!(!targets.is_empty(), "Для лаборатории нужны TCP-адреса");
+    Ok(targets)
 }
 
 pub fn run(app: &App, args: &LabArgs) -> Result<Value> {
@@ -475,11 +479,10 @@ fn batch(
                 .as_millis() as u64,
         )
         .max(1);
-    let jobs=targets.iter().map(|target|json!({"version":1,"id":target.target.id(),"url":target.target.url,
-        "connect_ip":target.address,"timeout_ms":timeout,"body_limit":65536,
-        "post_bytes":if target.target.post{65536}else{0},"method":if target.target.post{"POST"}else{"GET"}})).collect::<Vec<_>>();
     let mut input = Vec::new();
-    for job in jobs {
+    for target in targets {
+        let mut job = target.target.job(timeout, false);
+        job.connect_ip = Some(target.address);
         serde_json::to_writer(&mut input, &job)?;
         input.push(b'\n');
     }
@@ -741,7 +744,7 @@ mod tests {
         .unwrap();
         fs::write(
             root.join("tools/targets.txt"),
-            "GameServices.auth = https://example.org/auth\n",
+            "GameServices.auth = https://example.org/auth\nQUIC.check H3 200 0 = https://example.org/auth\n",
         )
         .unwrap();
         let source = "@ first\n--payload=tls_client_hello\n--lua-desync=fake:blob=tls_google\n@sleep 1\n@ baseline\n";

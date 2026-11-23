@@ -290,6 +290,7 @@ fn head_job(id: String, url: String, connect_ip: Option<IpAddr>) -> zapret_net::
         body_limit: 65536,
         post_bytes: 0,
         method: Some("HEAD".into()),
+        mode: zapret_net::ProbeMode::Range,
         connect_ip,
     }
 }

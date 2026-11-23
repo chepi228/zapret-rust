@@ -1,5 +1,5 @@
 # Адреса сервисов для автоподбора (пункт 3). Формат: Группа.Имя = https://адрес
-# Завершённая передача с любым HTTP-кодом (даже 403/404) считается успехом. Обрыв/тайм-аут после заголовков успехом не является.
+# Для адреса без дополнительных полей достаточно HTTP-ответа с завершённой передачей или достигнутым лимитом.
 # Замерзание 16-20 КБ проверяется отдельно по набору хостингов из tools\dpi-suite.json (как в тесте Flowseal).
 Discord.main      = https://discord.com/
 Discord.gateway   = https://gateway.discord.gg/
@@ -38,3 +38,25 @@ Clean.office      = https://www.office.com/
 # Steam: если стратегия ломает его, в Доте и других играх Steam пропадают цены, матчи и вход
 Clean.steam       = https://store.steampowered.com/
 Clean.steamapi    = https://api.steampowered.com/ISteamWebAPIUtil/GetServerInfo/v1/
+
+# После имени можно указать метод, ожидаемый HTTP-код, размер тела в байтах и необязательный SHA-256.
+# GET читает до конца. Для неизменяемого файла задаётся точный размер, для обновляемого — диапазон.
+# H3 проверяет HEAD через QUIC с проверкой сертификата и согласованием HTTP/3.
+Discord.gateway_json GET 200 10..512       = https://discord.com/api/v10/gateway
+Discord.avatar       GET 200 256..32768    = https://cdn.discordapp.com/embed/avatars/0.png
+YouTube.thumbnail    GET 200 4096..65536   = https://i.ytimg.com/vi/jNQXAC9IVRw/hqdefault.jpg
+YouTube.connectivity GET 204 0             = https://connectivitycheck.gstatic.com/generate_204
+SoundCloud.oembed    GET 200 128..16384    = https://soundcloud.com/oembed?format=json&url=https%3A%2F%2Fsoundcloud.com%2Fforss%2Fflickermood
+NBA2K.store_image    GET 200 91315 2c073e9176cd934933b5914534017ffe89607b91a4966fea392291026b0eb7f5 = https://nba-cdn3.2ksports.com/2k27/store/image/35/swags_hoodies_512x512_8_17.jHvTERq0BSA_g4D-lgVoiA
+CDN.github_raw       GET 200 13 03ba204e50d126e4674c005e04d82e84c21366780af1f43bd54a37816b6ab340 = https://raw.githubusercontent.com/octocat/Hello-World/7fd1a60b01f91b314f59955a4e4d4e80d8edf11d/README
+CDN.cloudflare       GET 200 32768         = https://speed.cloudflare.com/__down?bytes=32768
+CDN.cloudflare_text  GET 200 256..16384    = https://www.cloudflare.com/robots.txt
+CDN.jsdelivr         GET 200 87533 fc9a93dd241f6b045cbff0481cf4e1901becd0e12fb45166a8f17f95823f0b1a = https://cdn.jsdelivr.net/npm/jquery@3.7.1/dist/jquery.min.js
+Clean.windows_http   GET 200 22 5e9a7996fe94d7be10595d7133748760bf8348198b71b7a50fd8affaa980ac61 = http://www.msftconnecttest.com/connecttest.txt
+Clean.firefox_https  GET 200 8             = https://detectportal.firefox.com/success.txt
+Clean.steam_asset    GET 200 512..16384    = https://community.fastly.steamstatic.com/public/shared/images/header/logo_steam.svg
+# Эти четыре адреса также проверяются по TCP выше.
+QUIC.google          H3 204 0              = https://connectivitycheck.gstatic.com/generate_204
+QUIC.cloudflare      H3 200 0              = https://www.cloudflare.com/robots.txt
+QUIC.discord         H3 200 0              = https://discord.com/api/v10/gateway
+QUIC.jsdelivr        H3 200 0              = https://cdn.jsdelivr.net/npm/jquery@3.7.1/dist/jquery.min.js
