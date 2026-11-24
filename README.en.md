@@ -2,7 +2,7 @@
 
 **YouTube, Discord and Telegram Desktop on Windows 10/11 x64.** If your ISP restricts access through deep packet inspection (DPI), zapret-rust helps you choose a strategy for your connection. One menu lets you start the bypass, test Discord attachments and connect Telegram to a local bridge.
 
-**[Download the Windows x64 ZIP](https://github.com/chepi228/zapret-rust/releases/download/v1.2/zapret-rust-native-v1.2.zip)** · [All release files](https://github.com/chepi228/zapret-rust/releases/tag/v1.2) · [What's new in 1.2](CHANGELOG.md) · [Русский](README.md)
+**[Download the Windows x64 ZIP](https://github.com/chepi228/zapret-rust/releases/download/v1.2/zapret-rust-v1.2-windows-x64.zip)** · [All release files](https://github.com/chepi228/zapret-rust/releases/tag/v1.2) · [What's new in 1.2](CHANGELOG.md) · [Русский](README.md)
 
 ## Start on Windows
 
@@ -79,7 +79,9 @@ The Windows guide covers all menu options, custom lists and recovery after an in
 
 ## Downloads and Linux
 
-All Windows archives contain the same `zapret-rust` folder. Windows can open the ZIP directly. [ZIP](https://github.com/chepi228/zapret-rust/releases/download/v1.2/zapret-rust-native-v1.2.zip) · [7z](https://github.com/chepi228/zapret-rust/releases/download/v1.2/zapret-rust-v1.2-windows-x64.7z) · [RAR](https://github.com/chepi228/zapret-rust/releases/download/v1.2/zapret-rust-v1.2-windows-x64.rar) · [SHA-256 checksums](https://github.com/chepi228/zapret-rust/releases/download/v1.2/SHA256SUMS.txt)
+The ZIP, 7z and RAR for manual installation contain the same `zapret-rust` folder. Windows can open the ZIP directly. [ZIP](https://github.com/chepi228/zapret-rust/releases/download/v1.2/zapret-rust-v1.2-windows-x64.zip) · [7z](https://github.com/chepi228/zapret-rust/releases/download/v1.2/zapret-rust-v1.2-windows-x64.7z) · [RAR](https://github.com/chepi228/zapret-rust/releases/download/v1.2/zapret-rust-v1.2-windows-x64.rar) · [SHA-256 checksums](https://github.com/chepi228/zapret-rust/releases/download/v1.2/SHA256SUMS.txt)
+
+The menu updater in versions 1.0 and 1.1 downloads `zapret-rust-native-v1.2.zip`. It contains the same programs, with license files at the top level for compatibility.
 
 The separate Linux installer downloads upstream **zapret2 v1.0.7**, verifies its SHA-256 and opens its interactive setup. Add `--prepare-only` to prepare the files without installing the system service. [Linux installer](https://github.com/chepi228/zapret-rust/releases/download/v1.2/zapret-rust-v1.2-linux-install.sh) · [Linux guide in Russian](https://github.com/chepi228/zapret-rust/blob/v1.2/docs/linux.md)
 

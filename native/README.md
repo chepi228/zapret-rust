@@ -422,9 +422,11 @@ cargo zapret fmt --check
 cargo zapret build --install
 cargo zapret check-install
 cargo zapret build-ring --native-windows
-cargo zapret package --skip-compile --candidate dist/native/native-engine-candidate
-cargo zapret check-package dist\zapret-rust-native-v1.2.zip --output dist\native\smoke.json
-cargo zapret check-menu dist\zapret-rust-native-v1.2.zip --output dist\native\menu.json
+cargo zapret package --skip-compile --candidate dist/native/native-engine-candidate --output dist/zapret-rust-v1.2-windows-x64.zip
+cargo zapret check-package dist/zapret-rust-v1.2-windows-x64.zip --output dist/native/smoke.json
+cargo zapret check-menu dist/zapret-rust-v1.2-windows-x64.zip --output dist/native/menu.json
+# The 1.0 and 1.1 updaters look for this exact asset name and read licenses from the root.
+python dev/make-v1.2-update.py dist/zapret-rust-v1.2-windows-x64.zip dist/zapret-rust-native-v1.2.zip
 cargo zapret check-probe bin\zapret-rust.exe --subcommand probe --output dist\native\probe.json
 ```
 

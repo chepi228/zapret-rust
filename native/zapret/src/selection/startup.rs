@@ -99,16 +99,24 @@ mod tests {
             .join("System32/WindowsPowerShell/v1.0/powershell.exe");
         let args = ["-NoProfile", "-NonInteractive", "-Command", script].map(OsString::from);
         let mut child = OwnedChild::spawn(&shell, &args, &options)?;
+        // Start the trial in the announced state. PowerShell startup on CI can
+        // exceed the legacy engine grace period before the script executes.
+        let posted = unsafe {
+            windows_sys::Win32::System::Threading::ReleaseSemaphore(
+                signal.0.as_raw_handle(),
+                1,
+                ptr::null_mut(),
+            )
+        };
+        ensure!(posted != 0, "Could not announce fixture initialization");
         wait(&mut child, Some(&signal))
     }
 
     #[test]
     fn initialization_alone_does_not_start_measurements() {
-        assert!(!fixture(
-            "$s=[Threading.Semaphore]::OpenExisting($env:ZAPRET_TRIAL_STARTUP); $null=$s.Release(); Start-Sleep -Milliseconds 2300; exit 3"
-        ).unwrap());
+        assert!(!fixture("Start-Sleep -Milliseconds 2300; exit 3").unwrap());
         assert!(fixture(
-            "$s=[Threading.Semaphore]::OpenExisting($env:ZAPRET_TRIAL_STARTUP); $null=$s.Release(2); Start-Sleep -Seconds 20"
+            "$s=[Threading.Semaphore]::OpenExisting($env:ZAPRET_TRIAL_STARTUP); $null=$s.Release(); Start-Sleep -Seconds 20"
         ).unwrap());
     }
 }
