@@ -1,9 +1,40 @@
 use crate::{Settings, io::hex, sha256, sha256_file};
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
-use std::{collections::BTreeMap, fs, io::ErrorKind, path::Path};
+use std::{
+    collections::{BTreeMap, btree_map::Entry},
+    fs,
+    io::ErrorKind,
+    path::{Path, PathBuf},
+};
 
-pub const PACKAGE_VERSION: &str = "1.1";
+/// Digests belong to one composition. During Windows startup the open file
+/// handles deny writes and renames until that launch has finished.
+pub(crate) enum InputHashes<'a> {
+    Live(BTreeMap<PathBuf, String>),
+    Pinned(&'a BTreeMap<PathBuf, &'a str>),
+}
+impl InputHashes<'_> {
+    pub(crate) fn live() -> Self {
+        Self::Live(BTreeMap::new())
+    }
+    pub(crate) fn get(&mut self, path: &Path) -> Result<&str> {
+        match self {
+            Self::Pinned(files) => files.get(path).copied().with_context(|| {
+                format!(
+                    "File is absent from the pinned launch inputs: {}",
+                    path.display()
+                )
+            }),
+            Self::Live(files) => Ok(match files.entry(path.to_owned()) {
+                Entry::Occupied(entry) => entry.into_mut(),
+                Entry::Vacant(entry) => entry.insert(sha256_file(path)?),
+            }),
+        }
+    }
+}
+
+pub const PACKAGE_VERSION: &str = "1.2";
 // Frozen PowerShell signatures retain their historical release identity.
 const LEGACY_PACKAGE_VERSION: &str = "2.2";
 const SCORE_CODE: [&str; 20] = [
@@ -114,6 +145,14 @@ pub fn score_inputs_hash(
     targets: &[ScoreTarget],
     parameters: &BTreeMap<String, String>,
 ) -> Result<String> {
+    score_hash(root, targets, parameters, &mut InputHashes::live())
+}
+fn score_hash(
+    root: &Path,
+    targets: &[ScoreTarget],
+    parameters: &BTreeMap<String, String>,
+    hashes: &mut InputHashes<'_>,
+) -> Result<String> {
     ensure!(!targets.is_empty(), "No score targets");
     let (schema, version) = if root.join("tools/lib.ps1").is_file() {
         ("score-inputs-v2", LEGACY_PACKAGE_VERSION)
@@ -131,7 +170,7 @@ pub fn score_inputs_hash(
     parameters.sort_by(|(a, _), (b, _)| crate::io::legacy_compare(a, b));
     parts.extend(parameters.into_iter().map(|(k, v)| format!("{k}={v}")));
     for file in score_input_files(root)? {
-        parts.push(sha256_file(&root.join(file))?);
+        parts.push(hashes.get(&root.join(file))?.to_owned());
     }
     Ok(sha256(parts.join("\n").as_bytes()))
 }
@@ -183,9 +222,22 @@ pub fn test_result_context(
     settings: &Settings,
     network_key: &str,
 ) -> Result<TestResultContext> {
+    rank_context(root, settings, network_key, None, &mut InputHashes::live())
+}
+pub(crate) fn rank_context(
+    root: &Path,
+    settings: &Settings,
+    network_key: &str,
+    native_identity: Option<&str>,
+    hashes: &mut InputHashes<'_>,
+) -> Result<TestResultContext> {
+    ensure!(
+        native_identity.is_none_or(|id| hex(id, 64)),
+        "Native identity must be a SHA256"
+    );
     ensure!(hex(network_key, 64), "Unknown network context");
     let settings_key = settings_signature(settings, &["alt", "auto", "notify"]);
-    let inputs = score_inputs_hash(
+    let inputs = score_hash(
         root,
         &[ScoreTarget {
             group: "rank".into(),
@@ -193,6 +245,7 @@ pub fn test_result_context(
             url: "local".into(),
         }],
         &BTreeMap::from([("Settings".into(), settings_key)]),
+        hashes,
     )?;
     let mut parts = vec!["rank-context-v2".to_owned(), inputs];
     for dir in ["strategies", "bin", "windivert"] {
@@ -201,16 +254,20 @@ pub fn test_result_context(
             if crate::is_native_build_artifact(&relative) {
                 continue;
             }
-            parts.push(format!(
-                "{relative}={}",
-                sha256_file(&root.join(&relative))?
-            ));
+            parts.push(format!("{relative}={}", hashes.get(&root.join(&relative))?));
         }
     }
+    let inputs_hash = sha256(parts.join("\n").as_bytes());
+    let inputs_hash = match native_identity {
+        Some(identity) => {
+            sha256(format!("native-rank-context-v1\n{inputs_hash}\n{identity}").as_bytes())
+        }
+        None => inputs_hash,
+    };
     Ok(TestResultContext {
         schema: 2,
         network_key: network_key.to_owned(),
-        inputs_hash: sha256(parts.join("\n").as_bytes()),
+        inputs_hash,
         run_id: new_run_id(),
     })
 }
@@ -220,20 +277,29 @@ pub fn test_result_context_with_identity(
     network_key: &str,
     native_identity: &str,
 ) -> Result<TestResultContext> {
-    ensure!(hex(native_identity, 64), "Native identity must be a SHA256");
-    let mut context = test_result_context(root, settings, network_key)?;
-    context.inputs_hash = sha256(
-        format!(
-            "native-rank-context-v1\n{}\n{native_identity}",
-            context.inputs_hash
-        )
-        .as_bytes(),
-    );
-    Ok(context)
+    rank_context(
+        root,
+        settings,
+        network_key,
+        Some(native_identity),
+        &mut InputHashes::live(),
+    )
 }
 pub fn ring_composition_key(root: &Path, settings: &Settings) -> Result<String> {
+    ring_key(root, settings, None, &mut InputHashes::live())
+}
+pub(crate) fn ring_key(
+    root: &Path,
+    settings: &Settings,
+    native_identity: Option<&str>,
+    hashes: &mut InputHashes<'_>,
+) -> Result<String> {
+    ensure!(
+        native_identity.is_none_or(|id| hex(id, 64)),
+        "Native identity must be a SHA256"
+    );
     let settings_key = settings_signature(settings, &[]);
-    score_inputs_hash(
+    let key = score_hash(
         root,
         &[ScoreTarget {
             group: "ring".into(),
@@ -241,21 +307,26 @@ pub fn ring_composition_key(root: &Path, settings: &Settings) -> Result<String> 
             url: "local".into(),
         }],
         &BTreeMap::from([("Settings".into(), settings_key)]),
-    )
+        hashes,
+    )?;
+    Ok(match native_identity {
+        Some(identity) => {
+            sha256(format!("native-ring-composition-v1\n{key}\n{identity}").as_bytes())
+        }
+        None => key,
+    })
 }
 pub fn ring_composition_key_with_identity(
     root: &Path,
     settings: &Settings,
     native_identity: &str,
 ) -> Result<String> {
-    ensure!(hex(native_identity, 64), "Native identity must be a SHA256");
-    Ok(sha256(
-        format!(
-            "native-ring-composition-v1\n{}\n{native_identity}",
-            ring_composition_key(root, settings)?
-        )
-        .as_bytes(),
-    ))
+    ring_key(
+        root,
+        settings,
+        Some(native_identity),
+        &mut InputHashes::live(),
+    )
 }
 pub fn result_header(text: &str) -> Option<TestResultContext> {
     let headers: Vec<_> = text

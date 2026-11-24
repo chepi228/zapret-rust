@@ -57,12 +57,9 @@ strategies/alt10.txt
 strategies/alt11.txt
 strategies/alt12.txt
 strategies/alt13.txt
-strategies/alt21.txt
 strategies/alt23.txt
-strategies/alt3.txt
 strategies/alt31.txt
 strategies/alt32.txt
-strategies/alt4.txt
 strategies/alt40.txt
 strategies/alt41.txt
 strategies/alt42.txt
@@ -86,8 +83,9 @@ strategies/alt61.txt
 strategies/alt7.txt
 strategies/alt70.txt
 strategies/alt71.txt
+strategies/alt75.txt
+strategies/alt76.txt
 strategies/alt8.txt
-strategies/alt9.txt
 strategies/retired.txt
 licenses/THIRD-PARTY-NOTICES.md
 tools/dpi-suite.json

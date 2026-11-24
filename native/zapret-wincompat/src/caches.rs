@@ -7,7 +7,9 @@ use std::{
     ffi::{CStr, CString, c_char},
     hash::Hash,
     ops::Bound::{Excluded, Unbounded},
-    ptr, slice,
+    ptr,
+    rc::Rc,
+    slice,
     sync::atomic::{AtomicU64, Ordering},
 };
 
@@ -30,9 +32,13 @@ impl<K, V> Stored<K, V> {
     }
 }
 
+// Each cache belongs to one engine thread. Both indexes refer to the same
+// stable allocation; only ordered enumeration needs to search by id.
+type Record<K, V> = Rc<Stored<K, V>>;
+
 struct Store<K, V> {
-    names: HashMap<K, Vec<u64>>,
-    records: BTreeMap<u64, Box<Stored<K, V>>>,
+    names: HashMap<K, Vec<Record<K, V>>>,
+    records: BTreeMap<u64, Record<K, V>>,
     buckets: Option<BucketOrder>,
 }
 
@@ -125,19 +131,19 @@ impl<K: Eq + Hash + Clone + CacheKey, V> Store<K, V> {
         if self.names.try_reserve(1).is_err() {
             return ptr::null_mut();
         }
-        let ids = self.names.entry(key.clone()).or_default();
-        if ids.try_reserve(1).is_err() {
+        let matches = self.names.entry(key.clone()).or_default();
+        if matches.try_reserve(1).is_err() {
             return ptr::null_mut();
         }
         let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
         let legacy_hash = key.legacy_hash();
-        let record = Box::new(Stored {
+        let record = Rc::new(Stored {
             data: UnsafeCell::new(data),
             id,
             key,
         });
         let result = record.data_ptr();
-        ids.push(id);
+        matches.push(Rc::clone(&record));
         self.records.insert(id, record);
         if let Some(hash) = legacy_hash {
             let mut buckets = self.buckets.take().unwrap_or_default();
@@ -150,8 +156,8 @@ impl<K: Eq + Hash + Clone + CacheKey, V> Store<K, V> {
                 );
                 // Pinned uthash reverses bucket chains on expansion. Entries
                 // with the same string reverse relative order as well.
-                for ids in self.names.values_mut() {
-                    ids.reverse();
+                for matches in self.names.values_mut() {
+                    matches.reverse();
                 }
             }
             self.buckets = Some(buckets);
@@ -165,13 +171,24 @@ impl<K: Eq + Hash + Clone + CacheKey, V> Store<K, V> {
     {
         self.names
             .get(key)
-            .and_then(|ids| ids.last())
-            .and_then(|id| self.records.get(id))
+            .and_then(|matches| matches.last())
             .map_or(ptr::null_mut(), |record| record.data_ptr())
     }
 
-    fn after(&self, cursor: &mut u64) -> Option<&Stored<K, V>> {
-        let (&id, record) = self.records.range((Excluded(*cursor), Unbounded)).next()?;
+    fn after(
+        &self,
+        cursor: &mut u64,
+        mut include: impl FnMut(&V) -> bool,
+    ) -> Option<&Stored<K, V>> {
+        // Scan in insertion order. The caller can free or remove the returned
+        // record after this call, so only the numeric cursor crosses the ABI.
+        let (&id, record) =
+            self.records
+                .range((Excluded(*cursor), Unbounded))
+                .find(|(_, record)| {
+                    // The engine thread only mutates the C payload between calls.
+                    include(unsafe { &*record.data.get() })
+                })?;
         *cursor = id;
         Some(record)
     }
@@ -186,10 +203,12 @@ impl<K: Eq + Hash + Clone + CacheKey, V> Store<K, V> {
                     buckets.remove(hash);
                 }
             }
-            if let Some(ids) = self.names.get_mut(&record.key) {
-                ids.retain(|&value| value != id);
-                if ids.is_empty() {
-                    self.names.remove(&record.key);
+            // The usual key has one record. Remove its name with a single
+            // lookup; only duplicate host failures need a bucket put back.
+            if let Some((key, mut matches)) = self.names.remove_entry(&record.key) {
+                matches.retain(|entry| !Rc::ptr_eq(entry, &record));
+                if !matches.is_empty() {
+                    self.names.insert(key, matches);
                 }
             }
         }
@@ -232,6 +251,11 @@ pub(super) struct Failure {
     pub(super) counter: i32,
     expires: i64,
 }
+impl Failure {
+    fn expired(&self, now: i64) -> bool {
+        now >= self.expires
+    }
+}
 type Failures = Store<CString, Failure>;
 
 // Private ABI: roots belong to the engine thread; all names are terminated.
@@ -269,7 +293,18 @@ unsafe extern "C" fn zapret_hostfail_after(
     cursor: *mut u64,
 ) -> *mut Failure {
     unsafe { store.as_ref() }
-        .and_then(|store| store.after(unsafe { &mut *cursor }))
+        .and_then(|store| store.after(unsafe { &mut *cursor }, |_| true))
+        .map_or(ptr::null_mut(), |record| record.data_ptr())
+}
+
+#[unsafe(no_mangle)]
+unsafe extern "C" fn zapret_hostfail_next_expired(
+    store: *const Failures,
+    cursor: *mut u64,
+    now: i64,
+) -> *mut Failure {
+    unsafe { store.as_ref() }
+        .and_then(|store| store.after(unsafe { &mut *cursor }, |entry| entry.expired(now)))
         .map_or(ptr::null_mut(), |record| record.data_ptr())
 }
 
@@ -294,7 +329,7 @@ pub(super) unsafe extern "C" fn zapret_hostfail_increment(data: *mut Failure) {
 
 #[unsafe(no_mangle)]
 unsafe extern "C" fn zapret_hostfail_expired(data: *const Failure, now: i64) -> i32 {
-    i32::from(now >= unsafe { (*data).expires })
+    i32::from(unsafe { (*data).expired(now) })
 }
 
 #[derive(Clone, Eq, Hash, PartialEq)]
@@ -325,6 +360,11 @@ pub(super) struct IpItem {
     pub(super) hostname: *mut c_char,
     pub(super) hostname_is_ip: u8,
     pub(super) ttl: u8,
+}
+impl IpItem {
+    fn expired(&self, lifetime: i64, now: i64) -> bool {
+        lifetime != 0 && now >= self.last.wrapping_add(lifetime)
+    }
 }
 type IpCache = Store<IpKey, IpItem>;
 
@@ -387,8 +427,8 @@ unsafe extern "C" fn zapret_ipcache_after(
     address: *mut u8,
     iface: *mut u8,
 ) -> *mut IpItem {
-    let Some(record) =
-        (unsafe { store.as_ref() }).and_then(|store| store.after(unsafe { &mut *cursor }))
+    let Some(record) = (unsafe { store.as_ref() })
+        .and_then(|store| store.after(unsafe { &mut *cursor }, |_| true))
     else {
         return ptr::null_mut();
     };
@@ -401,6 +441,22 @@ unsafe extern "C" fn zapret_ipcache_after(
     record.data_ptr()
 }
 
+#[unsafe(no_mangle)]
+unsafe extern "C" fn zapret_ipcache_next_expired(
+    store: *const IpCache,
+    cursor: *mut u64,
+    lifetime: i64,
+    now: i64,
+) -> *mut IpItem {
+    unsafe { store.as_ref() }
+        .and_then(|store| {
+            store.after(unsafe { &mut *cursor }, |entry| {
+                entry.expired(lifetime, now)
+            })
+        })
+        .map_or(ptr::null_mut(), |record| record.data_ptr())
+}
+
 // C frees the optional hostname with the allocator that created it, then calls
 // remove. No Rust callback or borrow spans that C allocation boundary.
 #[unsafe(no_mangle)]
@@ -410,7 +466,7 @@ unsafe extern "C" fn zapret_ipcache_remove(slot: *mut *mut IpCache, data: *const
 
 #[unsafe(no_mangle)]
 unsafe extern "C" fn zapret_ipcache_expired(data: *const IpItem, lifetime: i64, now: i64) -> i32 {
-    i32::from(lifetime != 0 && now >= unsafe { (*data).last }.wrapping_add(lifetime))
+    i32::from(unsafe { (*data).expired(lifetime, now) })
 }
 
 #[unsafe(no_mangle)]
@@ -482,6 +538,64 @@ mod tests {
             assert_eq!((*first).expires, 97);
             zapret_hostfail_destroy(&mut root);
             assert!(root.is_null());
+        }
+    }
+
+    #[test]
+    fn expiry_cursor_skips_live_duplicates_and_survives_deleting_its_last_match() {
+        let mut pool = ptr::null_mut();
+        let mut cursor = 0;
+        unsafe {
+            let live = zapret_hostfail_add(&mut pool, c"same".as_ptr(), 20, 100);
+            let due = zapret_hostfail_add(&mut pool, c"same".as_ptr(), 10, 100);
+            let later = zapret_hostfail_add(&mut pool, c"later".as_ptr(), 30, 100);
+            let last = zapret_hostfail_add(&mut pool, c"last".as_ptr(), -1, 100);
+            assert_eq!(zapret_hostfail_next_expired(pool, &mut cursor, 110), due);
+            zapret_hostfail_remove(&mut pool, due);
+            assert_eq!(zapret_hostfail_find(pool, c"same".as_ptr()), live);
+            assert_eq!(zapret_hostfail_next_expired(pool, &mut cursor, 110), last);
+            zapret_hostfail_remove(&mut pool, last);
+            assert!(zapret_hostfail_next_expired(pool, &mut cursor, 110).is_null());
+            cursor = 0;
+            assert_eq!(zapret_hostfail_after(pool, &mut cursor), live);
+            assert_eq!(zapret_hostfail_after(pool, &mut cursor), later);
+            zapret_hostfail_destroy(&mut pool);
+        }
+    }
+
+    #[test]
+    fn ip_expiry_reads_the_latest_touch_and_handles_disabled_expiry() {
+        let mut pool = ptr::null_mut();
+        let mut cursor = 0;
+        unsafe {
+            let mut entries = Vec::new();
+            for host in 1..=4 {
+                let address = [192, 0, 2, host];
+                entries.push(zapret_ipcache_add(
+                    &mut pool,
+                    address.as_ptr(),
+                    4,
+                    ptr::null(),
+                    50,
+                ));
+            }
+            zapret_ipcache_touch(entries[0], 60);
+            assert!(zapret_ipcache_next_expired(pool, &mut cursor, 0, 60).is_null());
+            assert_eq!(
+                zapret_ipcache_next_expired(pool, &mut cursor, 10, 60),
+                entries[1]
+            );
+            zapret_ipcache_remove(&mut pool, entries[1]);
+            zapret_ipcache_touch(entries[2], 59);
+            assert_eq!(
+                zapret_ipcache_next_expired(pool, &mut cursor, 10, 60),
+                entries[3]
+            );
+            zapret_ipcache_remove(&mut pool, entries[3]);
+            assert!(zapret_ipcache_next_expired(pool, &mut cursor, 10, 60).is_null());
+            zapret_ipcache_remove(&mut pool, entries[0]);
+            zapret_ipcache_remove(&mut pool, entries[2]);
+            assert!(pool.is_null());
         }
     }
 

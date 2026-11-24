@@ -9,7 +9,7 @@ if ([IO.Path]::GetDirectoryName($stage) -ne [IO.Path]::GetFullPath($env:TEMP).Tr
 $pkg = Join-Path $stage 'pkg'
 # The legacy tests need the launcher and its current controller for filtertest.
 # Old native images, the worker and the recovery copy are not legacy engine inputs.
-& robocopy.exe $root $pkg /E /XJ /XD .git dist runtime rust-ring-next /XF zapret.exe zapret-worker.exe zapret-recovery.exe zapret-rust-worker.exe zapret-rust-recovery.exe /R:1 /W:1 /NFL /NDL /NJH /NJS /NP | Out-Null
+& robocopy.exe $root $pkg /E /XJ /XD .git dist runtime rust-ring-next /XF .git zapret.exe zapret-worker.exe zapret-recovery.exe zapret-rust-worker.exe zapret-rust-recovery.exe /R:1 /W:1 /NFL /NDL /NJH /NJS /NP | Out-Null
 if ($LASTEXITCODE -lt 0 -or $LASTEXITCODE -ge 8) { throw ('robocopy: ошибка ' + $LASTEXITCODE) }
 if ($NativeRelease) {
     $sourceImage = Join-Path $NativeRelease 'zapret.exe'

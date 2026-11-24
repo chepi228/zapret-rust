@@ -4,7 +4,7 @@
 [quic]
 --out-range=-n10
 --payload=quic_initial
---lua-desync=fake:blob=quic_google:repeats=11
+--lua-desync=fake:blob=quic_google:repeats=4
 [discord_udp]
 --out-range=a
 --payload=discord_ip_discovery,stun

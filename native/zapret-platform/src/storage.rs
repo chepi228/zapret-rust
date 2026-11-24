@@ -67,8 +67,20 @@ pub(crate) fn read_shared_limited(path: &Path, budget: u64) -> Result<Vec<u8>> {
     read_limited_with_share(path, budget, FILE_SHARE_READ | FILE_SHARE_WRITE)
 }
 fn read_limited_with_share(path: &Path, budget: u64, share: u32) -> Result<Vec<u8>> {
+    let mut f = open_limited(path, budget, share)?;
+    let mut bytes = Vec::new();
+    Read::by_ref(&mut f)
+        .take(budget.saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    ensure!(
+        bytes.len() as u64 <= budget,
+        "File grew beyond its size budget"
+    );
+    Ok(bytes)
+}
+fn open_limited(path: &Path, budget: u64, share: u32) -> Result<File> {
     no_reparse(path)?;
-    let mut f = OpenOptions::new()
+    let f = OpenOptions::new()
         .read(true)
         .share_mode(share)
         .open(path)
@@ -78,22 +90,19 @@ fn read_limited_with_share(path: &Path, budget: u64, share: u32) -> Result<Vec<u
         "File exceeds size budget: {}",
         path.display()
     );
-    let mut bytes = Vec::new();
-    Read::by_ref(&mut f)
-        .take(budget + 1)
-        .read_to_end(&mut bytes)?;
-    ensure!(
-        bytes.len() as u64 <= budget,
-        "File grew beyond its size budget"
-    );
-    Ok(bytes)
+    Ok(f)
 }
 pub(crate) fn hash(bytes: &[u8]) -> String {
     format!("{:X}", Sha256::digest(bytes))
 }
 pub(crate) fn file_hash(path: &Path) -> Result<String> {
-    let bytes = read_limited(path, 64 * 1024 * 1024)?;
-    Ok(hash(&bytes))
+    hash_handle(&mut open_limited(path, HASH_LIMIT, FILE_SHARE_READ)?).map(|(digest, _)| digest)
+}
+const HASH_LIMIT: u64 = 64 * 1024 * 1024;
+fn hash_handle(file: &mut File) -> Result<(String, u64)> {
+    let result = zapret_core::sha256_reader(file.take(HASH_LIMIT + 1))?;
+    ensure!(result.1 <= HASH_LIMIT, "File grew beyond its size budget");
+    Ok(result)
 }
 pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     no_reparse(path)?;
@@ -153,18 +162,44 @@ impl Pins {
         Ok(())
     }
     pub fn file(&mut self, path: &Path) -> Result<Vec<u8>> {
-        no_reparse(path)?;
-        let mut f = OpenOptions::new()
-            .read(true)
-            .share_mode(FILE_SHARE_READ)
-            .open(path)?;
-        ensure!(
-            f.metadata()?.len() <= 64 * 1024 * 1024,
-            "Pinned file exceeds size budget"
-        );
+        let mut f = open_limited(path, HASH_LIMIT, FILE_SHARE_READ)?;
         let mut bytes = Vec::new();
-        f.read_to_end(&mut bytes)?;
+        Read::by_ref(&mut f)
+            .take(HASH_LIMIT + 1)
+            .read_to_end(&mut bytes)?;
+        ensure!(
+            bytes.len() as u64 <= HASH_LIMIT,
+            "File grew beyond its size budget"
+        );
         self.files.push(f);
         Ok(bytes)
     }
+    pub fn file_hash(&mut self, path: &Path) -> Result<(String, u64)> {
+        let mut file = open_limited(path, HASH_LIMIT, FILE_SHARE_READ)?;
+        let result = hash_handle(&mut file)?;
+        self.files.push(file);
+        Ok(result)
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn streaming_digest_keeps_the_file_pinned_and_honors_the_existing_size_limit() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("input.bin");
+    for bytes in [Vec::new(), (0..131_073).map(|i| (i % 251) as u8).collect()] {
+        std::fs::write(&path, &bytes).unwrap();
+        let mut pins = Pins::new();
+        assert_eq!(
+            pins.file_hash(&path).unwrap(),
+            (hash(&bytes), bytes.len() as u64)
+        );
+        assert!(OpenOptions::new().write(true).open(&path).is_err());
+        assert!(std::fs::rename(&path, temp.path().join("renamed.bin")).is_err());
+    }
+    File::create(&path)
+        .unwrap()
+        .set_len(HASH_LIMIT + 1)
+        .unwrap();
+    assert!(Pins::new().file_hash(&path).is_err());
 }

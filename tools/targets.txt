@@ -44,6 +44,7 @@ Clean.steamapi    = https://api.steampowered.com/ISteamWebAPIUtil/GetServerInfo/
 # H3 проверяет HEAD через QUIC с проверкой сертификата и согласованием HTTP/3.
 Discord.gateway_json GET 200 10..512       = https://discord.com/api/v10/gateway
 Discord.avatar       GET 200 256..32768    = https://cdn.discordapp.com/embed/avatars/0.png
+Discord.media_file   GET 200 229034 8dbecf7b6d7da8a9c761ad89a73066838d89f3cda4a1313976c9533ac88a3fb3 = https://media.discordapp.net/stickers/781291442961383434.png
 YouTube.thumbnail    GET 200 4096..65536   = https://i.ytimg.com/vi/jNQXAC9IVRw/hqdefault.jpg
 YouTube.connectivity GET 204 0             = https://connectivitycheck.gstatic.com/generate_204
 SoundCloud.oembed    GET 200 128..16384    = https://soundcloud.com/oembed?format=json&url=https%3A%2F%2Fsoundcloud.com%2Fforss%2Fflickermood

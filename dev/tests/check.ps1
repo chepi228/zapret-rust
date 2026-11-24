@@ -21,7 +21,7 @@ Update-RuntimeLists
 $base = Get-Settings
 foreach ($st in Get-Strategies) { if ($st.Missing.Count) { "FAIL $($st.Name): нет секций $($st.Missing -join ',')"; $fails++ } }
 $cases = @()
-foreach ($alt in @('10', '11', '12', '13', '21', '23', '31', '32')) { foreach ($auto in @('on', 'off')) { $cases += @{ alt = $alt; auto = $auto } } }
+foreach ($alt in @('10', '11', '12', '13', '23', '31', '32', '75')) { foreach ($auto in @('on', 'off')) { $cases += @{ alt = $alt; auto = $auto } } }
 foreach ($game in @('tcp', 'udp', 'off')) { $cases += @{ game = $game } }
 foreach ($ip in @('any', 'none')) { $cases += @{ ipset = $ip } }
 $cases += @{ autolist = 'off' }

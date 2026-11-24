@@ -48,9 +48,9 @@ impl Compiler {
             "Core manifest changed before compiler lease"
         );
         let path = root.join("bin/WinDivert.dll");
-        let bytes = pins.file(&path)?;
+        let (digest, _) = pins.file_hash(&path)?;
         ensure!(
-            hash(&bytes).eq_ignore_ascii_case(&manifest.hashes["bin/WinDivert.dll"]),
+            digest.eq_ignore_ascii_case(&manifest.hashes["bin/WinDivert.dll"]),
             "Pinned WinDivert.dll integrity check failed"
         );
         let name = wide(&path)?;
@@ -95,9 +95,9 @@ impl Compiler {
             let path = root.join(name);
             self.pins
                 .directory(path.parent().context("Core input parent missing")?)?;
-            let bytes = self.pins.file(&path)?;
+            let (digest, _) = self.pins.file_hash(&path)?;
             ensure!(
-                hash(&bytes).eq_ignore_ascii_case(&self.manifest.hashes[name]),
+                digest.eq_ignore_ascii_case(&self.manifest.hashes[name]),
                 "Pinned engine input differs from its manifest: {name}"
             );
         }

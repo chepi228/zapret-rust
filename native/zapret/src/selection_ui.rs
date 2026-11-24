@@ -157,6 +157,18 @@ fn name(report: &Value, id: &str) -> String {
         .unwrap_or_else(|| format!("Стратегия {id}"))
 }
 
+fn family_of<'a>(report: &'a Value, id: &str) -> Option<&'a str> {
+    report["strategy_families"]
+        .as_object()?
+        .iter()
+        .find_map(|(family, ids)| {
+            ids.as_array()?
+                .iter()
+                .any(|value| value == id)
+                .then_some(family.as_str())
+        })
+}
+
 fn speed_reason(report: &Value) -> Option<String> {
     let selection = &report["connection_selection"];
     if selection["confirmed"] != true {
@@ -164,6 +176,14 @@ fn speed_reason(report: &Value) -> Option<String> {
     }
     let working = &selection["working"];
     let ms = working["gain_ms"].as_f64()?;
+    if working["scope"] == crate::selection_latency::SERVICE_SCOPE {
+        let repeat = selection["repeat"]["gain_ms"].as_f64()?;
+        return Some(format!(
+            " Запросы к сервисам быстрее на {} и {} мс в двух проверках.",
+            points(ms),
+            points(repeat)
+        ));
+    }
     if working["scope"] == "AllTargets" {
         return Some(format!(
             " При близком балле полный запрос быстрее на ~{ms:.0} мс (адресов: {}).",
@@ -182,9 +202,20 @@ fn speed_reason(report: &Value) -> Option<String> {
 }
 
 fn full_request_policy(report: &Value) -> bool {
+    service_policy(report)
+        || matches!(
+            report["selection_policy"].as_str(),
+            Some(
+                "availability-then-full-request-latency-v2"
+                    | crate::selection_latency::PREVIOUS_POLICY
+            )
+        )
+}
+
+fn service_policy(report: &Value) -> bool {
     matches!(
         report["selection_policy"].as_str(),
-        Some("availability-then-full-request-latency-v2" | crate::selection_latency::POLICY)
+        Some("service-availability-then-paired-latency-v4" | crate::selection_latency::POLICY)
     )
 }
 
@@ -209,7 +240,10 @@ fn connection_timing(report: &Value, id: &str) -> Option<(f64, f64)> {
             None
         };
         if let Some(prefix) = prefix {
-            let working = &preference["working"];
+            let working = preference
+                .get("repeat")
+                .filter(|c| c.is_object())
+                .unwrap_or(&preference["working"]);
             if let Some(pair) = working[format!("{prefix}_tcp_ms")]
                 .as_f64()
                 .zip(working[format!("{prefix}_tls_ms")].as_f64())
@@ -234,7 +268,12 @@ fn connection_timing(report: &Value, id: &str) -> Option<(f64, f64)> {
 
 fn request_timing(report: &Value, id: &str) -> Option<(f64, f64, &'static str)> {
     let preference = &report["connection_selection"];
-    if preference["confirmed"] == true && preference["working"]["scope"] == "AllTargets" {
+    if preference["confirmed"] == true
+        && matches!(
+            preference["working"]["scope"].as_str(),
+            Some("AllTargets" | crate::selection_latency::SERVICE_SCOPE)
+        )
+    {
         let prefix = if preference["reference"] == id {
             Some("reference")
         } else if preference["candidate"] == id {
@@ -243,7 +282,10 @@ fn request_timing(report: &Value, id: &str) -> Option<(f64, f64, &'static str)> 
             None
         };
         if let Some(prefix) = prefix {
-            let working = &preference["working"];
+            let working = preference
+                .get("repeat")
+                .filter(|c| c.is_object())
+                .unwrap_or(&preference["working"]);
             if let Some(pair) = working[format!("{prefix}_total_ms")]
                 .as_f64()
                 .zip(working[format!("{prefix}_p95_ms")].as_f64())
@@ -290,7 +332,11 @@ fn final_targets(report: &Value, error: &str) -> String {
         .as_array()
         .into_iter()
         .flatten()
-        .filter(|row| row["state"] == "OK" && (row["group"] != "DPI" || row["flaky"] != true))
+        .filter(|row| {
+            !service_policy(report)
+                && row["state"] == "OK"
+                && (row["group"] != "DPI" || row["flaky"] != true)
+        })
     {
         let Some((group, name, _)) = key(row).filter(|target| failed.contains(target)) else {
             continue;
@@ -376,6 +422,12 @@ fn compact_result(
         ("НЕ ПРИМЕНЕНО", Tone::Bad)
     };
     frame.row(&format!(" {status}: {}", name(report, primary)), tone);
+    if let Some(family) = family_of(report, primary) {
+        frame.row(
+            &format!(" Семейство текущей стратегии — {family}."),
+            Tone::Secondary,
+        );
+    }
     if restored {
         frame.row(
             " Новый обход не запустился. Восстановлен прежний.",
@@ -527,7 +579,11 @@ fn compact_result(
     }
     if full_request_policy(report) {
         frame.row(
-            " Задержка по всем группам; всего = DNS → ответ и данные.",
+            if service_policy(report) {
+                " Выбор по доступности сервисов и задержке на общих адресах."
+            } else {
+                " Задержка по всем группам; всего = DNS → ответ и данные."
+            },
             Tone::Secondary,
         );
         if let Some((_, p95, stage)) = request_timing(report, best) {
@@ -652,7 +708,11 @@ fn ranking_frame(
         }),
         Tone::Secondary,
     );
-    for row in rows.iter().take(shown) {
+    let mut display: Vec<_> = rows.iter().collect();
+    if service_policy(report) {
+        display.sort_by_key(|r| r["id"].as_str() != Some(best));
+    }
+    for row in display.into_iter().take(shown) {
         let id = row["id"].as_str().unwrap_or("");
         let unconfirmed = report["strategy_quality"][id] == false;
         let failed_final = report["final_checks"][id]["confirmed"] == false;
@@ -699,7 +759,11 @@ fn ranking_frame(
         );
     }
     frame.row(
-        " Выше оценка — лучше результат с учётом повторов и замедлений.",
+        if service_policy(report) {
+            " Приоритет у стабильных сервисов и подтверждённой низкой задержки."
+        } else {
+            " Выше оценка — лучше результат с учётом повторов и замедлений."
+        },
         Tone::Text,
     );
     frame.row(
@@ -925,10 +989,40 @@ pub fn result_text(report: &Value) -> Option<String> {
         },
     )
     .map(Frame::plain)?;
+    if let Some(families) = report["strategy_families"].as_object() {
+        text.push_str("\r\n\r\nСемейства установленных стратегий\r\n");
+        for (family, ids) in families {
+            let names: Vec<_> = ids
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .map(|id| format!("ALT{id}"))
+                .collect();
+            text.push_str(&format!("{family} — {}\r\n", names.join(", ")));
+        }
+        if let Some(followups) = report["family_selection"]["followups"]
+            .as_array()
+            .filter(|ids| !ids.is_empty())
+        {
+            let names: Vec<_> = followups
+                .iter()
+                .filter_map(Value::as_str)
+                .map(|id| name(report, id))
+                .collect();
+            text.push_str(&format!(
+                "После сравнения представителей в первую очередь проверялись {}.\r\n",
+                names.join(", ")
+            ));
+        }
+    }
     if report["timings"].is_object() {
         text.push_str("\r\n\r\nСводка по стратегиям\r\n");
         if full_request_policy(report) {
             text.push_str("Время запроса включает DNS, подключение и чтение до конца ответа или лимита адреса. Медиана и P95 учитывают стабильные успешные запросы всех групп. Для HTTP/3 измеряется рукопожатие QUIC через UDP.\r\n");
+        }
+        if service_policy(report) {
+            text.push_str("При выборе по задержке сравниваются стабильные ответы сервисов, включая три адреса Steam. Подтверждение требует двух парных сравнений в рабочем режиме при смене порядка профилей. Балл покрытия включает также цели DPI.\r\n");
         }
         for row in report["rows"].as_array().into_iter().flatten() {
             let id = row["id"].as_str().unwrap_or("");
@@ -1384,6 +1478,26 @@ mod tests {
         .plain();
         assert!(prompt.contains("y") && prompt.contains("n"));
         assert!(!prompt.contains("yes") && !prompt.contains("no") && !prompt.contains("[д/Н]"));
+    }
+
+    #[test]
+    fn service_reports_show_both_working_measurements_and_keep_v3_reports_readable() {
+        let mut data = report();
+        data["selection_policy"] = json!(crate::selection_latency::PREVIOUS_POLICY);
+        assert!(full_request_policy(&data));
+        data["selection_policy"] = json!("service-availability-then-paired-latency-v4");
+        assert!(service_policy(&data) && full_request_policy(&data));
+        data["selection_policy"] = json!(crate::selection_latency::POLICY);
+        data["connection_selection"] = json!({"confirmed": true, "reference":"50","candidate":"70",
+            "working":{"scope":"ServiceTargets","gain_ms":4.5,"candidate_total_ms":120.,"candidate_p95_ms":333.},
+            "repeat":{"scope":"ServiceTargets","gain_ms":3.5,"candidate_total_ms":125.,"candidate_p95_ms":350.}});
+        assert!(speed_reason(&data).unwrap().contains("4,5 и 3,5 мс"));
+        assert_eq!(
+            request_timing(&data, "70"),
+            Some((125., 350., "В рабочем режиме"))
+        );
+        data["connection_selection"]["confirmed"] = json!(false);
+        assert!(speed_reason(&data).is_none());
     }
 
     #[test]

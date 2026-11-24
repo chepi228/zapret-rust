@@ -36,13 +36,16 @@ def voice_actions(lines):
     return actions
 
 
+retired = (root / 'strategies/retired.txt').read_text('utf-8-sig').splitlines()
 for parent_id, ids in [
     (11, [31, 50, 51, 52, 54, 55, 56, 57, 58, 59, 60, 61, 70, 71]),
     (12, [21, 23, 32]),
 ]:
     original = converter.read_ours(root / f'strategies/alt{parent_id}.txt')['discord_udp']
     for sid in ids:
-        compact = converter.read_ours(root / f'strategies/alt{sid}.txt')['discord_udp']
+        filename = f'alt{sid}.txt'
+        directory = 'dev/experimental' if filename in retired else 'strategies'
+        compact = converter.read_ours(root / directory / filename)['discord_udp']
         assert voice_actions(compact) == voice_actions(original), sid
         original_rules = sum(line.startswith('--lua-desync=') for line in original)
         assert sum(line.startswith('--lua-desync=') for line in compact) == original_rules - 1, sid

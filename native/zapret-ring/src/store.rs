@@ -1,6 +1,12 @@
 use crate::store_bounds::{MAX_BYTES, MAX_RECORDS, MIN_BYTES, TTL};
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::{
+    collections::HashMap,
+    fmt::Write,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+};
 static NEXT_SERIAL: AtomicU64 = AtomicU64::new(1);
 pub const SAVE_DELAY: f64 = 5.;
 pub const RETRY_DELAY: f64 = 30.;
@@ -8,7 +14,7 @@ const HEADER: &str = "# ring-store-v2\n";
 
 #[derive(Clone, Debug)]
 struct Record {
-    key: String,
+    key: Arc<str>,
     n: u32,
     confirmed: u64,
     used: u64,
@@ -39,7 +45,7 @@ impl Limits {
 }
 
 pub struct Store {
-    index: HashMap<String, usize>,
+    index: HashMap<Arc<str>, usize>,
     records: Vec<Option<Record>>,
     free: Vec<usize>,
     head: Option<usize>,
@@ -60,8 +66,8 @@ impl Store {
             return None;
         }
         Some(Self {
-            index: HashMap::with_capacity(limits.records),
-            records: Vec::with_capacity(limits.records),
+            index: HashMap::new(),
+            records: Vec::new(),
             free: Vec::new(),
             head: None,
             tail: None,
@@ -104,6 +110,26 @@ impl Store {
         self.index.remove(&record.key);
         self.free.push(index);
     }
+    fn insert(&mut self, record: Record) {
+        let (previous, next) = (record.previous, record.next);
+        let index = self.free.pop().unwrap_or(self.records.len());
+        self.index.insert(record.key.clone(), index);
+        if index == self.records.len() {
+            self.records.push(Some(record));
+        } else {
+            self.records[index] = Some(record);
+        }
+        if let Some(p) = previous {
+            self.records[p].as_mut().expect("previous LRU record").next = Some(index);
+        } else {
+            self.head = Some(index);
+        }
+        if let Some(n) = next {
+            self.records[n].as_mut().expect("next LRU record").previous = Some(index);
+        } else {
+            self.tail = Some(index);
+        }
+    }
     fn touch(&mut self, index: usize, now: u64) {
         if self.head != Some(index) {
             self.unlink(index);
@@ -141,9 +167,7 @@ impl Store {
         Some(self.records[index].as_ref()?.n)
     }
     pub fn put(&mut self, key: &str, n: Option<u32>, now: u64, mono: f64) -> bool {
-        if key.is_empty()
-            || key.len() > 255
-            || key.bytes().any(|b| b.is_ascii_whitespace())
+        if !valid_key(key)
             || !mono.is_finite()
             || (!self.legacy && n.is_some_and(|n| !(2..=128).contains(&n)))
         {
@@ -182,28 +206,14 @@ impl Store {
                 self.remove(tail)
             }
         }
-        let index = if let Some(index) = self.free.pop() {
-            index
-        } else {
-            self.records.push(None);
-            self.records.len() - 1
-        };
-        let owned = key.to_owned();
-        self.records[index] = Some(Record {
-            key: owned.clone(),
+        self.insert(Record {
+            key: Arc::from(key),
             n,
             confirmed: now,
             used: now,
             previous: None,
             next: self.head,
         });
-        self.index.insert(owned, index);
-        if let Some(head) = self.head {
-            self.records[head].as_mut().expect("LRU head").previous = Some(index)
-        } else {
-            self.tail = Some(index)
-        }
-        self.head = Some(index);
         self.mark_dirty(mono);
         true
     }
@@ -230,28 +240,34 @@ impl Store {
         }
     }
     pub fn snapshot(&mut self, now: u64) -> Vec<u8> {
-        let mut current = self.tail;
-        while let Some(index) = current {
-            current = self.records[index].as_ref().expect("LRU record").previous;
-            if self.expired(index, now) {
-                self.remove(index)
+        if !self.legacy {
+            let mut current = self.tail;
+            while let Some(index) = current {
+                current = self.records[index].as_ref().expect("LRU record").previous;
+                if self.expired(index, now) {
+                    self.remove(index);
+                }
             }
         }
         let mut result = Vec::with_capacity(self.limits.bytes.min(self.len() * 64 + HEADER.len()));
         if !self.legacy {
             result.extend_from_slice(HEADER.as_bytes());
         }
+        let mut line = String::new();
         let mut current = self.head;
         while let Some(index) = current {
             let record = self.records[index].as_ref().expect("LRU record");
-            let line = if self.legacy {
-                format!("{} {}\n", record.key, record.n)
+            line.clear();
+            if self.legacy {
+                writeln!(line, "{} {}", record.key, record.n)
             } else {
-                format!(
-                    "{} {} {} {}\n",
+                writeln!(
+                    line,
+                    "{} {} {} {}",
                     record.key, record.n, record.confirmed, record.used
                 )
-            };
+            }
+            .expect("formatting into a String");
             if result.len() + line.len() <= self.limits.bytes {
                 result.extend_from_slice(line.as_bytes());
             }
@@ -269,15 +285,16 @@ impl Store {
                 return;
             }
             for line in text.lines() {
-                let parts = line.split_whitespace().collect::<Vec<_>>();
                 if self.len() >= self.limits.records {
                     break;
                 }
-                if parts.len() != 2 {
+                let mut fields = line.split_whitespace();
+                let (Some(key), Some(number), None) = (fields.next(), fields.next(), fields.next())
+                else {
                     continue;
-                }
-                if let Ok(n) = parts[1].parse::<u32>() {
-                    self.put(parts[0], Some(n), now, 0.);
+                };
+                if let Ok(n) = number.parse::<u32>() {
+                    self.put(key, Some(n), now, 0.);
                 }
             }
             self.dirty = false;
@@ -291,24 +308,25 @@ impl Store {
             .split(['\r', '\n'])
             .filter(|line| !line.is_empty())
         {
-            let parts = line.split(' ').collect::<Vec<_>>();
-            if parts.len() != 4
-                || parts[0].is_empty()
-                || parts[0].len() > 255
-                || parts[0].bytes().any(|b| b.is_ascii_whitespace())
-            {
+            let mut fields = line.split(' ');
+            let (Some(key), Some(number), Some(confirmed), Some(used)) =
+                (fields.next(), fields.next(), fields.next(), fields.next())
+            else {
                 continue;
-            }
-            if !parts[1..]
-                .iter()
-                .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+            };
+            // Unsigned parsing permits a leading '+'. The on-disk format requires digits.
+            if fields.next().is_some()
+                || !valid_key(key)
+                || ![number, confirmed, used]
+                    .iter()
+                    .all(|field| field.as_bytes().first().is_some_and(u8::is_ascii_digit))
             {
                 continue;
             }
             let (Ok(n), Ok(confirmed), Ok(used)) = (
-                parts[1].parse::<u32>(),
-                parts[2].parse::<u64>(),
-                parts[3].parse::<u64>(),
+                number.parse::<u32>(),
+                confirmed.parse::<u64>(),
+                used.parse::<u64>(),
             ) else {
                 continue;
             };
@@ -318,37 +336,83 @@ impl Store {
                 || used > now
                 || confirmed > now
                 || now - confirmed >= self.limits.ttl
-                || self.index.contains_key(parts[0])
+                || self.index.contains_key(key)
             {
                 continue;
             }
             if self.len() >= self.limits.records {
                 break;
             }
-            let index = self.records.len();
-            let key = parts[0].to_owned();
-            self.records.push(Some(Record {
-                key: key.clone(),
+            self.insert(Record {
+                key: Arc::from(key),
                 n,
                 confirmed,
                 used,
                 previous: self.tail,
                 next: None,
-            }));
-            self.index.insert(key, index);
-            if let Some(tail) = self.tail {
-                self.records[tail].as_mut().expect("LRU tail").next = Some(index)
-            } else {
-                self.head = Some(index)
-            }
-            self.tail = Some(index);
+            });
         }
     }
+}
+
+fn valid_key(key: &str) -> bool {
+    !key.is_empty() && key.len() <= 255 && !key.bytes().any(|b| b.is_ascii_whitespace())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn loading_after_removal_reuses_slots_and_preserves_the_persisted_order() {
+        let mut store = Store::new(
+            Limits {
+                records: 3,
+                ..Limits::default()
+            },
+            true,
+        )
+        .unwrap();
+        store.put("a", Some(2), 100, 0.);
+        store.put("b", Some(3), 100, 0.);
+        store.put("c", Some(4), 100, 0.);
+        for _ in 0..20 {
+            store.put("b", None, 100, 0.);
+            store.load(
+                b"# ring-store-v2\nb +2 90 99\nb 2 +90 99\nb 2 90 99 extra\nb 2 90 9x\nb 2 90 99\n",
+                100,
+            );
+            assert_eq!(
+                store.snapshot(100),
+                b"# ring-store-v2\nc 4 100 100\na 2 100 100\nb 2 90 99\n"
+            );
+            assert_eq!(store.records.len(), 3);
+        }
+    }
+
+    #[test]
+    fn snapshots_skip_individual_oversized_lines_and_keep_later_records() {
+        for legacy in [false, true] {
+            let mut store = Store::new(
+                Limits {
+                    bytes: MIN_BYTES,
+                    ..Limits::default()
+                },
+                true,
+            )
+            .unwrap();
+            store.legacy = legacy;
+            store.put("old", Some(2), 123, 0.);
+            store.put(&"x".repeat(MIN_BYTES), Some(3), 123, 0.);
+            store.put("new", Some(4), 124, 0.);
+            let expected = if legacy {
+                "new 4\nold 2\n"
+            } else {
+                "# ring-store-v2\nnew 4 124 124\nold 2 123 123\n"
+            };
+            assert_eq!(store.snapshot(124), expected.as_bytes());
+        }
+    }
     #[test]
     fn ttl_lru_clock_reversal_bounds_and_deferred_retries() {
         let mut store = Store::new(

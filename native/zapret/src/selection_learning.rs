@@ -4,6 +4,9 @@ use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, path::Path};
 use zapret_core::{RankRow, Strategy};
 
+mod latency_history;
+pub(crate) use latency_history::{next_candidates, recent_candidates};
+
 pub const FILE: &str = "runtime/test-selection-cache.json";
 pub(crate) const QUICK_STRATEGY_LIMIT: usize = 18;
 const PRIORITY_SLOTS: usize = 6;
@@ -31,6 +34,8 @@ pub struct Plan {
     pub strategies: Vec<Strategy>,
     pub deferred: Vec<String>,
     pub queued: Vec<String>,
+    pub latency_candidates: Vec<String>,
+    pub lighter_candidate: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -137,17 +142,19 @@ impl Cache {
     pub fn plan(
         &self,
         pool: &[Strategy],
-        all: &[Strategy],
         primary: &str,
         full: bool,
         hashes: &BTreeMap<String, String>,
         now: i64,
+        recent: &[String],
     ) -> Plan {
         if full {
             return Plan {
                 strategies: pool.to_vec(),
                 deferred: Vec::new(),
                 queued: Vec::new(),
+                latency_candidates: Vec::new(),
+                lighter_candidate: None,
             };
         }
         let valid = |id: &str, entry: &Entry| {
@@ -169,7 +176,7 @@ impl Cache {
         let mut known: Vec<_> = self
             .entries
             .iter()
-            .filter(|(id, entry)| valid(id, entry))
+            .filter(|(id, entry)| valid(id, entry) && pool.iter().any(|s| s.id == id.as_str()))
             .collect();
         known.sort_by(|(_, a), (_, b)| {
             b.samples
@@ -178,20 +185,23 @@ impl Cache {
                 .score
                 .total_cmp(&a.samples.last().unwrap().score)
         });
-        let mut pool = pool.to_vec();
-        for (id, _) in known.iter().take(2) {
-            if !pool.iter().any(|strategy| strategy.id == **id) {
-                if let Some(strategy) = all.iter().find(|strategy| strategy.id == **id) {
-                    pool.push(strategy.clone());
+        let mut latency_candidates = Vec::new();
+        for id in recent {
+            if id != primary && !latency_candidates.contains(id) && pool.iter().any(|s| &s.id == id)
+            {
+                latency_candidates.push(id.clone());
+                if latency_candidates.len() == latency_history::SLOTS {
+                    break;
                 }
             }
         }
+        let mut pool = pool.to_vec();
         let Some((_, leader)) = known.first() else {
-            return self.bounded(pool, Vec::new(), primary, &known);
+            return Self::bounded(pool, Vec::new(), primary, &known, latency_candidates);
         };
         let best = leader.samples.last().unwrap();
         if best.ok / (best.total as f64) < 0.65 {
-            return self.bounded(pool, Vec::new(), primary, &known);
+            return Self::bounded(pool, Vec::new(), primary, &known, latency_candidates);
         }
         let mut deferred = Vec::new();
         pool.retain(|strategy| {
@@ -204,6 +214,7 @@ impl Cache {
             };
             let row = entry.samples.last().unwrap();
             if strategy.id == primary
+                || latency_candidates.contains(&strategy.id)
                 || self.generation.saturating_sub(entry.generation) >= 5
                 || row.total != best.total
             {
@@ -240,21 +251,28 @@ impl Cache {
                 true
             }
         });
-        self.bounded(pool, deferred, primary, &known)
+        Self::bounded(pool, deferred, primary, &known, latency_candidates)
     }
 
     fn bounded(
-        &self,
         pool: Vec<Strategy>,
         deferred: Vec<String>,
         primary: &str,
         known: &[(&String, &Entry)],
+        latency_candidates: Vec<String>,
     ) -> Plan {
+        let lighter_candidate = if latency_candidates.is_empty() {
+            lighter_relative(&pool, primary)
+        } else {
+            None
+        };
         if pool.len() <= QUICK_STRATEGY_LIMIT {
             return Plan {
                 strategies: pool,
                 deferred,
                 queued: Vec::new(),
+                latency_candidates,
+                lighter_candidate,
             };
         }
         let mut ids = Vec::<String>::new();
@@ -264,6 +282,9 @@ impl Cache {
             }
         };
         add(&mut ids, primary);
+        for id in latency_candidates.iter().chain(lighter_candidate.iter()) {
+            add(&mut ids, id);
+        }
         for (id, _) in known.iter().take(3) {
             add(&mut ids, id);
         }
@@ -307,15 +328,26 @@ impl Cache {
         }
         let families: BTreeMap<_, _> = pool
             .iter()
-            .map(|s| (&s.id, crate::selection::family(s)))
+            .map(|s| {
+                (
+                    &s.id,
+                    (
+                        crate::selection::families::method(s),
+                        crate::selection::families::signature(s),
+                    ),
+                )
+            })
             .collect();
         let generations: BTreeMap<_, _> = known
             .iter()
             .map(|(id, entry)| (id.as_str(), entry.generation.saturating_add(1)))
             .collect();
         let mut represented = BTreeMap::<&str, usize>::new();
+        let mut methods = std::collections::BTreeSet::new();
         for id in &ids {
-            *represented.entry(&families[id]).or_default() += 1;
+            let (method, signature) = &families[id];
+            methods.insert(method.as_str());
+            *represented.entry(signature).or_default() += 1;
         }
         // Visit unmeasured and older profiles first. Within that cohort spread the slots across
         // families, then prefer the profile differing in the most sections from its closest peer.
@@ -330,8 +362,9 @@ impl Cache {
                     .unwrap_or(0);
                 (
                     generations.get(strategy.id.as_str()).copied().unwrap_or(0),
+                    methods.contains(families[&strategy.id].0.as_str()),
                     represented
-                        .get(families[&strategy.id].as_str())
+                        .get(families[&strategy.id].1.as_str())
                         .copied()
                         .unwrap_or(0),
                     std::cmp::Reverse(distance),
@@ -340,7 +373,9 @@ impl Cache {
                 break;
             };
             let next = exploration.remove(index);
-            *represented.entry(&families[&next.id]).or_default() += 1;
+            let (method, signature) = &families[&next.id];
+            methods.insert(method.as_str());
+            *represented.entry(signature).or_default() += 1;
             ids.push(next.id.clone());
             selected.push(next);
         }
@@ -357,8 +392,42 @@ impl Cache {
             strategies,
             deferred,
             queued,
+            latency_candidates,
+            lighter_candidate,
         }
     }
+}
+
+// Only a scheduling hint for a cold start. Each alternative still needs real service measurements.
+fn lighter_relative(pool: &[Strategy], primary: &str) -> Option<String> {
+    fn general_work(strategy: &Strategy) -> Option<u64> {
+        let mut work = 0u64;
+        for action in strategy
+            .section("general", "general")
+            .iter()
+            .filter(|s| s.starts_with("--lua-desync="))
+        {
+            let repeats = action
+                .split(':')
+                .find_map(|part| part.strip_prefix("repeats="));
+            let count = match repeats {
+                Some(value) => value.parse::<u32>().ok()?,
+                None => 1,
+            };
+            work += u64::from(count);
+        }
+        (work > 0).then_some(work)
+    }
+    let active = pool.iter().find(|s| s.id == primary)?;
+    let active_work = general_work(active)?;
+    pool.iter()
+        .filter_map(|candidate| {
+            let work = general_work(candidate)?;
+            (work < active_work)
+                .then(|| ((section_distance(active, candidate), work), &candidate.id))
+        })
+        .min_by_key(|(key, _)| *key)
+        .map(|(_, id)| id.clone())
 }
 
 fn section_distance(a: &Strategy, b: &Strategy) -> usize {
@@ -378,6 +447,48 @@ mod tests {
     use super::*;
     const NOW: i64 = 2_000_000_000;
     #[test]
+    fn fresh_latency_candidates_get_two_existing_slots_and_the_cold_pick_stays_near_primary() {
+        let mut all: Vec<_> = (1..=30)
+            .map(|n| Strategy {
+                id: n.to_string(),
+                sections: BTreeMap::from([(
+                    "general".into(),
+                    vec!["--lua-desync=fake:repeats=8".into()],
+                )]),
+                ..Default::default()
+            })
+            .collect();
+        all[15]
+            .sections
+            .insert("general".into(), vec!["--lua-desync=fake:repeats=2".into()]);
+        all[16]
+            .sections
+            .insert("general".into(), vec!["--lua-desync=fake:repeats=1".into()]);
+        all[16]
+            .sections
+            .insert("quic".into(), vec!["changed".into()]);
+        let cache = Cache::new("test");
+        let cold = cache.plan(&all, "1", false, &BTreeMap::new(), NOW, &[]);
+        assert_eq!(cold.lighter_candidate.as_deref(), Some("16"));
+        assert_eq!(cold.strategies[1].id, "16");
+        let hints = ["absent", "1", "29", "29", "30", "27"].map(str::to_owned);
+        let warm = cache.plan(&all, "1", false, &BTreeMap::new(), NOW, &hints);
+        assert_eq!(warm.latency_candidates, ["29", "30"]);
+        assert_eq!(
+            warm.strategies
+                .iter()
+                .take(3)
+                .map(|s| s.id.as_str())
+                .collect::<Vec<_>>(),
+            ["1", "29", "30"]
+        );
+        assert_eq!(warm.strategies.len(), QUICK_STRATEGY_LIMIT);
+        assert!(warm.lighter_candidate.is_none());
+        let small = strategies();
+        let retained = learned().plan(&small, "50", false, &hashes(), NOW, &["53".into()]);
+        assert!(retained.strategies.iter().any(|s| s.id == "53"));
+    }
+    #[test]
     fn late_distinct_families_and_udp_variants_enter_a_cold_pick_before_duplicates() {
         let mut all: Vec<_> = (1..=30)
             .map(|id| Strategy {
@@ -391,7 +502,7 @@ mod tests {
         all[29]
             .sections
             .insert("quic".into(), vec!["distinct UDP section".into()]);
-        let plan = Cache::new("new").plan(&all, &all, "1", false, &BTreeMap::new(), NOW);
+        let plan = Cache::new("new").plan(&all, "1", false, &BTreeMap::new(), NOW, &[]);
         assert_eq!(plan.strategies[0].id, "1");
         let first: Vec<_> = plan.strategies[..3].iter().map(|s| s.id.as_str()).collect();
         assert!(first.contains(&"29") && first.contains(&"30"));
@@ -423,11 +534,11 @@ mod tests {
             .collect();
         let hashes = all.iter().map(|s| (s.id.clone(), s.id.clone())).collect();
         let cache = Cache::new("cold-network");
-        let quick = cache.plan(&all, &all, "40", false, &hashes, NOW);
+        let quick = cache.plan(&all, "40", false, &hashes, NOW, &[]);
         assert_eq!(quick.strategies.len(), QUICK_STRATEGY_LIMIT);
         assert_eq!(quick.queued.len(), all.len() - quick.strategies.len());
         assert!(quick.strategies.iter().any(|s| s.id == "40"));
-        let full = cache.plan(&all, &all, "40", true, &hashes, NOW);
+        let full = cache.plan(&all, "40", true, &hashes, NOW, &[]);
         assert_eq!(full.strategies.len(), 41);
         assert!(full.queued.is_empty());
     }
@@ -442,7 +553,7 @@ mod tests {
             .collect();
         let hashes = all.iter().map(|s| (s.id.clone(), s.id.clone())).collect();
         let mut cache = Cache::new("cold-network");
-        let first = cache.plan(&all, &all, "40", false, &hashes, NOW);
+        let first = cache.plan(&all, "40", false, &hashes, NOW, &[]);
         let scores: Vec<_> = first
             .strategies
             .iter()
@@ -464,7 +575,7 @@ mod tests {
             &hashes,
             NOW,
         );
-        let next = cache.plan(&all, &all, "40", false, &hashes, NOW + 1);
+        let next = cache.plan(&all, "40", false, &hashes, NOW + 1, &[]);
         assert!(next.strategies.iter().any(|s| s.id == "40"));
         assert!(
             next.strategies
@@ -524,7 +635,7 @@ mod tests {
     fn second_quick_test_defers_a_clear_loser_but_retains_near_winners_and_primary() {
         let cache = learned();
         let all = strategies();
-        let plan = cache.plan(&all, &all, "50", false, &hashes(), NOW + 1);
+        let plan = cache.plan(&all, "50", false, &hashes(), NOW + 1, &[]);
         assert_eq!(plan.deferred, ["53"]);
         assert_eq!(
             plan.strategies
@@ -533,7 +644,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["50", "58", "61"]
         );
-        let plan = cache.plan(&all, &all, "53", false, &hashes(), NOW + 1);
+        let plan = cache.plan(&all, "53", false, &hashes(), NOW + 1, &[]);
         assert!(plan.strategies.iter().any(|s| s.id == "53"));
     }
     #[test]
@@ -551,7 +662,7 @@ mod tests {
         ] {
             assert!(
                 cache
-                    .plan(&all, &all, "50", full, &hashes, time)
+                    .plan(&all, "50", full, &hashes, time, &[])
                     .deferred
                     .is_empty()
             );
@@ -561,7 +672,7 @@ mod tests {
         cache.save(root.path()).unwrap();
         assert!(
             Cache::load(root.path(), "another-network")
-                .plan(&all, &all, "50", false, &hashes(), NOW)
+                .plan(&all, "50", false, &hashes(), NOW, &[])
                 .deferred
                 .is_empty()
         );
@@ -582,7 +693,7 @@ mod tests {
         }
         assert!(
             cache
-                .plan(&strategies(), &strategies(), "50", false, &hashes(), NOW)
+                .plan(&strategies(), "50", false, &hashes(), NOW, &[])
                 .deferred
                 .is_empty()
         );
@@ -598,14 +709,7 @@ mod tests {
         );
         assert!(
             cache
-                .plan(
-                    &strategies(),
-                    &strategies(),
-                    "50",
-                    false,
-                    &hashes(),
-                    NOW + 1
-                )
+                .plan(&strategies(), "50", false, &hashes(), NOW + 1, &[])
                 .deferred
                 .is_empty()
         );
@@ -616,14 +720,7 @@ mod tests {
         cache.generation += 5;
         assert!(
             cache
-                .plan(
-                    &strategies(),
-                    &strategies(),
-                    "50",
-                    false,
-                    &hashes(),
-                    NOW + 1
-                )
+                .plan(&strategies(), "50", false, &hashes(), NOW + 1, &[])
                 .deferred
                 .is_empty()
         );

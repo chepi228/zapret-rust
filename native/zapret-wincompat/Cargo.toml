@@ -22,6 +22,7 @@ libc = "0.2"
 sha2.workspace = true
 zlib-rs = { version = "=0.6.8", default-features = false, features = ["std", "__internal-api"] }
 windows-sys = { workspace = true, features = [
+    "Wdk_Storage_FileSystem",
     "Win32_Globalization",
     "Win32_Networking_WinSock",
     "Win32_NetworkManagement_WiFi",

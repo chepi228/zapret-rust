@@ -4,15 +4,16 @@
 //! finish before C creates or releases Lua objects.
 
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, hash_map},
     ffi::c_void,
+    hash::{Hash, Hasher},
     ops::Bound::{Excluded, Unbounded},
     ptr, slice,
     sync::atomic::{AtomicU64, Ordering},
 };
 
 #[repr(C, align(4))]
-#[derive(Clone, Copy, Default, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Default, Eq, PartialEq)]
 struct Key {
     source: [u8; 16],
     destination: [u8; 16],
@@ -24,6 +25,15 @@ struct Key {
 }
 
 impl Key {
+    fn canonical(self) -> (Self, usize) {
+        // Most endpoints have distinct ports. Compare the addresses only on a tie.
+        if (self.source_port, &self.source) > (self.destination_port, &self.destination) {
+            (self.reversed(), 1)
+        } else {
+            (self, 0)
+        }
+    }
+
     fn reversed(self) -> Self {
         Self {
             source: self.destination,
@@ -33,6 +43,16 @@ impl Key {
             reserved: [0; 2],
             ..self
         }
+    }
+}
+
+impl Hash for Key {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        // All field widths are fixed. Keep the table's randomized hasher.
+        state.write(&self.source);
+        state.write(&self.destination);
+        state.write_u32(u32::from(self.source_port) | (u32::from(self.destination_port) << 16));
+        state.write_u16(u16::from_le_bytes([self.l3, self.l4]));
     }
 }
 
@@ -51,36 +71,49 @@ struct Entry {
 
 #[derive(Default)]
 struct Index {
-    entries: HashMap<Key, Entry>,
-    order: BTreeMap<u64, Key>,
+    // Opposite tuples may both be registered. An exact match has priority.
+    entries: HashMap<Key, [Option<Entry>; 2]>,
+    order: BTreeMap<u64, *mut c_void>,
 }
 
 static NEXT_ORDER: AtomicU64 = AtomicU64::new(1);
 
 impl Index {
     fn insert(&mut self, key: Key, value: *mut c_void) -> bool {
-        if self.entries.contains_key(&key) || self.entries.try_reserve(1).is_err() {
+        if self.entries.try_reserve(1).is_err() {
+            return false;
+        }
+        let (key, direction) = key.canonical();
+        let slot = &mut self.entries.entry(key).or_default()[direction];
+        if slot.is_some() {
             return false;
         }
         let order = NEXT_ORDER.fetch_add(1, Ordering::Relaxed);
-        self.entries.insert(key, Entry { value, order });
-        self.order.insert(order, key);
+        *slot = Some(Entry { value, order });
+        self.order.insert(order, value);
         true
     }
 
     fn find(&self, key: Key) -> Option<(*mut c_void, bool)> {
-        self.entries
-            .get(&key)
-            .map(|entry| (entry.value, false))
-            .or_else(|| {
-                self.entries
-                    .get(&key.reversed())
-                    .map(|entry| (entry.value, true))
-            })
+        let (key, direction) = key.canonical();
+        let pair = self.entries.get(&key)?;
+        if let Some(entry) = &pair[direction] {
+            return Some((entry.value, false));
+        }
+        pair[1 - direction]
+            .as_ref()
+            .map(|entry| (entry.value, true))
     }
 
     fn remove(&mut self, key: &Key) -> Option<*mut c_void> {
-        let entry = self.entries.remove(key)?;
+        let (key, direction) = key.canonical();
+        let hash_map::Entry::Occupied(mut slot) = self.entries.entry(key) else {
+            return None;
+        };
+        let entry = slot.get_mut()[direction].take()?;
+        if slot.get()[1 - direction].is_none() {
+            slot.remove();
+        }
         self.order.remove(&entry.order);
         Some(entry.value)
     }
@@ -177,11 +210,11 @@ unsafe extern "C" fn zapret_conntrack_after(index: *const Index, cursor: *mut u6
         return ptr::null_mut();
     };
     let after = unsafe { cursor.read() };
-    let Some((&order, key)) = index.order.range((Excluded(after), Unbounded)).next() else {
+    let Some((&order, &value)) = index.order.range((Excluded(after), Unbounded)).next() else {
         return ptr::null_mut();
     };
     unsafe { cursor.write(order) };
-    index.entries[key].value
+    value
 }
 
 #[unsafe(no_mangle)]
@@ -631,5 +664,52 @@ mod tests {
         assert_eq!(index.find(other), Some((second_ptr, false)));
         assert_eq!(index.order.len(), 1);
         assert!(index.find(key).is_none());
+    }
+
+    #[test]
+    fn opposite_registrations_keep_exact_matches_and_survive_independent_removal() {
+        let mut values = [1u8, 2];
+        let first = ptr::from_mut(&mut values[0]).cast();
+        let second = ptr::from_mut(&mut values[1]).cast();
+        let key = Key {
+            source: [1; 16],
+            destination: [2; 16],
+            source_port: 443,
+            destination_port: 443,
+            l3: 41,
+            l4: 17,
+            ..Key::default()
+        };
+        for key in [key, key.reversed()] {
+            let mut index = Index::default();
+            let reverse = key.reversed();
+            assert!(index.insert(key, first));
+            assert_eq!(index.remove(&reverse), None);
+            assert!(index.insert(reverse, second));
+            assert!(!index.insert(reverse, first));
+            assert_eq!(index.find(key), Some((first, false)));
+            assert_eq!(index.find(reverse), Some((second, false)));
+            let mut cursor = 0;
+            assert_eq!(
+                unsafe { zapret_conntrack_after(&index, &mut cursor) },
+                first
+            );
+            assert_eq!(index.remove(&key), Some(first));
+            assert_eq!(
+                unsafe { zapret_conntrack_after(&index, &mut cursor) },
+                second
+            );
+            assert_eq!(index.find(key), Some((second, true)));
+            assert_eq!(index.remove(&reverse), Some(second));
+            assert!(index.order.is_empty() && index.entries.is_empty());
+        }
+        let self_tuple = Key {
+            destination: key.source,
+            ..key
+        };
+        let mut index = Index::default();
+        assert!(index.insert(self_tuple, first));
+        assert!(!index.insert(self_tuple.reversed(), second));
+        assert_eq!(index.find(self_tuple.reversed()), Some((first, false)));
     }
 }

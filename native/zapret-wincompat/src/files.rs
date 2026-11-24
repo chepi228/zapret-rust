@@ -464,6 +464,14 @@ fn join_words(high: u32, low: u32) -> u64 {
     u64::from(high) << 32 | u64::from(low)
 }
 
+fn unix_file_time(ticks: i64) -> (i64, u32) {
+    let unix_ticks = ticks.wrapping_sub(116_444_736_000_000_000);
+    (
+        unix_ticks.div_euclid(10_000_000),
+        unix_ticks.rem_euclid(10_000_000) as u32 * 100,
+    )
+}
+
 #[repr(C)]
 #[derive(Default)]
 pub(super) struct FileMetadata {
@@ -484,13 +492,13 @@ fn metadata(path: &[u16]) -> WinResult<FileMetadata> {
         data.ftLastWriteTime.dwHighDateTime,
         data.ftLastWriteTime.dwLowDateTime,
     );
-    let unix_ticks = (ticks as i64).wrapping_sub(116_444_736_000_000_000);
+    let (seconds, nanoseconds) = unix_file_time(ticks as i64);
     Ok(FileMetadata {
         device: u64::from(data.dwVolumeSerialNumber),
         inode: file_index(&data),
         size,
-        seconds: unix_ticks.div_euclid(10_000_000),
-        nanoseconds: unix_ticks.rem_euclid(10_000_000) as u32 * 100,
+        seconds,
+        nanoseconds,
         directory: u32::from(data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0),
     })
 }

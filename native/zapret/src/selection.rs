@@ -1,9 +1,9 @@
 use crate::{
-    App, VERSION, cli::TestArgs, interrupt, maintenance, runtime_file, snapshot::Snapshot,
+    App, VERSION, cli::TestArgs, interrupt, maintenance, runtime_file, selection_latency::Panel,
+    snapshot::Snapshot,
 };
 use anyhow::{Context, Result, bail, ensure};
 use chrono::{Local, Utc};
-use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
@@ -24,6 +24,8 @@ use zapret_net::{Job, ProbeMode};
 use zapret_platform::{ControlGuard, OwnedChild, RunOptions};
 
 mod endpoints;
+pub(crate) mod families;
+mod startup;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct ExpectedResponse {
@@ -440,6 +442,7 @@ struct RunContext<'a> {
     app: &'a App,
     snapshot: &'a Snapshot,
     network_key: String,
+    network_parts: Value,
     native_hash: &'a str,
     journal: PathBuf,
     deadline: Option<Instant>,
@@ -460,13 +463,79 @@ impl RunContext<'_> {
             "Во время измерения запущена новая игра"
         );
         crate::ensure_snapshot_current(self.snapshot)?;
-        let current = self.app.platform("network", json!({}))?;
-        ensure!(
-            current["known"] == true && current["key"] == self.network_key,
-            "Подключение изменилось во время измерения"
-        );
-        Ok(())
+        let current = measurement_network(self.app)?;
+        verify_measurement_network(&self.network_key, &self.network_parts, &current)
     }
+}
+
+const NETWORK_PARTS: [(&str, &str); 5] = [
+    ("interfaces", "сетевые интерфейсы"),
+    ("routes", "маршруты"),
+    ("profiles", "профиль сети Windows"),
+    ("dns", "настройки DNS"),
+    ("proxy", "настройки прокси"),
+];
+
+fn verify_measurement_network(key: &str, parts: &Value, current: &Value) -> Result<()> {
+    if current["key"] == key {
+        return Ok(());
+    }
+    let changed = NETWORK_PARTS
+        .iter()
+        .filter(|(name, _)| parts[*name] != current["key_parts"][*name])
+        .map(|(_, label)| *label)
+        .collect::<Vec<_>>();
+    bail!(
+        "Подключение изменилось во время измерения. Изменились параметры: {}.",
+        changed.join(", ")
+    )
+}
+
+fn measurement_network(app: &App) -> Result<Value> {
+    read_measurement_network(
+        || app.platform("network", json!({})),
+        || {
+            interrupt::check()?;
+            thread::sleep(Duration::from_millis(200));
+            Ok(())
+        },
+    )
+}
+
+fn read_measurement_network(
+    mut read: impl FnMut() -> Result<Value>,
+    mut pause: impl FnMut() -> Result<()>,
+) -> Result<Value> {
+    let mut reading = read();
+    for _ in 0..2 {
+        if reading.as_ref().is_ok_and(|v| v["known"] == true) {
+            break;
+        }
+        pause()?;
+        reading = read();
+    }
+    let value =
+        reading.context("Не удалось прочитать состояние сети Windows после трёх попыток")?;
+    if value["known"] != true {
+        let missing = NETWORK_PARTS
+            .iter()
+            .filter(|(name, _)| {
+                value["unavailable"]
+                    .as_array()
+                    .is_some_and(|items| items.iter().any(|v| v.as_str() == Some(*name)))
+            })
+            .map(|(_, label)| *label)
+            .collect::<Vec<_>>();
+        bail!(
+            "Windows не подтвердила состояние сети после трёх попыток ({})",
+            if missing.is_empty() {
+                "нет полного снимка".into()
+            } else {
+                missing.join(", ")
+            }
+        )
+    }
+    Ok(value)
 }
 
 fn probe_batch(
@@ -807,42 +876,6 @@ fn summary(id: &str, rows: &[Row], clean: &BTreeMap<String, f64>) -> RankRow {
     result
 }
 
-pub(crate) fn family(strategy: &Strategy) -> String {
-    use std::sync::LazyLock;
-    static TUNING: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r":(pos|repeats|blob|host|seqovl|seqovl_pattern)=[^:]+").expect("constant regex")
-    });
-    static SNI: LazyLock<Regex> =
-        LazyLock::new(|| Regex::new(r"([=,])sni=[^,:]+").expect("constant regex"));
-    let mut parts = vec!["family-http-v2".to_owned()];
-    for section in ["general", "google", "discord_media", "ipset_tcp", "quic"] {
-        let actual = if strategy.sections.contains_key(section) {
-            section
-        } else {
-            "general"
-        };
-        parts.push(format!(
-            "{section}@{}",
-            strategy.section_family(actual, "general")
-        ));
-        let mut previous = None;
-        for line in strategy.section(actual, "general") {
-            if line.starts_with("--lua-desync=") {
-                let normalized = TUNING.replace_all(line, ":${1}=*");
-                let normalized = SNI.replace_all(&normalized, "${1}sni=*").into_owned();
-                if previous.as_ref() != Some(&normalized) {
-                    parts.push(normalized.clone());
-                }
-                previous = Some(normalized);
-            } else {
-                parts.push(line.clone());
-                previous = None;
-            }
-        }
-    }
-    sha256(parts.join("\n").as_bytes())
-}
-
 fn shuffle<T>(values: &mut [T], seed: &mut u64) {
     for index in (1..values.len()).rev() {
         *seed ^= *seed << 13;
@@ -852,16 +885,20 @@ fn shuffle<T>(values: &mut [T], seed: &mut u64) {
     }
 }
 
-fn final_check(expected: &[Row], actual: &[Row]) -> Result<()> {
+fn final_check<'a>(expected: impl IntoIterator<Item = &'a Row>, actual: &[Row]) -> Result<()> {
+    let mut required = expected
+        .into_iter()
+        .filter(|row| row.state == "OK")
+        .peekable();
     ensure!(
-        expected.iter().any(|row| row.state == "OK"),
+        required.peek().is_some(),
         "Нет подтверждённых адресов для финальной проверки"
     );
     let actual: HashMap<_, _> = actual.iter().map(|row| (row.key(), row)).collect();
     let mut reported = BTreeSet::new();
     let mut targets = Vec::new();
     let mut reasons = Vec::new();
-    for row in expected.iter().filter(|row| row.state == "OK") {
+    for row in required {
         let key = row.key();
         let reason = match actual.get(&key) {
             Some(next)
@@ -902,13 +939,19 @@ fn final_check(expected: &[Row], actual: &[Row]) -> Result<()> {
     Ok(())
 }
 
-fn final_reference(working: &[Row], measured: &[Row], baseline: &[Row]) -> Vec<Row> {
-    // Preserve stable working DPI coverage. A retry-only synthetic success is
-    // already scored as flaky; it must not become a mandatory regression veto.
-    // User services and ordinary sites also retain their independently measured requirements.
+fn final_reference(
+    working: &[Row],
+    measured: &[Row],
+    baseline: &[Row],
+    panel: crate::selection_latency::Panel,
+) -> Vec<Row> {
+    // User services and clean sites keep their independent working requirements.
+    // A coverage-only panel also protects stable synthetic successes.
     working
         .iter()
-        .filter(|row| row.group != "DPI" || !row.flaky)
+        .filter(|row| {
+            row.group != "DPI" || (panel == crate::selection_latency::Panel::All && !row.flaky)
+        })
         .chain(measured.iter().filter(|row| row.group != "DPI"))
         .chain(baseline.iter().filter(|row| row.group == "Clean"))
         .cloned()
@@ -951,6 +994,27 @@ fn updates_quick_history(arguments: &TestArgs) -> bool {
         && (!arguments.full
             || (arguments.parallel() == TestArgs::QUICK_PARALLEL
                 && arguments.retry_parallel() == TestArgs::QUICK_RETRY_PARALLEL))
+}
+
+fn recent_latency(
+    app: &App,
+    arguments: &TestArgs,
+    context: Option<&zapret_core::TestResultContext>,
+    primary: &str,
+) -> Vec<String> {
+    if arguments.full || arguments.compare_a.is_some() || arguments.compare_b.is_some() {
+        return Vec::new();
+    }
+    context
+        .map(|c| {
+            crate::selection_learning::recent_candidates(
+                &app.root,
+                c,
+                primary,
+                arguments.timeout_ms,
+            )
+        })
+        .unwrap_or_default()
 }
 
 fn strategy_hashes(all: &[Strategy]) -> Result<BTreeMap<String, String>> {
@@ -1132,25 +1196,16 @@ fn prepare_trial_command(
 
 fn start_trial(root: &Path, arguments: &[String], lifetime: u64) -> Result<OwnedChild> {
     maintenance::check_engine_args(root, arguments)?;
-    for _ in 0..3 {
-        let mut child = OwnedChild::spawn(
-            &root.join("bin/winws2.exe"),
-            &arguments.iter().map(OsString::from).collect::<Vec<_>>(),
-            &RunOptions {
-                cwd: Some(root.join("bin")),
-                timeout: Duration::from_millis(lifetime),
-                ..Default::default()
-            },
-        )?;
-        let start = Instant::now();
-        while start.elapsed() < Duration::from_secs(2) {
-            interrupt::check()?;
-            if !child.is_running()? {
-                break;
-            }
-            thread::sleep(Duration::from_millis(50));
-        }
-        if child.is_running()? {
+    let args: Vec<_> = arguments.iter().map(OsString::from).collect();
+    for attempt in 1..=3 {
+        let mut options = RunOptions {
+            cwd: Some(root.join("bin")),
+            timeout: Duration::from_millis(lifetime),
+            ..Default::default()
+        };
+        let signal = startup::Signal::for_child(&mut options);
+        let mut child = OwnedChild::spawn(&root.join("bin/winws2.exe"), &args, &options)?;
+        if startup::wait(&mut child, signal.as_ref())? {
             return Ok(child);
         }
         let output = child.finish()?;
@@ -1158,7 +1213,9 @@ fn start_trial(root: &Path, arguments: &[String], lifetime: u64) -> Result<Owned
             "Движок завершился при старте: {}",
             String::from_utf8_lossy(&output.stderr)
         );
-        thread::sleep(Duration::from_millis(700));
+        if attempt < 3 {
+            thread::sleep(Duration::from_millis(700));
+        }
     }
     bail!("Движок не запустился после трёх попыток")
 }
@@ -1580,26 +1637,54 @@ pub fn run(app: &App, arguments: &TestArgs) -> Result<Value> {
         local_cover.as_ref(),
         arguments.full,
     )?;
-    let hashes = strategy_hashes(&all)?;
-    let cache = match &local_context {
-        Some(context) => crate::selection_learning::Cache::load(
-            &app.root,
-            &learning_key(context, arguments, &targets)?,
-        ),
-        None => crate::selection_learning::Cache::new("unknown-network"),
-    };
-    let initial = cache.plan(
-        &initial,
-        &all,
-        settings.get("alt"),
-        arguments.full,
-        &hashes,
-        Utc::now().timestamp(),
-    );
-    let plan = json!({"schema":1,"policy":"native-quick-diverse-v4","context":local_context,"targets":targets,"strategies":initial.strategies,"deferred_history":initial.deferred,"queued_candidates":initial.queued,"settings":settings,
-        "rounds":arguments.rounds,"parallel":arguments.parallel(),"retry_parallel":arguments.retry_parallel(),"timeout_ms":arguments.timeout_ms,"report_only":arguments.report_only});
     if arguments.plan_only {
-        return Ok(plan);
+        let hashes = strategy_hashes(&all)?;
+        let cache = match &local_context {
+            Some(context) => crate::selection_learning::Cache::load(
+                &app.root,
+                &learning_key(context, arguments, &targets)?,
+            ),
+            None => crate::selection_learning::Cache::new("unknown-network"),
+        };
+        let primary = settings.get("alt");
+        let recent = recent_latency(app, arguments, local_context.as_ref(), primary);
+        let plan = cache.plan(
+            &initial,
+            primary,
+            arguments.full,
+            &hashes,
+            Utc::now().timestamp(),
+            &recent,
+        );
+        let representatives = if !arguments.full
+            && arguments.rounds == 1
+            && arguments.compare_a.is_none()
+            && arguments.compare_b.is_none()
+        {
+            Some(
+                families::schedule(
+                    &plan.strategies,
+                    &all,
+                    primary,
+                    local_rank.as_ref(),
+                    local_cover.as_ref(),
+                    plan.latency_candidates
+                        .iter()
+                        .chain(plan.lighter_candidate.iter())
+                        .cloned(),
+                )
+                .0
+                .into_iter()
+                .map(|s| s.id)
+                .collect::<Vec<_>>(),
+            )
+        } else {
+            None
+        };
+        return Ok(
+            json!({"schema":1,"policy":"native-quick-families-v5","preferred_selection_policy":crate::selection_latency::POLICY,"context":local_context,"targets":targets,"strategies":plan.strategies,"deferred_history":plan.deferred,"queued_candidates":plan.queued,"latency_candidates":plan.latency_candidates,"lighter_candidate":plan.lighter_candidate,"strategy_families":families::catalog(&initial),"family_representatives":representatives,"settings":settings,
+            "rounds":arguments.rounds,"parallel":arguments.parallel(),"retry_parallel":arguments.retry_parallel(),"timeout_ms":arguments.timeout_ms,"report_only":arguments.report_only}),
+        );
     }
     interrupt::install()?;
     ensure!(
@@ -1634,12 +1719,7 @@ pub fn run(app: &App, arguments: &TestArgs) -> Result<Value> {
     let _quick_edit = crate::console::QuickEditGuard::suspend()
         .context("Не удалось настроить ввод консоли на время автоподбора")?;
     crate::ensure_controller_current()?;
-    let network = app.platform("network", json!({}))?;
-    let key = network["key"]
-        .as_str()
-        .filter(|_| network["known"] == true)
-        .context("Неизвестен контекст сети")?
-        .to_owned();
+    let network = measurement_network(app)?;
     let status = app.platform("status", json!({}))?;
     ensure!(
         status["known"] == true && status["ownership_known"] == true,
@@ -1658,7 +1738,7 @@ pub fn run(app: &App, arguments: &TestArgs) -> Result<Value> {
         approved_games: approved_games.clone(),
     };
     app.platform("stop", json!({"game_approved":true}))?;
-    let mut result = run_inner(app, arguments, key, approved_games);
+    let mut result = run_inner(app, arguments, &network, approved_games);
     if let Ok(report) = &result {
         restore.needed |= selection_start_requested(arguments, report);
     }
@@ -1735,9 +1815,13 @@ fn reconcile_restart(
 fn run_inner(
     app: &App,
     arguments: &TestArgs,
-    network_key: String,
+    network: &Value,
     approved_games: BTreeSet<String>,
 ) -> Result<Value> {
+    let network_key = network["key"]
+        .as_str()
+        .context("Неизвестен контекст сети")?
+        .to_owned();
     let test_started = Instant::now();
     let mut snapshot = Snapshot::package(&app.root)?;
     // Read the complete run from the pinned package, after acquiring control.
@@ -1759,6 +1843,7 @@ fn run_inner(
         app,
         snapshot: &snapshot,
         network_key: network_key.clone(),
+        network_parts: network["key_parts"].clone(),
         native_hash,
         journal: journal.clone(),
         deadline: if arguments.compare_a.is_some() || arguments.compare_b.is_some() {
@@ -1795,17 +1880,20 @@ fn run_inner(
         snapshot.root(),
         &learning_key(&result_context, arguments, &targets)?,
     );
+    let recent = recent_latency(app, arguments, Some(&result_context), settings.get("alt"));
     let learned_plan = learning.plan(
         &candidates,
-        &all,
         settings.get("alt"),
         arguments.full,
         &hashes,
         Utc::now().timestamp(),
+        &recent,
     );
     let candidates = learned_plan.strategies;
     let deferred_history = learned_plan.deferred;
     let queued_candidates = learned_plan.queued;
+    let latency_candidates = learned_plan.latency_candidates;
+    let lighter_candidate = learned_plan.lighter_candidate;
     crate::selection_ui::progress(
         app,
         &format!(
@@ -1854,6 +1942,7 @@ fn run_inner(
     let mut failure_runs = BTreeMap::<String, usize>::new();
     let mut eligible = BTreeMap::<String, bool>::new();
     let mut skipped = Vec::new();
+    let mut family_selection = None;
     let mut strategy_quality = BTreeMap::<String, bool>::new();
     let mut quality_reasons = BTreeMap::<String, BTreeSet<String>>::new();
     let mut round_sums = BTreeMap::<String, Vec<RankRow>>::new();
@@ -1910,37 +1999,31 @@ fn run_inner(
                 ..target.clone()
             })
             .collect();
-        let mut ordered = candidates.clone();
-        shuffle(&mut ordered, &mut random);
-        let mut required = BTreeSet::new();
-        required.insert(settings.get("alt").to_owned());
-        for section in ["general", "google", "discord_media", "game_tcp"] {
-            required.extend(
-                zapret_core::rotation_order(
-                    &all,
-                    settings.get("alt"),
-                    section,
-                    rank.as_ref(),
-                    cover.as_ref(),
-                )
-                .into_iter()
-                .map(|strategy| strategy.id),
+        let (mut initial, mut deferred) = if arguments.full || arguments.rounds > 1 {
+            (candidates.clone(), Vec::new())
+        } else {
+            let plan = families::schedule(
+                &candidates,
+                &all,
+                settings.get("alt"),
+                rank.as_ref(),
+                cover.as_ref(),
+                latency_candidates
+                    .iter()
+                    .chain(lighter_candidate.iter())
+                    .cloned(),
             );
-        }
-        let mut represented = BTreeSet::new();
-        let mut initial = Vec::new();
-        let mut deferred = Vec::new();
-        for strategy in ordered {
-            if arguments.full
-                || arguments.rounds > 1
-                || required.contains(&strategy.id)
-                || represented.insert(family(&strategy))
-            {
-                initial.push(strategy)
-            } else {
-                deferred.push(strategy)
-            }
-        }
+            crate::selection_ui::progress(
+                app,
+                &format!(
+                    "Сравниваю {} семейств. В первом этапе {} профилей.",
+                    families::catalog(&candidates).len(),
+                    plan.0.len()
+                ),
+            )?;
+            plan
+        };
+        shuffle(&mut initial, &mut random);
         let initial_len = initial.len();
         let mut schedule = initial;
         let mut index = 0;
@@ -2039,44 +2122,59 @@ fn run_inner(
             index += 1;
             if index == initial_len && !deferred.is_empty() {
                 let clean_base = &table["0"];
+                let controls_stable = schedule
+                    .iter()
+                    .all(|s| strategy_quality.get(&s.id) == Some(&true));
+                let all_eligible =
+                    controls_stable && eligible["0"] && schedule.iter().all(|s| eligible[&s.id]);
                 let perfect = schedule
                     .iter()
-                    .filter(|strategy| {
-                        eligible.get(&strategy.id) == Some(&true)
-                            && strategy_quality.get(&strategy.id) == Some(&true)
-                    })
-                    .find(|strategy| fully_covered(clean_base, &table[&strategy.id]));
-                let initial_complete = schedule.iter().take(initial_len).all(|strategy| {
-                    eligible.get(&strategy.id) == Some(&true)
-                        && strategy_quality.get(&strategy.id) == Some(&true)
-                });
-                if eligible["0"] && initial_complete {
-                    if let Some(winner) = perfect {
-                        let winning_family = family(winner);
-                        let mut followed = 0;
-                        for strategy in deferred.drain(..) {
-                            if family(&strategy) == winning_family && followed < 2 {
-                                schedule.push(strategy);
-                                followed += 1;
-                            } else {
-                                skipped.push(strategy.id);
-                            }
-                        }
-                        if !skipped.is_empty() {
-                            crate::selection_ui::progress(
-                                app,
-                                &format!(
-                                    "Покрытие подтверждено. Лишние варианты отложены: {}; уточняю близкие стратегии.",
-                                    skipped.len()
-                                ),
-                            )?;
-                        }
-                    } else {
-                        schedule.append(&mut deferred);
-                    }
-                } else {
-                    schedule.append(&mut deferred);
+                    .filter(|s| all_eligible && fully_covered(clean_base, &table[&s.id]))
+                    .map(|s| s.id.clone())
+                    .collect();
+                let evidence = table
+                    .iter()
+                    .map(|(id, rows)| (id.clone(), probe_details(rows)))
+                    .collect();
+                let rows = schedule
+                    .iter()
+                    .filter(|s| strategy_quality.get(&s.id) == Some(&true))
+                    .map(|s| summary(&s.id, &table[&s.id], &clean))
+                    .collect();
+                let baseline_stable = !clean.is_empty()
+                    && clean_base
+                        .iter()
+                        .filter(|r| r.group != "DPI")
+                        .all(|r| !r.flaky && matches!(r.state.as_str(), "OK" | "FAIL" | "FREEZE"));
+                let (next, omitted, refinement) = families::refine(
+                    &schedule,
+                    std::mem::take(&mut deferred),
+                    families::Evidence {
+                        rows,
+                        details: &evidence,
+                        primary: settings.get("alt"),
+                        controls_stable: controls_stable && baseline_stable,
+                        perfect,
+                    },
+                );
+                if !refinement.leaders.is_empty() {
+                    let names = refinement
+                        .leaders
+                        .iter()
+                        .map(|l| l.family.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    crate::selection_ui::progress(
+                        app,
+                        &format!(
+                            "Уточняю варианты семейств {names}. Осталось проверить {}.",
+                            next.len()
+                        ),
+                    )?;
                 }
+                skipped.extend(omitted);
+                schedule.extend(next);
+                family_selection = Some(refinement);
             }
         }
         collect_round_summaries(&table, &round_ids, &clean, &mut round_sums)?;
@@ -2141,29 +2239,35 @@ fn run_inner(
         .map(|(id, rows)| (id.clone(), probe_details(rows)))
         .collect();
     let use_history = app.yes && !arguments.apply;
-    let mut latency_preference = crate::selection_latency::recommend(
-        if use_history {
-            &ordered_by_average
-        } else {
-            &qualified
-        },
-        &details,
-    );
-    let proposed = if use_history {
-        ordered_by_average.first().unwrap_or(&best)
+    let mut order = if use_history {
+        ordered_by_average
     } else {
-        &best
+        qualified.clone()
     };
+    let panel = Panel::for_trials(&order, &details);
+    panel.prioritize(&mut order, &details, settings.get("alt"));
+    let proposed = order.first().unwrap_or(&best);
+    let mut latency_preference = crate::selection_latency::recommend(&order, &details, panel);
+    // Within an equal service tier prioritize() places the current primary first.
+    let service_progress = panel == Panel::Services && proposed.id != settings.get("alt");
     let noise = app.yes
         && (strategy_quality.get(settings.get("alt")) != Some(&true)
             || averages.get(settings.get("alt")).is_some_and(|current| {
                 averages.get(&proposed.id).is_none_or(|proposed| {
-                    proposed.0 - current.0 < 2. && latency_preference.is_none()
+                    proposed.0 - current.0 < 2. && latency_preference.is_none() && !service_progress
                 })
             }));
     let proposed = proposed.clone();
-    let trial_best = best.clone();
-    let mut best = best;
+    let trial_best = if panel == crate::selection_latency::Panel::Services {
+        latency_preference
+            .as_ref()
+            .and_then(|p| order.iter().find(|r| r.id == p.candidate))
+            .unwrap_or(&proposed)
+            .clone()
+    } else {
+        best
+    };
+    let mut best = trial_best.clone();
     let mut candidate = settings.clone();
     let mut select = false;
     let mut choice = if arguments.report_only {
@@ -2206,6 +2310,7 @@ fn run_inner(
     let mut validation_error = None;
     let mut final_details = Vec::new();
     let mut final_checks = BTreeMap::new();
+    let mut latency_rechecks = Vec::new();
     let mut retained_check = None;
     let update_quick_history = updates_quick_history(arguments);
     if update_quick_history {
@@ -2263,14 +2368,19 @@ fn run_inner(
             let (actual, _) = actual?;
             // The retained command only needs to preserve its own working coverage.
             let expected = if retained {
-                final_reference(&working_reference, &[], &[])
+                final_reference(
+                    &working_reference,
+                    &[],
+                    &[],
+                    crate::selection_latency::Panel::All,
+                )
             } else {
                 let measured = table
                     .get(id)
                     .context("Рабочая стратегия отсутствует в измерении")?;
-                final_reference(&working_reference, measured, &table["0"])
+                final_reference(&working_reference, measured, &table["0"], panel)
             };
-            let (comparable, details) = endpoints::compare_final(
+            let check = endpoints::validate_final(
                 &targets,
                 &expected,
                 &actual,
@@ -2313,21 +2423,14 @@ fn run_inner(
                     result
                 },
             )?;
-            let error = final_check(&expected, &comparable)
-                .err()
-                .map(|error| format!("{error:#}"));
             context.assert_current()?;
             crate::selection_ui::validation_notice(
                 app,
                 &label,
-                error.as_deref(),
+                check.error.as_deref(),
                 arguments.details,
             )?;
-            Ok(crate::selection_decision::Check {
-                confirmed: error.is_none(),
-                error,
-                details,
-            })
+            Ok(check)
         };
         let mut primary_command_changed = false;
         let mut validate = |id: &str| {
@@ -2340,35 +2443,28 @@ fn run_inner(
             measure_final(id, &command, false)
         };
         if !arguments.keep_primary && (!noise || arguments.apply) {
-            let mut order = vec![proposed.clone()];
-            order.extend(
-                (if use_history {
-                    &ordered_by_average
-                } else {
-                    &qualified
-                })
-                .iter()
-                .filter(|row| row.id != proposed.id)
-                .filter(|row| {
-                    !app.yes
-                        || arguments.apply
-                        || averages
-                            .get(settings.get("alt"))
-                            .is_some_and(|current| averages[&row.id].0 - current.0 >= 2.)
-                        || latency_preference
-                            .as_ref()
-                            .is_some_and(|_| crate::selection_latency::eligible(&proposed, row))
-                })
-                .cloned(),
-            );
+            order.retain(|row| {
+                row.id == proposed.id
+                    || !app.yes
+                    || arguments.apply
+                    || panel == crate::selection_latency::Panel::Services
+                    || averages
+                        .get(settings.get("alt"))
+                        .is_some_and(|current| averages[&row.id].0 - current.0 >= 2.)
+                    || latency_preference
+                        .as_ref()
+                        .is_some_and(|_| crate::selection_latency::eligible(&proposed, row, panel))
+            });
             let decision = crate::selection_decision::verified_preferred(
                 &order,
                 arguments.full,
                 &details,
+                panel,
                 &mut validate,
             )?;
             latency_preference = decision.preference;
             final_checks = decision.checks;
+            latency_rechecks = decision.repeat_candidates;
             if let Some(recommended) = decision.recommended {
                 best = recommended;
                 recommendation_status = "confirmed";
@@ -2451,12 +2547,28 @@ fn run_inner(
         .filter(|(id, _)| id.as_str() != "0")
         .map(|(id, rows)| (id.clone(), availability(rows).counts()))
         .collect();
+    let primary = if accepted {
+        candidate.get("alt")
+    } else {
+        settings.get("alt")
+    };
+    let next_quick_latency = if accepted && panel == Panel::Services {
+        crate::selection_learning::next_candidates(&qualified, &details, &final_checks, primary)
+    } else {
+        Vec::new()
+    };
     let mut report = json!({"schema":1,"run_id":run_id,"best":best,"trial_best":trial_best,"recommendation_status":recommendation_status,"final_checks":final_checks,"choice":choice,
-        "selection_policy":crate::selection_latency::POLICY,"connection_selection":latency_preference,
+        "selection_policy":if panel == crate::selection_latency::Panel::Services {crate::selection_latency::POLICY} else {crate::selection_latency::PREVIOUS_POLICY},"connection_selection":latency_preference,
         "primary_requested":candidate.get("alt"),"apply_requested":arguments.apply,"report_only":arguments.report_only,"presentation":if arguments.details{"detailed"}else{"compact"},"queued_candidates":queued_candidates,"rows":sums,"base":table["0"],"journal":journal,"availability":availability,
         "timings":timings,"elapsed_ms":test_started.elapsed().as_secs_f64()*1000.,"details":details,"working_reference":working_details,"final_details":final_details,"retained_check":retained_check,"validation_error":validation_error,"cache_error":cache_error,"deferred_history":deferred_history,
-        "accepted":accepted,"quality_eligible":quality_ok,"strategy_quality":strategy_quality,"quality_reasons":quality_reasons,"averages":averages,"noise_margin":noise,"primary_changed":select&&accepted,"primary":if accepted{candidate.get("alt")}else{settings.get("alt")},
+        "accepted":accepted,"quality_eligible":quality_ok,"strategy_quality":strategy_quality,"quality_reasons":quality_reasons,"averages":averages,"noise_margin":noise,"primary_changed":select&&accepted,"primary":primary,
         "skipped_ids":skipped,"rounds_measured":rounds_measured,"strategy_names":all.iter().map(|s|(&s.id,s.display_name())).collect::<BTreeMap<_,_>>(),"native_identity":native_hash,"context":result_context});
+    report["latency_candidates"] = json!(latency_candidates);
+    report["lighter_candidate"] = json!(lighter_candidate);
+    report["next_quick_latency"] = json!(next_quick_latency);
+    report["latency_rechecks"] = json!(latency_rechecks);
+    report["family_selection"] = json!(family_selection);
+    report["strategy_families"] = json!(families::catalog(&all));
     report["parallel"] = json!(arguments.parallel());
     report["retry_parallel"] = json!(arguments.retry_parallel());
     report["endpoint_policy"] = json!("baseline-peer-per-round-live-dns-final-v1");
@@ -2698,6 +2810,56 @@ mod tests {
     use super::*;
 
     #[test]
+    fn measurement_retries_unavailable_samples_and_reports_confirmed_changes() {
+        let old = json!({"known":true,"key":"a","key_parts":{"proxy":"a"}});
+        let new = json!({"known":true,"key":"b","key_parts":{"proxy":"b"}});
+        let unavailable = json!({"known":false,"unavailable":["routes"]});
+        let mut samples = [unavailable.clone(), old.clone()].into_iter();
+        let mut pauses = 0;
+        let current = read_measurement_network(
+            || Ok(samples.next().unwrap()),
+            || {
+                pauses += 1;
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(pauses, 1);
+        verify_measurement_network("a", &old["key_parts"], &current).unwrap();
+        let current = read_measurement_network(
+            || Ok(new.clone()),
+            || panic!("confirmed samples need no retry"),
+        )
+        .unwrap();
+        assert!(
+            verify_measurement_network("a", &old["key_parts"], &current)
+                .unwrap_err()
+                .to_string()
+                .contains("настройки прокси")
+        );
+        let mut attempts = 0;
+        let err = read_measurement_network(
+            || {
+                attempts += 1;
+                Ok(unavailable.clone())
+            },
+            || Ok(()),
+        )
+        .unwrap_err();
+        assert_eq!(attempts, 3);
+        assert!(err.to_string().contains("маршруты"));
+        assert!(!err.to_string().contains("Подключение изменилось"));
+    }
+    fn final_reference(working: &[Row], measured: &[Row], baseline: &[Row]) -> Vec<Row> {
+        super::final_reference(
+            working,
+            measured,
+            baseline,
+            crate::selection_latency::Panel::All,
+        )
+    }
+
+    #[test]
     fn batch_journal_appends_existing_jsonl_and_leaves_prior_rows_readable_on_error() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("run.jsonl");
@@ -2808,6 +2970,22 @@ mod tests {
         let targets = std::slice::from_ref(&target);
         let expected = [observed(a, true)];
         let actual = [observed(b, false)];
+        let mut clean = row("OK");
+        clean.group = "Clean".into();
+        clean.name = "adobe".into();
+        let mut slow = clean.clone();
+        slow.tls_ms += 501.;
+        let veto = endpoints::validate_final(
+            targets,
+            &[expected[0].clone(), clean],
+            &[actual[0].clone(), slow],
+            |_, _| panic!("peer replays cannot change the control veto"),
+        )
+        .unwrap();
+        assert!(!veto.confirmed);
+        assert_eq!(veto.details.len(), 2);
+        let error = veto.error.unwrap();
+        assert!(error.contains("Clean/adobe") && !error.contains("Discord/avatar"));
         let round = endpoints::for_round(targets, &actual);
         let job = round[0].job(5000, false);
         assert_eq!(job.connect_ip, Some("192.0.2.130".parse().unwrap()));
@@ -2887,6 +3065,14 @@ mod tests {
         recovered[0].tls_ms = 50.;
         let expected = final_reference(&recovered, &isolated, &[]);
         assert!(final_check(&expected, &working).is_err());
+        let services = super::final_reference(
+            &recovered,
+            &isolated,
+            &[],
+            crate::selection_latency::Panel::Services,
+        );
+        assert!(final_check(&services, &working).is_ok());
+        assert!(final_check(&services, &broken).is_err());
     }
 
     #[test]
@@ -3129,7 +3315,8 @@ mod tests {
         assert!(final_check(&baseline_rows, &slow).is_err());
         assert!(!crate::selection_latency::preserves_services(
             &probe_details(&baseline_rows[1..]),
-            &probe_details(&slow[1..])
+            &probe_details(&slow[1..]),
+            crate::selection_latency::Panel::All
         ));
     }
     #[test]
@@ -3145,10 +3332,10 @@ mod tests {
         let mut second = first.clone();
         second.sections.get_mut("general").unwrap()[0] =
             "--lua-desync=multisplit:pos=3,4:fooling=md5sig".into();
-        assert_eq!(family(&first), family(&second));
+        assert_eq!(families::signature(&first), families::signature(&second));
         second.sections.get_mut("general").unwrap()[0] =
             "--lua-desync=multisplit:pos=3,4:fooling=badsum".into();
-        assert_ne!(family(&first), family(&second));
+        assert_ne!(families::signature(&first), families::signature(&second));
     }
 
     fn observation(target: &Target) -> Value {

@@ -8,8 +8,14 @@ use std::{
 };
 const BEGIN: &str = "# zapret: hosts Flowseal - начало (меню: Проверка обходов)";
 const END: &str = "# zapret: hosts Flowseal - конец";
+pub const DISCORD_MEDIA_HOST: &str = "media.discordapp.net";
+pub const DISCORD_MEDIA_GROUP: &str = "Медиа Discord";
+const GROUPS: [&str; 4] = ["GitHub", "Telegram", "Discord", DISCORD_MEDIA_GROUP];
 fn group(host: &str) -> Option<&'static str> {
     let h = host.to_lowercase();
+    if h == DISCORD_MEDIA_HOST {
+        return Some(DISCORD_MEDIA_GROUP);
+    }
     for (kind, domains) in [
         ("GitHub", &["github.com", "githubusercontent.com"][..]),
         (
@@ -59,6 +65,22 @@ pub(crate) fn entries(text: &str) -> Vec<(String, String)> {
     }
     out
 }
+
+pub fn reference_entries(text: &str) -> Vec<(String, String)> {
+    let mut rows = entries(text);
+    // Use just the IPv4 peer the diagnostic will check with the media hostname,
+    // SNI and a complete file. Prefer a dedicated entry in a refreshed list.
+    let media_ip = [DISCORD_MEDIA_HOST, "discord.com"].iter().find_map(|host| {
+        rows.iter()
+            .find(|(ip, name)| name == host && ip.parse::<std::net::Ipv4Addr>().is_ok())
+            .map(|(ip, _)| ip.clone())
+    });
+    rows.retain(|(_, host)| host != DISCORD_MEDIA_HOST);
+    if let Some(ip) = media_ip {
+        rows.push((ip, DISCORD_MEDIA_HOST.into()));
+    }
+    rows
+}
 fn system_hosts() -> Result<PathBuf> {
     Ok(crate::system::system_directory()?.join("drivers/etc/hosts"))
 }
@@ -87,9 +109,9 @@ pub(crate) fn status(root: &Path, args: &Value) -> Result<Value> {
     let current = entries(text);
     let expected =
         std::fs::read_to_string(root.join("lists/hosts-flowseal.txt")).unwrap_or_default();
-    let expected = entries(&expected);
+    let expected = reference_entries(&expected);
     let mut rows = Vec::new();
-    for g in ["GitHub", "Telegram", "Discord"] {
+    for g in GROUPS {
         let active = current
             .iter()
             .filter(|(_, h)| group(h) == Some(g))
@@ -110,10 +132,7 @@ pub(crate) fn set(root: &Path, args: &Value) -> Result<Value> {
         .iter()
         .map(|g| {
             let s = g.as_str().context("Hosts group must be a string")?;
-            ensure!(
-                ["GitHub", "Telegram", "Discord"].contains(&s),
-                "Unknown hosts group: {s}"
-            );
+            ensure!(GROUPS.contains(&s), "Unknown hosts group: {s}");
             Ok(s.to_owned())
         })
         .collect::<Result<BTreeSet<_>>>()?;
@@ -124,6 +143,7 @@ pub(crate) fn set(root: &Path, args: &Value) -> Result<Value> {
     let nl = if text.contains("\r\n") { "\r\n" } else { "\n" };
     let mut lines = Vec::new();
     let mut in_block = false;
+    let mut user_media = false;
     for line in text.trim_start_matches('\u{feff}').lines() {
         if [
             BEGIN,
@@ -145,7 +165,9 @@ pub(crate) fn set(root: &Path, args: &Value) -> Result<Value> {
             continue;
         }
         let names = entries(line);
-        if !names.is_empty() && names.iter().all(|(_, h)| group(h).is_some()) {
+        if names.iter().any(|(_, h)| h == DISCORD_MEDIA_HOST) {
+            user_media = true;
+        } else if !names.is_empty() && names.iter().all(|(_, h)| group(h).is_some()) {
             continue;
         }
         lines.push(line.to_owned());
@@ -158,7 +180,7 @@ pub(crate) fn set(root: &Path, args: &Value) -> Result<Value> {
         lines.pop();
     }
     let reference = read_limited(&root.join("lists/hosts-flowseal.txt"), 8 * 1024 * 1024)?;
-    let reference = entries(std::str::from_utf8(&reference)?);
+    let reference = reference_entries(std::str::from_utf8(&reference)?);
     for name in &groups {
         ensure!(
             reference
@@ -169,6 +191,7 @@ pub(crate) fn set(root: &Path, args: &Value) -> Result<Value> {
     }
     let add = reference
         .into_iter()
+        .filter(|(_, h)| h != DISCORD_MEDIA_HOST || !user_media)
         .filter(|(_, h)| group(h).is_some_and(|g| groups.contains(g)))
         .collect::<Vec<_>>();
     if !add.is_empty() {
@@ -202,4 +225,62 @@ pub(crate) fn set(root: &Path, args: &Value) -> Result<Value> {
         .unwrap_or(p == system_hosts()?)
         .then(crate::dns_cache::flush);
     Ok(json!({"updated":true,"path":p,"backup":backup,"groups":groups,"flush_dns":flush}))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn applying_and_removing_the_media_pin_preserves_an_external_override() {
+        let root = tempfile::tempdir().unwrap();
+        let hosts = root.path().join("hosts");
+        std::fs::create_dir_all(root.path().join("lists")).unwrap();
+        std::fs::create_dir_all(root.path().join("runtime")).unwrap();
+        std::fs::write(
+            root.path().join("lists/hosts-flowseal.txt"),
+            "192.0.2.1 discord.com\n",
+        )
+        .unwrap();
+        let manual = "192.0.2.44 media.discordapp.net\n127.0.0.1 localhost\n";
+        std::fs::write(&hosts, manual).unwrap();
+        for groups in [json!([DISCORD_MEDIA_GROUP]), json!([])] {
+            set(
+                root.path(),
+                &json!({"path":hosts,"groups":groups,"flush_dns":false}),
+            )
+            .unwrap();
+            assert_eq!(std::fs::read_to_string(&hosts).unwrap(), manual);
+        }
+        std::fs::write(&hosts, "127.0.0.1 localhost\n").unwrap();
+        set(
+            root.path(),
+            &json!({"path":hosts,"groups":[DISCORD_MEDIA_GROUP],"flush_dns":false}),
+        )
+        .unwrap();
+        let installed = std::fs::read_to_string(&hosts).unwrap();
+        assert!(installed.contains(&format!("{BEGIN}\n192.0.2.1 {DISCORD_MEDIA_HOST}\n{END}")));
+    }
+
+    #[test]
+    fn media_candidates_follow_the_reference_and_never_expand_to_other_hosts() {
+        let base = "192.0.2.1 discord.com\n192.0.2.2 updates.discord.com\n";
+        let media = |text: &str| {
+            reference_entries(text)
+                .into_iter()
+                .filter(|(_, h)| group(h) == Some(DISCORD_MEDIA_GROUP))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            media(base),
+            vec![("192.0.2.1".into(), DISCORD_MEDIA_HOST.into())]
+        );
+        let dedicated =
+            format!("{base}192.0.2.3 {DISCORD_MEDIA_HOST}\n192.0.2.4 {DISCORD_MEDIA_HOST}");
+        assert_eq!(
+            media(&dedicated),
+            vec![("192.0.2.3".into(), DISCORD_MEDIA_HOST.into())]
+        );
+        assert!(media("192.0.2.1 other.example").is_empty());
+    }
 }

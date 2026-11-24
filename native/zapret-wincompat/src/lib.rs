@@ -168,6 +168,7 @@ mod timer_lifecycle;
 mod timers;
 #[cfg(windows)]
 mod tls_debug_policy;
+mod trial_startup;
 #[cfg(windows)]
 mod windivert;
 mod windivert_filter;

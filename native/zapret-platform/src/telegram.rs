@@ -203,6 +203,9 @@ fn prepare_config(root: &Path, args: &Value) -> Result<Value> {
             config[k] = v.clone();
         }
     }
+    if config.get("media_pool_size").is_none() && config["pool_size"] == 4 {
+        config["media_pool_size"] = json!(8);
+    }
     // A malformed existing JSON file must not commit half of a new configuration.
     let user = if user["secret"].as_str().is_none_or(str::is_empty) {
         resolve_config(root, true, args)?
@@ -1455,6 +1458,7 @@ mod tests {
         let saved: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
         assert_eq!(saved["host"], "127.0.0.1");
         assert_eq!(saved["pool_size"], 17);
+        assert!(saved.get("media_pool_size").is_none());
         assert_eq!(saved["custom"]["x"], true);
         assert_eq!(saved["autostart"], false);
         assert_eq!(saved["check_updates"], false);
@@ -1470,6 +1474,29 @@ mod tests {
         assert_eq!(
             read_config(directory.path(), false, &json!({})).unwrap()["port"],
             2443
+        );
+    }
+
+    #[test]
+    fn default_media_pool_is_migrated_once_and_a_user_override_survives() {
+        let directory = tempfile::tempdir().unwrap();
+        let args = json!({"port":2443,"secret":SECRET});
+        let path = directory.path().join("runtime/tgws/TgWsProxy/config.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, br#"{"pool_size":4}"#).unwrap();
+        prepare_config(directory.path(), &args).unwrap();
+        let mut saved: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(saved["media_pool_size"], 8);
+        saved["media_pool_size"] = json!(2);
+        std::fs::write(&path, serde_json::to_vec(&saved).unwrap()).unwrap();
+        prepare_config(directory.path(), &args).unwrap();
+        let saved: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            (
+                saved["pool_size"].as_u64(),
+                saved["media_pool_size"].as_u64()
+            ),
+            (Some(4), Some(2))
         );
     }
 

@@ -1,0 +1,34 @@
+# name: Мягкая для сайтов и Discord
+# desc: Для сайтов и YouTube используются четыре повтора на действие, для голоса Discord — три. Дополнительные игровые порты TCP и UDP проходят напрямую.
+# since: 1.1 beta
+[quic]
+--out-range=-n10
+--payload=quic_initial
+--lua-desync=fake:blob=quic_google:repeats=4
+[discord_udp]
+--out-range=a
+--payload=discord_ip_discovery,stun
+--lua-desync=fake:blob=discord_udp:repeats=3
+[discord_media]
+--out-range=-d10
+--payload=tls_client_hello
+--lua-desync=fake:blob=tls_google:tcp_ts=-600000:tcp_ts_up:fool=ts_or_md5:repeats=4:tls_mod=rnd,dupsid
+--lua-desync=multisplit:pos=1
+[google]
+--out-range=-d10
+--payload=tls_client_hello
+--lua-desync=fake:blob=tls_google:tcp_ts=-600000:tcp_ts_up:fool=ts_or_md5:repeats=4:ip_id=zero:tls_mod=rnd,dupsid
+--lua-desync=multisplit:pos=1:ip_id=zero
+[general]
+--out-range=-d10
+--payload=tls_client_hello
+--lua-desync=fake:blob=stun2:tcp_ts=-600000:tcp_ts_up:fool=ts_or_md5:repeats=4
+--lua-desync=fake:blob=tls_sferum:tcp_ts=-600000:tcp_ts_up:fool=ts_or_md5:repeats=4:tls_mod=rnd,dupsid
+--lua-desync=multisplit:pos=1
+--payload=http_req
+--lua-desync=fake:blob=tls_sferum:tcp_ts=-600000:tcp_ts_up:fool=ts_or_md5:repeats=4
+--lua-desync=multisplit:pos=1
+[game_tcp]
+--skip
+[game_udp]
+--skip

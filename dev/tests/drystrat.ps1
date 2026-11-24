@@ -31,13 +31,13 @@ $Script:RingCache = @{}
 try {
     $lines = @('# date: 2026-10-27 12:00', 'base 20 54 DPI=10/36 Discord=0/4 YouTube=0/3', '7 45 45 54 0 0 DPI=30/36 Discord=4/4 YouTube=3/3',
         '22 44 44 54 0 0 DPI=30/36 Discord=4/4 YouTube=3/3', '6 44 44 54 0 0 DPI=30/36 Discord=4/4 YouTube=3/3', '46 43 43 54 0 0 DPI=30/36 Discord=4/4 YouTube=3/3',
-        '41 42 42 54 0 0 DPI=30/36 Discord=4/4 YouTube=3/3', '3 41 41 54 0 0 DPI=30/36 Discord=4/4 YouTube=3/3')
+        '41 42 42 54 0 0 DPI=30/36 Discord=4/4 YouTube=3/3', '8 41 41 54 0 0 DPI=30/36 Discord=4/4 YouTube=3/3')
     Write-TestResultFile $rankPath $lines (Get-TestResultContext)
     $s = Get-Settings; $s.alt = '7'; $s.auto = 'on'
     Write-Host ('ring general: ' + ((Get-RotationOrder '7' 'general' | ForEach-Object { $_.Name }) -join ' > '))
     # круг игры от рейтинга не зависит (основная и RotationPref), круги сайтов и YouTube - по рейтингу
     $availablePref = @($Script:RotationPref | Where-Object { $all.Id -contains $_ })
-    $want = @{ game_tcp = ((@('7') + $availablePref) -join ','); general = '7,6,46,41,3'; ipset_tcp = '7,6,46,41,3'; google = '7,6,46,41,3' }
+    $want = @{ game_tcp = ((@('7') + $availablePref) -join ','); general = '7,6,46,41,8'; ipset_tcp = '7,6,46,41,8'; google = '7,6,46,41,8' }
     foreach ($sec in $want.Keys) {
         $got = (@(Get-RotationOrder '7' $sec | ForEach-Object { $_.Id })) -join ','
         if ($got -eq $want[$sec]) { Write-Host ('ring ' + $sec + ': ' + $got) -ForegroundColor Green }

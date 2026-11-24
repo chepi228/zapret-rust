@@ -13,10 +13,10 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 use zapret_core::{
-    ComposeOptions, IpNetwork, Settings, atomic_write, checked_command_line, compose, list_lines,
-    normalize_domain, normalize_ip_network, normalize_list, port_in_list, prepare_runtime,
-    read_bounded, read_settings, read_text, ring_composition_key_with_identity, sha256,
-    verify_package,
+    ComposeOptions, GameProtocols, IpNetwork, Settings, atomic_write, checked_command_line,
+    compose, find_strategy, list_lines, normalize_domain, normalize_ip_network, normalize_list,
+    port_in_list, prepare_runtime, read_bounded, read_settings, read_text,
+    ring_composition_key_with_identity, sha256, verify_package,
 };
 use zapret_platform::{ControlGuard, OwnedChild, RunOptions, RunOutput};
 
@@ -94,20 +94,25 @@ const VALVE_NETWORKS: [&str; 32] = [
     "2a01:bc80:c::/48",
 ];
 
-const SERVICE_PROBES: [(&str, &str); 7] = [
+const DISCORD_MEDIA_URL: &str = "https://media.discordapp.net/stickers/781291442961383434.png";
+const DISCORD_MEDIA_BYTES: usize = 229034;
+const DISCORD_MEDIA_SHA256: &str =
+    "8dbecf7b6d7da8a9c761ad89a73066838d89f3cda4a1313976c9533ac88a3fb3";
+const SERVICE_PROBES: [(&str, &str); 8] = [
     ("YouTube", "https://www.youtube.com/generate_204"),
     (
         "видео YouTube",
         "https://redirector.googlevideo.com/report_mapping",
     ),
     ("Discord", "https://discord.com/api/v9/gateway"),
+    (zapret_platform::DISCORD_MEDIA_GROUP, DISCORD_MEDIA_URL),
     ("Steam", "https://store.steampowered.com/"),
     ("GitHub", "https://github.com/"),
     ("NBA 2K27: вход (Epic)", "https://api.epicgames.dev/"),
     ("NBA 2K27: запись матча", "https://api.quago.io/"),
 ];
 
-const HOSTS_PROBES: [(&str, &str, &str); 3] = [
+const HOSTS_PROBES: [(&str, &str, &str); 4] = [
     (
         "GitHub",
         "raw.githubusercontent.com",
@@ -115,6 +120,11 @@ const HOSTS_PROBES: [(&str, &str, &str); 3] = [
     ),
     ("Telegram", "telegram.org", "/"),
     ("Discord", "discord.com", "/api/v9/gateway"),
+    (
+        zapret_platform::DISCORD_MEDIA_GROUP,
+        zapret_platform::DISCORD_MEDIA_HOST,
+        "/stickers/781291442961383434.png",
+    ),
 ];
 
 pub fn integrity(root: &Path) -> Result<Value> {
@@ -281,34 +291,47 @@ fn joined_observation(result: thread::Result<Result<Value>>) -> Value {
     )
 }
 
-fn head_job(id: String, url: String, connect_ip: Option<IpAddr>) -> zapret_net::Job {
+fn service_job(id: String, url: String, connect_ip: Option<IpAddr>) -> zapret_net::Job {
+    let media = url == DISCORD_MEDIA_URL;
     zapret_net::Job {
         version: 1,
         id,
         url,
         timeout_ms: 6000,
-        body_limit: 65536,
+        body_limit: if media {
+            DISCORD_MEDIA_BYTES + 1
+        } else {
+            65536
+        },
         post_bytes: 0,
-        method: Some("HEAD".into()),
-        mode: zapret_net::ProbeMode::Range,
+        method: Some(if media { "GET" } else { "HEAD" }.into()),
+        mode: if media {
+            zapret_net::ProbeMode::FullGet
+        } else {
+            zapret_net::ProbeMode::Range
+        },
         connect_ip,
     }
 }
 
 fn probe_reached(row: &zapret_net::Observation) -> bool {
-    row.target_reached
+    row.body_complete
         && row.certificate_validated
         && row
             .status_code
             .is_some_and(|code| (200..=599).contains(&code))
         && row.termination == zapret_net::Termination::Complete
+        && (row.url != DISCORD_MEDIA_URL
+            || (row.status_code == Some(200)
+                && row.body_bytes == DISCORD_MEDIA_BYTES
+                && row.body_sha256.as_deref() == Some(DISCORD_MEDIA_SHA256)))
 }
 
 fn service_observations() -> Result<Value> {
     let jobs = SERVICE_PROBES
         .iter()
         .enumerate()
-        .map(|(index, (_, url))| head_job(index.to_string(), (*url).into(), None))
+        .map(|(index, (_, url))| service_job(index.to_string(), (*url).into(), None))
         .collect::<Vec<_>>();
     let rows = zapret_net::probe(
         &jobs,
@@ -327,7 +350,7 @@ fn service_observations() -> Result<Value> {
         output.push(json!({"name":name,"url":url,"ok":probe_reached(row),"observation":row}));
     }
     Ok(
-        json!({"rows":output,"evidence":"Validated TLS and HTTP headers; game latency not measured"}),
+        json!({"rows":output,"evidence":"Validated TLS and HTTP responses, including a complete Discord media file with SHA-256"}),
     )
 }
 
@@ -338,6 +361,7 @@ fn hosts_pin_observations(root: &Path) -> Result<Value> {
         &json!({"hosts":HOSTS_PROBES.map(|(_,host,_)|host),"no_hosts":true,"compare":false,"timeout_ms":1500}),
     )?;
     let reference = read_text(&list_path(root, "hosts-flowseal.txt")?, 8 * 1024 * 1024)?;
+    let reference = zapret_platform::hosts_reference_entries(&reference);
     let mut jobs = Vec::new();
     let mut endpoints = BTreeMap::new();
     for (index, (_, host, path)) in HOSTS_PROBES.iter().enumerate() {
@@ -352,20 +376,14 @@ fn hosts_pin_observations(root: &Path) -> Result<Value> {
             .filter_map(Value::as_str)
             .find_map(|ip| ip.parse::<std::net::Ipv4Addr>().ok().map(IpAddr::V4));
         let pin = reference
-            .lines()
-            .filter_map(|line| {
-                let mut fields = list_content(line).split_whitespace();
-                let address = fields.next()?.parse::<std::net::Ipv4Addr>().ok()?;
-                fields
-                    .any(|name| name.eq_ignore_ascii_case(host))
-                    .then_some(IpAddr::V4(address))
-            })
-            .next();
+            .iter()
+            .filter(|(_, name)| name.eq_ignore_ascii_case(host))
+            .find_map(|(ip, _)| ip.parse::<std::net::Ipv4Addr>().ok().map(IpAddr::V4));
         for (kind, address) in [("dns", system), ("pin", pin)] {
             endpoints.insert(format!("{index}-{kind}"), address);
             if let Some(address) = address {
                 for attempt in 0..2 {
-                    jobs.push(head_job(
+                    jobs.push(service_job(
                         format!("{index}-{kind}-{attempt}"),
                         format!("https://{host}{path}"),
                         Some(address),
@@ -403,7 +421,7 @@ fn hosts_pin_observations(root: &Path) -> Result<Value> {
         rows.push(json!({"group":group,"host":host,"dns":system,"pin":pin,"verdict":verdict}));
     }
     Ok(
-        json!({"rows":rows,"evidence":"DNS-only resolution; validated TLS and HTTP headers at explicit IPv4 addresses"}),
+        json!({"rows":rows,"evidence":"DNS-only resolution and validated HTTP responses at explicit IPv4 addresses, including Discord media file integrity"}),
     )
 }
 
@@ -976,6 +994,7 @@ fn capture_text(capture: &Value, voice: bool) -> String {
                 Some("NotSelected") => "адрес вне списков выбранных игр",
                 Some("Game") => "игровой фильтр",
                 Some("Protocol") => "выбранный протокол",
+                Some("Port") => "порт вне правил профиля",
                 Some("MissingEngine") => "процесс обхода не найден",
                 _ => "правило не подтверждено",
             }
@@ -1015,7 +1034,10 @@ fn capture_text(capture: &Value, voice: bool) -> String {
 }
 
 #[derive(PartialEq, Eq)]
-struct OwnerSets(Vec<(&'static str, Vec<IpNetwork>)>);
+struct OwnerSets {
+    lists: Vec<(&'static str, Vec<IpNetwork>)>,
+    game: GameProtocols,
+}
 
 impl OwnerSets {
     fn load(root: &Path, settings: &Settings) -> Result<Self> {
@@ -1047,16 +1069,23 @@ impl OwnerSets {
                 .collect::<Result<Vec<_>>>()?;
             owners.push((name, networks));
         }
-        Ok(Self(owners))
+        let game = find_strategy(root, settings.get("alt"))?
+            .filter(|strategy| strategy.is_valid())
+            .map(|strategy| strategy.game_protocols(settings.get("game")))
+            .unwrap_or_default();
+        Ok(Self {
+            lists: owners,
+            game,
+        })
     }
 
     fn owner(&self, address: IpAddr) -> &str {
         // Explicit engine exclusions still apply when upstream include ranges grow.
-        self.0
+        self.lists
             .iter()
             .filter(|(name, _)| ["исключено", "Take-Two"].contains(name))
             .chain(
-                self.0
+                self.lists
                     .iter()
                     .filter(|(name, _)| !["исключено", "Take-Two"].contains(name)),
             )
@@ -1070,6 +1099,7 @@ fn configured_bypass(
     protocol: &str,
     port: u16,
     settings: &Settings,
+    game_protocols: GameProtocols,
 ) -> (bool, &'static str) {
     if owner == "Take-Two" {
         return (false, "TakeTwo");
@@ -1082,11 +1112,9 @@ fn configured_bypass(
     }
     let mode = settings.get("game").to_ascii_lowercase();
     let game = (protocol == "tcp"
-        && ["all", "selected", "tcp"].contains(&mode.as_str())
+        && game_protocols.tcp
         && port_in_list(port, settings.get("gametcp")))
-        || (protocol == "udp"
-            && ["all", "selected", "udp"].contains(&mode.as_str())
-            && port_in_list(port, settings.get("gameudp")));
+        || (protocol == "udp" && game_protocols.udp && port_in_list(port, settings.get("gameudp")));
     let web = (protocol == "tcp" && [80, 443, 8443].contains(&port))
         || (protocol == "udp" && port == 443);
     if !web && !game {
@@ -1126,7 +1154,8 @@ fn annotate_capture(capture: &mut Value, settings: &Settings, owners: &OwnerSets
                 .as_u64()
                 .and_then(|port| u16::try_from(port).ok())
                 .unwrap_or(0);
-            let (bypassed, reason) = configured_bypass(owner, &protocol, port, settings);
+            let (bypassed, reason) =
+                configured_bypass(owner, &protocol, port, settings, owners.game);
             flow["owner"] = json!(owner);
             flow["configured_bypass"] = json!(bypassed);
             flow["bypass_reason"] = json!(reason);
@@ -2825,30 +2854,50 @@ mod tests {
         let mut settings = Settings::default();
         settings.set("game", "selected").unwrap();
         settings.set("ipset", "any").unwrap();
+        let game = zapret_core::Strategy::default().game_protocols("selected");
         for proto in ["tcp", "udp"] {
             assert_eq!(
-                configured_bypass("выбранная игра", proto, 27015, &settings),
+                configured_bypass("выбранная игра", proto, 27015, &settings, game),
                 (true, "SelectedGame")
             );
             assert_eq!(
-                configured_bypass("ipset-all", proto, 27015, &settings),
+                configured_bypass("ipset-all", proto, 27015, &settings, game),
                 (false, "NotSelected")
             );
-            assert!(!configured_bypass("исключено", proto, 27015, &settings).0);
+            assert!(!configured_bypass("исключено", proto, 27015, &settings, game).0);
         }
+        let tcp_only = GameProtocols {
+            tcp: true,
+            udp: false,
+        };
+        assert_eq!(
+            configured_bypass("выбранная игра", "udp", 27015, &settings, tcp_only),
+            (false, "Port")
+        );
+        assert_eq!(
+            configured_bypass("выбранная игра", "udp", 443, &settings, tcp_only),
+            (true, "SelectedGame")
+        );
     }
 
     #[test]
     fn exclusion_uses_only_configured_game_paths_and_keeps_voice_out() {
-        let overlap = OwnerSets(vec![
-            ("ipset-all", vec![IpNetwork::parse("2.2.0.0/16").unwrap()]),
-            ("Take-Two", vec![IpNetwork::parse("2.2.2.0/24").unwrap()]),
-        ]);
+        let game = zapret_core::Strategy::default().game_protocols("all");
+        let overlap = OwnerSets {
+            lists: vec![
+                ("ipset-all", vec![IpNetwork::parse("2.2.0.0/16").unwrap()]),
+                ("Take-Two", vec![IpNetwork::parse("2.2.2.0/24").unwrap()]),
+            ],
+            game,
+        };
         assert_eq!(overlap.owner("2.2.2.2".parse().unwrap()), "Take-Two");
-        let owners = OwnerSets(vec![
-            ("ipset-all", vec![IpNetwork::parse("8.8.8.0/24").unwrap()]),
-            ("Take-Two", vec![IpNetwork::parse("2.2.2.0/24").unwrap()]),
-        ]);
+        let owners = OwnerSets {
+            lists: vec![
+                ("ipset-all", vec![IpNetwork::parse("8.8.8.0/24").unwrap()]),
+                ("Take-Two", vec![IpNetwork::parse("2.2.2.0/24").unwrap()]),
+            ],
+            game,
+        };
         let mut capture = json!({"flows":[
             {"address":"8.8.8.8","protocol":"tcp","port":443},
             {"address":"8.8.8.9","protocol":"udp","port":50000},
@@ -2999,15 +3048,18 @@ mod tests {
     #[test]
     fn pc_repairs_remain_explicit_and_hosts_preserves_uncertain_groups() {
         let result = json!({"ipv4_preference":{"known":true,"enabled":false},"ipv6":{"broken":["test"]},
-            "hosts":{"groups":[{"group":"GitHub","entries":0},{"group":"Telegram","entries":1},{"group":"Discord","entries":1}]},
-            "hosts_pins":{"rows":[{"group":"GitHub","verdict":"helps"},{"group":"Telegram","verdict":"down"},{"group":"Discord","verdict":"worse"}]}});
+            "hosts":{"groups":[{"group":"GitHub","entries":0},{"group":"Telegram","entries":1},{"group":"Discord","entries":1},{"group":zapret_platform::DISCORD_MEDIA_GROUP,"entries":0}]},
+            "hosts_pins":{"rows":[{"group":"GitHub","verdict":"helps"},{"group":"Telegram","verdict":"down"},{"group":"Discord","verdict":"worse"},{"group":zapret_platform::DISCORD_MEDIA_GROUP,"verdict":"helps"}]}});
         let fixes = pc_fixes(&result);
         assert_eq!(fixes.len(), 2);
         let hosts = fixes
             .iter()
             .find(|fix| fix["action"] == "hosts-set")
             .unwrap();
-        assert_eq!(hosts["arguments"]["groups"], json!(["GitHub", "Telegram"]));
+        assert_eq!(
+            hosts["arguments"]["groups"],
+            json!(["GitHub", "Telegram", zapret_platform::DISCORD_MEDIA_GROUP])
+        );
         assert_eq!(
             hosts_pin_verdict(
                 &json!({"ok":true,"ms":10}),

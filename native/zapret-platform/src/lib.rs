@@ -28,6 +28,9 @@ mod wmi;
 pub use control::ControlGuard;
 pub use dns_cache::{ForwardDnsCache, forward_dns_cache};
 pub use engine::{validate_capture_filter, validate_engine_args};
+pub use hosts::{
+    DISCORD_MEDIA_GROUP, DISCORD_MEDIA_HOST, reference_entries as hosts_reference_entries,
+};
 pub use launch::validate_launch;
 pub use maintenance::is_admin;
 pub use metrics::ProcessMetrics;

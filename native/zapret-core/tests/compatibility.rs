@@ -148,6 +148,54 @@ fn score_input_order_and_context_match_the_legacy_package() {
 }
 
 #[test]
+fn pinned_composition_matches_disk_and_requires_every_digest_it_uses() {
+    let fixture = composition_fixture();
+    let case = fixture
+        .cases
+        .iter()
+        .find(|c| c.name == "scoped-rank")
+        .unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    write_fixture_files(root, &fixture.files);
+    write_fixture_files(root, &case.files);
+    let digests: BTreeMap<_, _> = fixture
+        .files
+        .keys()
+        .chain(case.files.keys())
+        .map(|name| {
+            let path = root.join(name);
+            let hash = zapret_core::sha256_file(&path).unwrap();
+            (path, hash)
+        })
+        .collect();
+    let mut pinned = digests
+        .iter()
+        .map(|(path, hash)| (path.clone(), hash.as_str()))
+        .collect();
+    let settings = Settings {
+        values: case.settings.clone(),
+    };
+    let options = ComposeOptions {
+        persistence: true,
+        ..case.options.clone()
+    };
+    let expected = compose(root, &settings, &options).unwrap();
+    assert_eq!(
+        zapret_core::compose_with_pinned_hashes(root, &settings, &options, &pinned).unwrap(),
+        expected
+    );
+    let missing = root.join("tools/upstream.txt");
+    pinned.remove(&missing).unwrap();
+    assert!(zapret_core::compose_with_pinned_hashes(root, &settings, &options, &pinned).is_err());
+    let bytes = fs::read(&missing).unwrap();
+    let mut changed = bytes;
+    changed[0] ^= 1;
+    fs::write(missing, changed).unwrap();
+    assert_ne!(compose(root, &settings, &options).unwrap(), expected);
+}
+
+#[test]
 fn selected_games_use_only_their_own_lists_on_game_ports() {
     let fixture = composition_fixture();
     let temp = tempfile::tempdir().unwrap();
@@ -229,6 +277,127 @@ fn selected_games_use_only_their_own_lists_on_game_ports() {
             .filter(|arg| arg.as_str() == "--ipset-ip=203.0.113.113/32")
             .count(),
         2
+    );
+}
+
+#[test]
+fn low_latency_profiles_only_capture_game_ports_for_enabled_transports() {
+    let pkg = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let mut settings = Settings::default();
+    settings.set("gametcp", "27015").unwrap();
+    settings.set("gameudp", "27016").unwrap();
+    for (id, profile_tcp, profile_udp) in [
+        ("31", true, true),
+        ("75", false, false),
+        ("76", true, false),
+    ] {
+        for (mode, mode_tcp, mode_udp) in [
+            ("off", false, false),
+            ("all", true, true),
+            ("selected", true, true),
+            ("tcp", true, false),
+            ("udp", false, true),
+        ] {
+            settings.set("game", mode).unwrap();
+            for no_auto in [true, false] {
+                let options = ComposeOptions {
+                    alt: Some(id.into()),
+                    no_auto,
+                    persistence: false,
+                    ..Default::default()
+                };
+                let args = compose(&pkg, &settings, &options).unwrap();
+                for (proto, port, active) in [
+                    ("tcp", 27015, profile_tcp && mode_tcp),
+                    ("udp", 27016, profile_udp && mode_udp),
+                ] {
+                    let key = format!("--wf-{proto}-out=");
+                    let ports = args.iter().find_map(|arg| arg.strip_prefix(&key)).unwrap();
+                    assert_eq!(
+                        zapret_core::port_in_list(port, ports),
+                        active,
+                        "{id}/{mode}/{no_auto}"
+                    );
+                    assert_eq!(args.contains(&format!("--new=game_{proto}")), active);
+                }
+                assert!(args.iter().any(|s| s == "--new=discord_voice"));
+                assert!(args.iter().any(|s| s == "--new=quic_ipset"));
+                assert!(!args.iter().any(|s| s == "--skip"));
+            }
+        }
+    }
+}
+
+#[test]
+fn native_rotation_skips_identical_slots_after_family_and_fallback_resolution() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    for dir in ["tools", "strategies", "windivert"] {
+        fs::create_dir(root.join(dir)).unwrap();
+    }
+    let manifest = include_str!("../../../tools/upstream.txt")
+        .lines()
+        .filter(|line| {
+            line.split_once('=').is_none_or(|(key, _)| {
+                !zapret_core::omits_engine_file(zapret_core::BUILTIN_RULES_SCHEMA, key)
+            })
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+        .replace("schema=1", "schema=3");
+    fs::write(root.join("tools/upstream.txt"), manifest).unwrap();
+    fs::write(root.join("windivert/quic_initial_ietf.txt"), "udp").unwrap();
+    for (id, pos) in [("11", 1), ("12", 1), ("32", 2)] {
+        let mut text = String::new();
+        for section in zapret_core::SECTIONS {
+            text.push_str(&format!("[{section}]\n"));
+            match (section, id) {
+                ("google", "11") => text.push_str("# match-l3: ipv4\n"),
+                ("google", "32") => text.push_str("# match-l3: ipv6\n"),
+                ("discord_media", "32") => {
+                    text.push_str("--lua-desync=user_hook\n");
+                    continue;
+                }
+                _ => {}
+            }
+            text.push_str(&format!("--lua-desync=multisplit:pos={pos}\n"));
+        }
+        if id == "12" {
+            text.push_str("[ipset_tcp]\n--lua-desync=multisplit:pos=1\n");
+        }
+        fs::write(root.join(format!("strategies/alt{id}.txt")), text).unwrap();
+    }
+    let mut settings = Settings::default();
+    settings.set("auto", "on").unwrap();
+    let args = compose(
+        root,
+        &settings,
+        &ComposeOptions {
+            alt: Some("11".into()),
+            persistence: false,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let slots = |start: &str| -> Vec<&str> {
+        let i = args.iter().position(|a| a == start).unwrap();
+        args[i + 1..]
+            .iter()
+            .take_while(|a| !a.starts_with("--new") && !a.starts_with("--template="))
+            .filter_map(|a| {
+                a.strip_prefix("--lua-desync=multisplit:pos=")
+                    .or_else(|| a.strip_prefix("--lua-desync=user_hook:"))
+            })
+            .collect()
+    };
+    let pair = ["1:strategy=1", "2:strategy=2"];
+    assert_eq!(slots("--template=tpl_general"), pair);
+    assert_eq!(slots("--new=tcp_ipset"), pair);
+    assert_eq!(slots("--new=google_ipv4"), ["1"]);
+    assert_eq!(slots("--new=google_ipv6"), pair);
+    assert_eq!(
+        slots("--new=discord_media"),
+        ["1:strategy=1", "1:strategy=2", "strategy=3"]
     );
 }
 

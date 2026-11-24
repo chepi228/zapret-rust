@@ -1,15 +1,21 @@
 //! Engine file metadata, access probes, path resolution and EXEDIR setup.
 use super::{
-    FileHandle, WinResult, executable_directory, metadata, open_file, path_input, realpath, utf16,
-    win32_ok,
+    FileHandle, WinResult, executable_directory, metadata, open_file, path_input, realpath,
+    unix_file_time, utf16, win32_ok,
 };
 use std::{
-    ffi::{CStr, c_char, c_int},
+    ffi::{CStr, c_char, c_int, c_void},
     ptr,
+    sync::OnceLock,
 };
+use windows_sys::Wdk::Storage::FileSystem::FILE_STAT_INFORMATION;
 use windows_sys::Win32::{
     Foundation::{ERROR_FILENAME_EXCED_RANGE, ERROR_INVALID_PARAMETER},
-    System::Environment::SetEnvironmentVariableW,
+    Storage::FileSystem::{FILE_ATTRIBUTE_REPARSE_POINT, FILE_READ_ATTRIBUTES},
+    System::{
+        Environment::SetEnvironmentVariableW,
+        LibraryLoader::{GetModuleHandleW, GetProcAddress},
+    },
 };
 
 #[repr(C)]
@@ -27,6 +33,59 @@ impl Stamp {
         size: 0,
     };
 }
+
+type QueryFileByName = unsafe extern "system" fn(*const u16, i32, *mut c_void, u32) -> i32;
+
+fn file_stamp(path: &[u16]) -> WinResult<Stamp> {
+    // Resolve once so older Windows versions can keep using the handle query.
+    static QUERY: OnceLock<Option<QueryFileByName>> = OnceLock::new();
+    let query = QUERY.get_or_init(|| unsafe {
+        let kernel = GetModuleHandleW(windows_sys::w!("kernel32.dll"));
+        if kernel.is_null() {
+            return None;
+        }
+        let query = GetProcAddress(kernel, c"GetFileInformationByName".as_ptr().cast())?;
+        Some(std::mem::transmute::<
+            unsafe extern "system" fn() -> isize,
+            QueryFileByName,
+        >(query))
+    });
+    if let Some(query) = query {
+        const FILE_STAT_BY_NAME_INFO: i32 = 0;
+        let mut info = FILE_STAT_INFORMATION::default();
+        let ok = unsafe {
+            query(
+                path.as_ptr(),
+                FILE_STAT_BY_NAME_INFO,
+                (&raw mut info).cast(),
+                size_of::<FILE_STAT_INFORMATION>() as u32,
+            )
+        };
+        // Follow the original path for reparse points, restricted access and
+        // filesystems that do not support this query. Never cache a list's stamp.
+        if ok != 0
+            && info.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT == 0
+            && info.EffectiveAccess & FILE_READ_ATTRIBUTES != 0
+            && info.EndOfFile >= 0
+        {
+            let (seconds, nanos) = unix_file_time(info.LastWriteTime);
+            return Ok(Stamp {
+                seconds,
+                nanoseconds: nanos as i32,
+                reserved: 0,
+                size: info.EndOfFile,
+            });
+        }
+    }
+    let data = metadata(path)?;
+    Ok(Stamp {
+        seconds: data.seconds,
+        nanoseconds: data.nanoseconds as i32,
+        reserved: 0,
+        size: data.size,
+    })
+}
+
 fn status(result: WinResult<()>) -> u32 {
     result.err().unwrap_or(0)
 }
@@ -46,15 +105,7 @@ unsafe extern "C" fn zapret_engine_file_stamp(filename: *const c_char, output: *
     if output.is_null() {
         return ERROR_INVALID_PARAMETER;
     }
-    let result = (|| {
-        let data = metadata(&path_input(filename)?)?;
-        Ok(Stamp {
-            seconds: data.seconds,
-            nanoseconds: data.nanoseconds as i32,
-            reserved: 0,
-            size: data.size,
-        })
-    })();
+    let result = path_input(filename).and_then(|path| file_stamp(&path));
     match result {
         Ok(stamp) => {
             unsafe { output.write(stamp) };
@@ -108,4 +159,45 @@ unsafe extern "C" fn zapret_engine_realpath(
         unsafe { ptr::copy_nonoverlapping(resolved.as_ptr().cast(), output, resolved.len()) };
         Ok(())
     })())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{
+        fs,
+        os::windows::{ffi::OsStrExt, fs::symlink_file},
+        path::Path,
+    };
+
+    fn check_stamp(path: &Path) {
+        let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+        let observed = file_stamp(&wide).map(|s| (s.size, s.seconds, s.nanoseconds));
+        let expected = metadata(&wide).map(|s| (s.size, s.seconds, s.nanoseconds as i32));
+        assert_eq!(observed, expected);
+    }
+
+    #[test]
+    fn stamps_follow_edits_links_and_replacement_at_the_same_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let list = dir.path().join("список.txt");
+        fs::write(&list, b"one").unwrap();
+        check_stamp(&list);
+        let hard = dir.path().join("hard.txt");
+        fs::hard_link(&list, &hard).unwrap();
+        fs::write(&hard, b"changed through another name").unwrap();
+        check_stamp(&list);
+        let link = dir.path().join("symbolic.txt");
+        match symlink_file(&list, &link) {
+            Ok(()) => check_stamp(&link),
+            Err(e) if e.raw_os_error() == Some(1314) => {}
+            Err(e) => panic!("symlink: {e}"),
+        }
+        fs::remove_file(&list).unwrap();
+        check_stamp(&list);
+        check_stamp(&link);
+        fs::write(&list, b"replacement").unwrap();
+        check_stamp(&list);
+        check_stamp(&hard);
+    }
 }

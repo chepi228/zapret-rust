@@ -11,7 +11,8 @@ pub struct Config {
     pub(crate) secret: [u8; 16],
     pub(crate) dc_ips: BTreeMap<u16, Ipv4Addr>,
     pub(crate) buffer_size: usize,
-    pub(crate) pool_size: usize,
+    pool_size: usize,
+    media_pool_size: usize,
     pub(crate) verbose: bool,
     pub(crate) cfproxy: bool,
     pub(crate) h2: bool,
@@ -102,12 +103,14 @@ impl Config {
         )?;
         let worker_domains =
             domain_aliases(value, &["cfproxy_worker_domains", "cfproxy_worker_domain"])?;
+        let pool_size = number(value, "pool_size", 4, 0, 32)?;
         Ok(Self {
             listen: SocketAddr::new(ip, port),
             secret,
             dc_ips,
             buffer_size: number(value, "buf_kb", 256, 16, 4096)? as usize * 1024,
-            pool_size: number(value, "pool_size", 4, 0, 32)? as usize,
+            pool_size: pool_size as usize,
+            media_pool_size: number(value, "media_pool_size", pool_size, 0, 32)? as usize,
             verbose: boolean(value, "verbose", false)?,
             cfproxy: boolean(value, "cfproxy", true)?,
             h2: boolean(value, "h2", true)?,
@@ -127,6 +130,14 @@ impl Config {
     }
     pub fn listener_addr(&self) -> SocketAddr {
         self.listen
+    }
+
+    pub(crate) fn pool_target(&self, media: bool) -> usize {
+        if media {
+            self.media_pool_size
+        } else {
+            self.pool_size
+        }
     }
 
     pub(crate) fn h2_enabled(&self) -> bool {
@@ -274,6 +285,20 @@ mod tests {
     }
 
     #[test]
+    fn media_pool_inherits_custom_limits_and_can_be_sized_independently() {
+        let mut value = valid();
+        value["pool_size"] = json!(1);
+        let inherited = Config::from_value(&value).unwrap();
+        assert_eq!(inherited.pool_target(true), 1);
+        value["media_pool_size"] = json!(8);
+        let separate = Config::from_value(&value).unwrap();
+        assert_eq!(
+            (separate.pool_target(false), separate.pool_target(true)),
+            (1, 8)
+        );
+    }
+
+    #[test]
     fn invalid_recognized_settings_are_rejected() {
         for (key, value) in [
             ("host", json!("0.0.0.0")),
@@ -282,6 +307,7 @@ mod tests {
             ("dc_ip", json!(["99:1.2.3.4"])),
             ("pool_size", json!(-1)),
             ("pool_size", json!(1000)),
+            ("media_pool_size", json!(33)),
             ("buf_kb", json!(0)),
             ("buf_kb", json!("256")),
             ("h2", json!("true")),

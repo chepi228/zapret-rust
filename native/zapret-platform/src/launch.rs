@@ -158,13 +158,13 @@ impl Recipe {
         for name in &catalog {
             let path = crate::storage::relative(root, name)
                 .with_context(|| format!("Invalid launch input: {name}"))?;
-            let bytes = pins.file(&path)?;
-            total += bytes.len() as u64;
+            let (sha256, length) = pins.file_hash(&path)?;
+            total += length;
             ensure!(total <= 64 * 1024 * 1024, "Launch inputs exceed 64 MiB");
             inputs.push(Input {
                 name: name.clone(),
-                sha256: hash(&bytes),
-                length: bytes.len() as u64,
+                sha256,
+                length,
             });
         }
         // Revalidate pinned upstream bytes after immutable leases close the capture race.
@@ -186,7 +186,14 @@ impl Recipe {
         // prevent a write or rename between integrity validation and execution.
         zapret_core::verify_ring(root)?;
         // Composition is evaluated from bytes leased against writes and rename.
-        let controller_hash = crate::storage::file_hash(controller)?;
+        let pinned: BTreeMap<_, _> = inputs
+            .iter()
+            .map(|input| (root.join(&input.name), input.sha256.as_str()))
+            .collect();
+        let controller_hash = match pinned.get(controller) {
+            Some(digest) => (*digest).to_owned(),
+            None => crate::storage::file_hash(controller)?,
+        };
         let options = ComposeOptions {
             network_key,
             native_identity: Some(controller_hash.clone()),
@@ -194,7 +201,7 @@ impl Recipe {
         };
         let args = zapret_core::checked_command_line(
             root,
-            &zapret_core::compose(root, settings, &options)?,
+            &zapret_core::compose_with_pinned_hashes(root, settings, &options, &pinned)?,
         )?;
         let static_inputs = inputs
             .iter()

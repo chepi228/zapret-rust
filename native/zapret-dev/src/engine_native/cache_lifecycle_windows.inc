@@ -6,11 +6,8 @@ static uintptr_t cache_native(uint32_t op,uintptr_t a,uintptr_t b,uintptr_t c,ui
 {
     switch(op){
     case 1:return (uintptr_t)boottime();
-    case 2:return (uintptr_t)zapret_hostfail_after((hostfail_index *)a,(uint64_t *)b);
-    case 3:return zapret_hostfail_expired((hostfail_pool *)a,(time_t)b);
     case 4:zapret_hostfail_remove((hostfail_index **)a,(hostfail_pool *)b);return 0;
     case 5:return (uintptr_t)zapret_ipcache_after((ip_cache4 *)a,(uint64_t *)b,NULL,NULL);
-    case 6:return zapret_ipcache_expired((ip_cache_item *)a,(time_t)b,(time_t)c);
     case 7:zapret_ipcache_remove((ip_cache4 **)a,(ip_cache_item *)b);return 0;
     case 8:return (uintptr_t)((ip_cache_item *)a)->hostname;
     case 9:free((void *)a);return 0;
@@ -18,6 +15,8 @@ static uintptr_t cache_native(uint32_t op,uintptr_t a,uintptr_t b,uintptr_t c,ui
     case 11:return (uintptr_t)zapret_ipcache_add((ip_cache4 **)a,(const unsigned char *)b,(size_t)c,(const char *)d,(time_t)e);
     case 12:zapret_ipcache_touch((ip_cache_item *)a,(time_t)b);return 0;
     case 13:return zapret_cache_purge_due((time_t)a,(time_t)b);
+    case 14:return (uintptr_t)zapret_hostfail_next_expired((hostfail_index *)a,(uint64_t *)b,(time_t)c);
+    case 15:return (uintptr_t)zapret_ipcache_next_expired((ip_cache4 *)a,(uint64_t *)b,(time_t)c,(time_t)d);
     default:return 0;
     }
 }

@@ -23,13 +23,17 @@ unsafe extern "C-unwind" {
 }
 
 unsafe extern "C" {
+    fn zapret_trial_starting();
     fn zapret_lua_vm_request_quit();
 }
 /// # Safety
 /// The Windows CRT supplies the UTF-16 argument vector.
 #[unsafe(no_mangle)]
 pub unsafe extern "C-unwind" fn wmain(argc: c_int, argv: *const *const u16) -> c_int {
-    unsafe { zapret_native_start(argc, argv, zapret_engine_main) }
+    unsafe {
+        zapret_trial_starting();
+        zapret_native_start(argc, argv, zapret_engine_main)
+    }
 }
 
 unsafe extern "C" fn service_quit() {

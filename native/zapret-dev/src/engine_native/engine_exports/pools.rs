@@ -87,17 +87,21 @@ unsafe extern "C" {
 
     fn zapret_hostfail_add(pool: Head, name: *const c_char, timeout: c_int, now: i64) -> Record;
     fn zapret_hostfail_find(pool: *const c_void, name: *const c_char) -> Record;
-    fn zapret_hostfail_after(pool: *const c_void, cursor: *mut u64) -> Record;
+    fn zapret_hostfail_next_expired(pool: *const c_void, cursor: *mut u64, now: i64) -> Record;
     fn zapret_hostfail_remove(pool: Head, entry: *const c_void);
     fn zapret_hostfail_destroy(pool: Head);
-    fn zapret_hostfail_expired(entry: *const c_void, now: i64) -> c_int;
     fn zapret_ipcache_after(
         pool: *const c_void,
         cursor: *mut u64,
         address: *mut u8,
         interface: *mut u8,
     ) -> Record;
-    fn zapret_ipcache_expired(entry: *const c_void, lifetime: i64, now: i64) -> c_int;
+    fn zapret_ipcache_next_expired(
+        pool: *const c_void,
+        cursor: *mut u64,
+        lifetime: i64,
+        now: i64,
+    ) -> Record;
     fn zapret_ipcache_remove(pool: Head, entry: *const c_void);
     fn zapret_ipcache_find(
         pool: *const c_void,
@@ -382,8 +386,6 @@ unsafe extern "C" fn cache_native(
     unsafe {
         match op {
             1 => boottime() as usize,
-            2 => zapret_hostfail_after(a as *const c_void, b as *mut u64) as usize,
-            3 => zapret_hostfail_expired(a as *const c_void, b as i64) as usize,
             4 => {
                 zapret_hostfail_remove(a as Head, b as *const c_void);
                 0
@@ -394,7 +396,6 @@ unsafe extern "C" fn cache_native(
                 ptr::null_mut(),
                 ptr::null_mut(),
             ) as usize,
-            6 => zapret_ipcache_expired(a as *const c_void, b as i64, c as i64) as usize,
             7 => {
                 zapret_ipcache_remove(a as Head, b as *const c_void);
                 0
@@ -413,6 +414,13 @@ unsafe extern "C" fn cache_native(
                 0
             }
             13 => zapret_cache_purge_due(a as i64, b as i64) as usize,
+            14 => {
+                zapret_hostfail_next_expired(a as *const c_void, b as *mut u64, c as i64) as usize
+            }
+            15 => {
+                zapret_ipcache_next_expired(a as *const c_void, b as *mut u64, c as i64, d as i64)
+                    as usize
+            }
             _ => 0,
         }
     }

@@ -342,8 +342,8 @@ pub(crate) fn run(archive: &Path, output: &Path) -> Result<()> {
         let strategies = runner.json(&["strategies"])?;
         let strategies = strategies.as_array().context("strategy array")?;
         evidence.check(
-            strategies.len() == 36,
-            "all 36 bundled strategy records are available",
+            strategies.len() == 34,
+            "all 34 bundled strategy records are available",
         )?;
         fs::write(
             root.join("lists/autohostlist.txt"),

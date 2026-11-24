@@ -1,12 +1,14 @@
 use crate::{
-    Coverage, Settings, Strategy, TestRank, capture_exclusion, find_strategy, list_strategies,
-    read_cover, read_rank, read_text, ring_composition_key, rotation_order, sha256,
-    test_result_context, valid_port_list,
+    Coverage, Settings, Strategy, TestRank, capture_exclusion,
+    context::{InputHashes, rank_context, ring_key},
+    find_strategy, list_strategies,
+    ranking::{read_rank_cover, read_rank_for_network, rotation_order_refs},
+    read_text, sha256, valid_port_list,
 };
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
 };
 
@@ -40,7 +42,19 @@ impl Default for ComposeOptions {
     }
 }
 
-pub fn ring_state_name(section: &str, ring: &[Strategy], composition_key: &str) -> Result<String> {
+pub fn ring_state_name<'a>(
+    section: &str,
+    ring: impl IntoIterator<Item = &'a Strategy>,
+    composition_key: &str,
+) -> Result<String> {
+    state_name(section, ring, composition_key, &mut InputHashes::live())
+}
+fn state_name<'a>(
+    section: &str,
+    ring: impl IntoIterator<Item = &'a Strategy>,
+    composition_key: &str,
+    hashes: &mut InputHashes<'_>,
+) -> Result<String> {
     ensure!(
         crate::io::hex(composition_key, 64),
         "Unconfirmed rotation composition"
@@ -54,7 +68,7 @@ pub fn ring_state_name(section: &str, ring: &[Strategy], composition_key: &str) 
     );
     let mut parts = Vec::new();
     for s in ring {
-        parts.push(format!("{}:{}:{}", s.id, s.name, s.fingerprint()?));
+        parts.push(format!("{}:{}:{}", s.id, s.name, hashes.get(&s.file)?));
     }
     let hash = sha256(format!("{composition_key}|{}", parts.join(",")).as_bytes());
     Ok(format!(
@@ -67,17 +81,19 @@ pub fn ring_state_name(section: &str, ring: &[Strategy], composition_key: &str) 
 struct Composer<'a> {
     root: &'a Path,
     options: &'a ComposeOptions,
-    strategies: Vec<Strategy>,
-    primary: Strategy,
+    strategies: &'a [Strategy],
+    primary: &'a Strategy,
     auto: bool,
+    builtin: bool,
     rank: Option<TestRank>,
     cover: Option<Coverage>,
     composition_key: String,
+    hashes: InputHashes<'a>,
     args: Vec<String>,
     first: bool,
     templates: BTreeMap<String, String>,
 }
-impl Composer<'_> {
+impl<'a> Composer<'a> {
     fn path(&self, rel: &str) -> String {
         self.root
             .join(rel.replace('/', std::path::MAIN_SEPARATOR_STR))
@@ -90,17 +106,21 @@ impl Composer<'_> {
             .map(|p| format!("{option}{}", self.path(p)))
             .collect()
     }
-    fn ring(&self, section: &str, circular: bool) -> Vec<Strategy> {
+    fn ring(&self, section: &str, circular: bool) -> Vec<&'a Strategy> {
         if circular && self.auto {
-            rotation_order(
-                &self.strategies,
+            let mut order = rotation_order_refs(
+                self.strategies,
                 &self.primary.id,
                 section,
                 self.rank.as_ref(),
                 self.cover.as_ref(),
-            )
+            );
+            if section == "game_tcp" {
+                order.retain(|s| !s.skips_game_section(section));
+            }
+            order
         } else {
-            vec![self.primary.clone()]
+            vec![self.primary]
         }
     }
     fn profile_raw(&mut self, name: &str, filters: &[String]) {
@@ -147,12 +167,12 @@ impl Composer<'_> {
                         let mut f = filters.clone();
                         f.push(format!("--filter-l3={family}"));
                         self.profile_raw(&format!("{name}_{family}"), &f);
-                        self.section(section, circular, learn, fallback, family)?;
+                        self.section(section, &ring, learn, fallback, family)?;
                     }
                 }
             } else {
                 self.profile_raw(name, &filters);
-                self.section(section, circular, learn, fallback, "")?;
+                self.section(section, &ring, learn, fallback, "")?;
             }
         } else {
             self.profile_raw(name, &filters);
@@ -162,18 +182,27 @@ impl Composer<'_> {
     fn section(
         &mut self,
         name: &str,
-        circular: bool,
+        order: &[&Strategy],
         learn: bool,
         fallback: &str,
         family: &str,
     ) -> Result<()> {
-        let ring: Vec<_> = self
-            .ring(name, circular)
-            .into_iter()
+        let mut ring: Vec<_> = order
+            .iter()
+            .copied()
             .filter(|s| {
                 family.is_empty() || ["any", family].contains(&s.section_family(name, fallback))
             })
             .collect();
+        if self.builtin
+            && ring.len() > 1
+            && ring
+                .iter()
+                .all(|s| repeatable_builtin_section(s.section(name, fallback)))
+        {
+            let mut seen = BTreeSet::new();
+            ring.retain(|s| seen.insert(s.section(name, fallback)));
+        }
         if ring.is_empty() {
             return Ok(());
         }
@@ -203,7 +232,12 @@ impl Composer<'_> {
             let state = if learn && self.options.persistence {
                 format!(
                     ":context=network-context.txt:state={}",
-                    ring_state_name(&memory_name, &ring, &self.composition_key)?
+                    state_name(
+                        &memory_name,
+                        ring.iter().copied(),
+                        &self.composition_key,
+                        &mut self.hashes
+                    )?
                 )
             } else {
                 String::new()
@@ -248,22 +282,93 @@ impl Composer<'_> {
     }
 }
 
+// Custom Lua, hooks and options with per-slot state must retain their original slots.
+fn repeatable_builtin_section(lines: &[String]) -> bool {
+    lines.iter().all(|line| {
+        let Some((option, value)) = line.split_once('=') else {
+            return false;
+        };
+        match option {
+            "--payload" | "--in-range" | "--out-range" => true,
+            "--lua-desync" => {
+                let mut fields = value.split(':');
+                matches!(
+                    fields.next(),
+                    Some(
+                        "fake"
+                            | "multisplit"
+                            | "multidisorder"
+                            | "hostfakesplit"
+                            | "hostfakesplit_alt"
+                            | "fakedsplit"
+                            | "fakeddisorder"
+                            | "syndata"
+                    )
+                ) && fields.all(|field| {
+                    matches!(
+                        field.split('=').next(),
+                        Some(
+                            "blob"
+                                | "fool"
+                                | "host"
+                                | "ip_id"
+                                | "ip_autottl"
+                                | "ip6_autottl"
+                                | "payload"
+                                | "pos"
+                                | "repeats"
+                                | "seqovl"
+                                | "seqovl_pattern"
+                                | "tcp_md5"
+                                | "tcp_ts"
+                                | "tcp_ts_up"
+                                | "tls_mod"
+                        )
+                    )
+                })
+            }
+            _ => false,
+        }
+    })
+}
+
 /// Compose engine arguments without writing runtime state or starting any process.
 pub fn compose(root: &Path, settings: &Settings, options: &ComposeOptions) -> Result<Vec<String>> {
+    compose_from_inputs(root, settings, options, InputHashes::live())
+}
+
+/// Use SHA-256 values from the launcher's open, write-denying file handles.
+/// Keys are full package paths. The caller keeps those handles until launch completes.
+pub fn compose_with_pinned_hashes(
+    root: &Path,
+    settings: &Settings,
+    options: &ComposeOptions,
+    pinned: &BTreeMap<PathBuf, &str>,
+) -> Result<Vec<String>> {
+    compose_from_inputs(root, settings, options, InputHashes::Pinned(pinned))
+}
+
+fn compose_from_inputs(
+    root: &Path,
+    settings: &Settings,
+    options: &ComposeOptions,
+    mut hashes: InputHashes<'_>,
+) -> Result<Vec<String>> {
     let auto = settings.get("auto").eq_ignore_ascii_case("on") && !options.no_auto;
     let alt = options
         .alt
         .as_deref()
         .filter(|s| !s.is_empty())
         .unwrap_or(settings.get("alt"));
-    let (strategies, primary) = if auto {
-        let strategies = list_strategies(root)?;
-        let primary = strategies.iter().find(|s| s.id == alt).cloned();
-        (strategies, primary)
+    let strategies = if auto {
+        list_strategies(root)?
     } else {
-        (Vec::new(), find_strategy(root, alt)?)
+        find_strategy(root, alt)?.into_iter().collect()
     };
-    let primary = primary.with_context(|| format!("Стратегия ALT{alt} не найдена"))?;
+    let primary = strategies
+        .iter()
+        .find(|s| s.id == alt)
+        .with_context(|| format!("Стратегия ALT{alt} не найдена"))?;
     ensure!(
         primary.is_valid(),
         "В {} нет секций: {}",
@@ -291,43 +396,45 @@ pub fn compose(root: &Path, settings: &Settings, options: &ComposeOptions) -> Re
         composition_settings
             .values
             .insert("ipset".into(), mode_raw.into());
-        if let Some(identity) = options.native_identity.as_deref() {
-            crate::ring_composition_key_with_identity(root, &composition_settings, identity)?
-        } else {
-            ring_composition_key(root, &composition_settings)?
-        }
+        ring_key(
+            root,
+            &composition_settings,
+            options.native_identity.as_deref(),
+            &mut hashes,
+        )?
     } else {
         String::new()
     };
-    let context = if auto && root.join("runtime/test-rank.txt").exists() {
-        options.network_key.as_deref().and_then(|key| {
-            if let Some(identity) = options.native_identity.as_deref() {
-                crate::test_result_context_with_identity(root, settings, key, identity).ok()
-            } else {
-                test_result_context(root, settings, key).ok()
-            }
-        })
+    let rank = if let Some(key) = options.network_key.as_deref().filter(|_| auto) {
+        read_rank_for_network(root, key, &strategies, || {
+            rank_context(
+                root,
+                settings,
+                key,
+                options.native_identity.as_deref(),
+                &mut hashes,
+            )
+            .ok()
+        })?
     } else {
         None
     };
-    let rank = if auto {
-        read_rank(root, context.as_ref(), &strategies)?
-    } else {
-        None
+    let cover = match rank.as_ref().and_then(|r| r.context.as_ref()) {
+        Some(context) => read_rank_cover(root, context)?,
+        None => None,
     };
-    let cover = match (&rank, &context) {
-        (Some(rank), Some(context)) => read_cover(root, rank, context)?,
-        _ => None,
-    };
+    let builtin = crate::uses_builtin_rules(root);
     let mut c = Composer {
         root,
         options,
-        strategies,
+        strategies: &strategies,
         primary,
         auto,
+        builtin,
         rank,
         cover,
         composition_key,
+        hashes,
         args: Vec::new(),
         first: true,
         templates: BTreeMap::new(),
@@ -341,41 +448,53 @@ pub fn compose(root: &Path, settings: &Settings, options: &ComposeOptions) -> Re
     let autolist = settings.get("autolist").eq_ignore_ascii_case("on");
     let game = settings.get("game").to_ascii_lowercase();
     let selected = game == "selected";
-    let game_tcp = selected || ["all", "tcp"].contains(&game.as_str());
-    let game_udp = selected || ["all", "udp"].contains(&game.as_str());
+    let game_protocols = c.primary.game_protocols(&game);
     if autolist {
         c.args.push(format!(
             "--hostlist-auto-debug={}",
             c.path("runtime/autohostlist-debug.log")
         ));
     }
-    c.args.push(format!(
-        "--wf-tcp-out=80,443,{DISCORD_TCP}{}",
-        if game_tcp {
-            format!(",{}", settings.get("gametcp"))
-        } else {
-            String::new()
-        }
-    ));
-    c.args.push(format!(
-        "--wf-udp-out={DISCORD_UDP}{}",
-        if game_udp {
-            format!(",{}", settings.get("gameudp"))
-        } else {
-            String::new()
-        }
-    ));
-    c.args.push(format!(
-        "--wf-raw-part=@{}",
-        c.path("windivert/quic_initial_ietf.txt")
-    ));
+    let web_tcp = format!("80,443,{DISCORD_TCP}");
+    for (protocol, ports, extra) in [
+        (
+            "tcp",
+            web_tcp.as_str(),
+            game_protocols.tcp.then(|| settings.get("gametcp")),
+        ),
+        (
+            "udp",
+            DISCORD_UDP,
+            game_protocols.udp.then(|| settings.get("gameudp")),
+        ),
+    ] {
+        let ports = match extra {
+            Some(extra) if builtin => crate::capture::merged_ports(ports, extra)?,
+            Some(extra) => format!("{ports},{extra}"),
+            None => ports.to_owned(),
+        };
+        c.args.push(format!("--wf-{protocol}-out={ports}"));
+    }
+    let quic = "windivert/quic_initial_ietf.txt";
+    if builtin {
+        // Both QUIC profiles match UDP/443. Voice and game ports have independent selectors.
+        let predicate = read_text(&root.join(quic), 65535)?;
+        let predicate = predicate
+            .split_ascii_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        c.args
+            .push(format!("--wf-raw-part=udp.DstPort==443 and ({predicate})"));
+    } else {
+        c.args.push(format!("--wf-raw-part=@{}", c.path(quic)));
+    }
     let capture = read_text(&root.join("lists/ipset-taketwo.txt"), 8192)
         .ok()
         .and_then(|text| capture_exclusion(&text.lines().map(str::to_owned).collect::<Vec<_>>()));
     if let Some(capture) = &capture {
         c.args.push(format!("--wf-raw-filter={}", capture.filter));
     }
-    if crate::uses_builtin_rules(root) {
+    if builtin {
         c.args.push("--builtin-rules".into());
     } else {
         c.args
@@ -456,13 +575,13 @@ pub fn compose(root: &Path, settings: &Settings, options: &ComposeOptions) -> Re
                 let template = format!("tpl_general_{family}");
                 c.templates.insert(family.into(), template.clone());
                 c.args.push(format!("--template={template}"));
-                c.section("general", true, true, "", family)?;
+                c.section("general", &general_ring, true, "", family)?;
                 c.args.push("--new".into());
             }
         }
     } else {
         c.args.push("--template=tpl_general".into());
-        c.section("general", true, true, "", "")?;
+        c.section("general", &general_ring, true, "", "")?;
         c.args.push("--new".into());
     }
     let filters = |initial: Vec<String>, sets: &[&Vec<String>]| -> Vec<String> {
@@ -552,7 +671,7 @@ pub fn compose(root: &Path, settings: &Settings, options: &ComposeOptions) -> Re
         f.push("--import=tpl_general".into());
         c.profile("autolist", f, None)?;
     }
-    if game_tcp {
+    if game_protocols.tcp {
         c.profile(
             "game_tcp",
             filters(
@@ -562,7 +681,7 @@ pub fn compose(root: &Path, settings: &Settings, options: &ComposeOptions) -> Re
             Some(("game_tcp", true, false, "")),
         )?;
     }
-    if game_udp {
+    if game_protocols.udp {
         c.profile(
             "game_udp",
             filters(

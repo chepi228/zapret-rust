@@ -423,8 +423,8 @@ cargo zapret build --install
 cargo zapret check-install
 cargo zapret build-ring --native-windows
 cargo zapret package --skip-compile --candidate dist/native/native-engine-candidate
-cargo zapret check-package dist\zapret-rust-native-v1.1.zip --output dist\native\smoke.json
-cargo zapret check-menu dist\zapret-rust-native-v1.1.zip --output dist\native\menu.json
+cargo zapret check-package dist\zapret-rust-native-v1.2.zip --output dist\native\smoke.json
+cargo zapret check-menu dist\zapret-rust-native-v1.2.zip --output dist\native\menu.json
 cargo zapret check-probe bin\zapret-rust.exe --subcommand probe --output dist\native\probe.json
 ```
 
@@ -527,8 +527,11 @@ selection, history, rankings and coverage; other confirmed trials remain usable.
 The report retains all observations and explains exclusions. The chosen final
 combination must still pass replay, including ordinary sites, before publication.
 Accepted ranks and coverage retain the legacy scoped text formats and matching
-RunId. All 36 profiles are available in manual selection and the full test;
-the quick test retains its smaller candidate pool.
+RunId. Manual selection and the full test include all 34 profiles. The quick
+test uses a smaller candidate pool. A standalone `--skip` in `[game_tcp]` or
+`[game_udp]` excludes that section and its additional capture ports when the
+profile is primary, including during automatic rotation. Web and voice ports
+remain available.
 
 `test --compare-a 12 --compare-b 13` collects endpoint calibration plus balanced
 ABBA/BAAB blocks. `finalists-native-v1` uses shared QPC target clocks, per-target

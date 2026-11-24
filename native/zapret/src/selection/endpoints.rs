@@ -121,6 +121,35 @@ fn comparisons<'a>(targets: &'a [Target], expected: &[Row], actual: &[Row]) -> V
         .collect()
 }
 
+pub(super) fn validate_final(
+    targets: &[Target],
+    expected: &[Row],
+    actual: &[Row],
+    probe: impl FnMut(&[Target], bool) -> Result<Vec<Row>>,
+) -> Result<crate::selection_decision::Check> {
+    // CDN peer replays cannot change a clean-site veto. Retain the observations
+    // for all sites, but only attribute a failure to a site we have established.
+    let controls = expected
+        .iter()
+        .filter(|row| row.group == "Clean" && row.state == "OK");
+    let veto = if controls.clone().next().is_some() {
+        super::final_check(controls, actual).err()
+    } else {
+        None
+    };
+    let (error, details) = if let Some(error) = veto {
+        (Some(error), probe_details(actual))
+    } else {
+        let (compared, details) = compare_final(targets, expected, actual, probe)?;
+        (super::final_check(expected, &compared).err(), details)
+    };
+    Ok(crate::selection_decision::Check {
+        confirmed: error.is_none(),
+        error: error.map(|e| format!("{e:#}")),
+        details,
+    })
+}
+
 /// Reproduce all earlier successes on their peers under the candidate. Also require
 /// two failures on the newly selected peer under the original working command.
 pub(super) fn compare_final(

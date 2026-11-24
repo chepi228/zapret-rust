@@ -1959,7 +1959,7 @@ dependencies = [
 
 [[package]]
 name = "telegram-core"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "aes",
  "anyhow",
@@ -2532,7 +2532,7 @@ dependencies = [
 
 [[package]]
 name = "zapret"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2557,7 +2557,7 @@ dependencies = [
 
 [[package]]
 name = "zapret-core"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "anyhow",
  "flate2",
@@ -2572,7 +2572,7 @@ dependencies = [
 
 [[package]]
 name = "zapret-dev"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -2594,7 +2594,7 @@ dependencies = [
 
 [[package]]
 name = "zapret-net"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "anyhow",
  "futures-util",
@@ -2623,7 +2623,7 @@ dependencies = [
 
 [[package]]
 name = "zapret-platform"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "anyhow",
  "roxmltree",
@@ -2638,18 +2638,18 @@ dependencies = [
 
 [[package]]
 name = "zapret-ring"
-version = "1.1.0"
+version = "1.2.0"
 
 [[package]]
 name = "zapret-ring-ffi"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "zapret-ring",
 ]
 
 [[package]]
 name = "zapret-wincompat"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -2670,7 +2670,7 @@ dependencies = [
 
 [[package]]
 name = "zapret-worker"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "anyhow",
  "serde_json",

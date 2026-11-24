@@ -123,26 +123,34 @@ pub fn read_text(path: &Path, max_bytes: u64) -> Result<String> {
             .collect();
         return String::from_utf16(&units).context("Invalid UTF-16 text");
     }
-    Ok(String::from_utf8(bytes)?
-        .trim_start_matches('\u{feff}')
-        .to_owned())
+    let mut text = String::from_utf8(bytes)?;
+    let prefix = text.len() - text.trim_start_matches('\u{feff}').len();
+    if prefix != 0 {
+        text.drain(..prefix);
+    }
+    Ok(text)
 }
 
 pub fn sha256(bytes: &[u8]) -> String {
     format!("{:X}", Sha256::digest(bytes))
 }
 pub fn sha256_file(path: &Path) -> Result<String> {
-    let mut file = File::open(path)?;
+    sha256_reader(File::open(path)?).map(|(digest, _)| digest)
+}
+/// Hash the bytes from the supplied handle and report how many were consumed.
+pub fn sha256_reader(mut reader: impl Read) -> Result<(String, u64)> {
     let mut sha = Sha256::new();
     let mut block = [0u8; 65536];
+    let mut length = 0;
     loop {
-        let n = file.read(&mut block)?;
+        let n = reader.read(&mut block)?;
         if n == 0 {
             break;
         }
         sha.update(&block[..n]);
+        length += n as u64;
     }
-    Ok(format!("{:X}", sha.finalize()))
+    Ok((format!("{:X}", sha.finalize()), length))
 }
 pub(crate) fn hex(text: &str, len: usize) -> bool {
     text.len() == len && text.bytes().all(|b| b.is_ascii_hexdigit())

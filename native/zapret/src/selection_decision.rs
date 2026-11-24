@@ -1,5 +1,5 @@
 //! A measured winner is recommended only after its working configuration passes.
-use crate::selection_latency;
+use crate::selection_latency::{self, Panel};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -13,32 +13,35 @@ pub struct Check {
     pub details: Vec<Value>,
 }
 
+#[derive(Default)]
 pub struct Decision {
     pub recommended: Option<RankRow>,
     pub checks: BTreeMap<String, Check>,
     pub preference: Option<crate::selection_latency::Preference>,
+    pub repeat_candidates: Vec<String>,
 }
 
 const QUICK_FINALISTS: usize = 3;
+const MAX_REVERSED_PAIRS: usize = 2;
 
 pub fn verified_preferred(
     rows: &[RankRow],
     full: bool,
     details: &BTreeMap<String, Vec<Value>>,
+    panel: Panel,
     mut validate: impl FnMut(&str) -> Result<Check>,
 ) -> Result<Decision> {
-    let mut decision = Decision {
-        recommended: None,
-        checks: BTreeMap::new(),
-        preference: None,
-    };
+    if panel == Panel::Services {
+        return verified_services(rows, full, details, validate);
+    }
+    let mut decision = Decision::default();
     let Some(leader) = rows.first() else {
         return Ok(decision);
     };
     let mut peers: Vec<_> = rows
         .iter()
         .skip(1)
-        .filter(|row| selection_latency::eligible(leader, row))
+        .filter(|row| selection_latency::eligible(leader, row, panel))
         .map(|row| {
             let ms = details
                 .get(&row.id)
@@ -59,13 +62,13 @@ pub fn verified_preferred(
         if decision.checks.contains_key(&row.id) {
             continue;
         }
-        if decision.recommended.is_some() && !selection_latency::eligible(leader, row) {
+        if decision.recommended.is_some() && !selection_latency::eligible(leader, row, panel) {
             continue;
         }
         let mut preference = decision
             .recommended
             .as_ref()
-            .and_then(|winner| selection_latency::preference(winner, row, details));
+            .and_then(|winner| selection_latency::preference(winner, row, details, panel));
         if decision.recommended.is_some() && preference.is_none() {
             continue;
         }
@@ -73,12 +76,13 @@ pub fn verified_preferred(
         if check.confirmed {
             if let Some(speed) = &mut preference {
                 let baseline = &decision.checks[&speed.reference].details;
-                speed.working = selection_latency::confirm(speed, baseline, &check.details);
+                speed.working =
+                    selection_latency::confirm(speed, baseline, &check.details, panel, None);
                 speed.confirmed = speed
                     .working
                     .as_ref()
                     .is_some_and(|working| working.faster())
-                    && selection_latency::preserves_services(baseline, &check.details);
+                    && selection_latency::preserves_services(baseline, &check.details, panel);
                 if speed.confirmed {
                     decision.recommended = Some(row.clone());
                 }
@@ -94,15 +98,203 @@ pub fn verified_preferred(
     }
     Ok(decision)
 }
+/// Use the first healthy working configuration as a fixed reference for every challenger.
+fn verified_services(
+    rows: &[RankRow],
+    full: bool,
+    details: &BTreeMap<String, Vec<Value>>,
+    mut validate: impl FnMut(&str) -> Result<Check>,
+) -> Result<Decision> {
+    let mut decision = Decision::default();
+    let limit = if full { usize::MAX } else { QUICK_FINALISTS };
+    let mut reference = None;
+    for row in rows
+        .iter()
+        .filter(|row| selection_latency::service_ready(row, details))
+        .take(limit)
+    {
+        let check = validate(&row.id)?;
+        let passed = check.confirmed;
+        decision.checks.insert(row.id.clone(), check);
+        if passed {
+            reference = Some(row);
+            break;
+        }
+    }
+    let Some(reference) = reference else {
+        return Ok(decision);
+    };
+    decision.recommended = Some(reference.clone());
+    let mut peers: Vec<_> = rows
+        .iter()
+        .filter(|row| !decision.checks.contains_key(&row.id))
+        .filter_map(|row| selection_latency::preference(reference, row, details, Panel::Services))
+        .filter(|speed| speed.trial.promising())
+        .collect();
+    peers.sort_by(|a, b| a.trial.screening_order(&b.trial));
+    let mut finalists = Vec::new();
+    for mut speed in peers.into_iter().take(limit - decision.checks.len()) {
+        let check = validate(&speed.candidate)?;
+        let before = &decision.checks[&reference.id].details;
+        if check.confirmed
+            && selection_latency::preserves_services(before, &check.details, Panel::Services)
+        {
+            speed.working =
+                selection_latency::confirm(&speed, before, &check.details, Panel::Services, None);
+        }
+        decision.checks.insert(speed.candidate.clone(), check);
+        if let Some(working) = speed.working.as_ref().filter(|pair| pair.faster()) {
+            finalists.push((working.gain_ms, speed));
+        } else if decision.preference.is_none() {
+            decision.preference = Some(speed);
+        }
+    }
+    finalists.sort_by(|a, b| b.0.total_cmp(&a.0));
+    // Preserve the original reference for the endpoint check of every reversed pair.
+    let mut latest_reference = None;
+    let mut recheck_fallback = false;
+    for (_, mut speed) in finalists.into_iter().take(MAX_REVERSED_PAIRS) {
+        let candidate_repeat = validate(&speed.candidate)?;
+        recheck_fallback = !candidate_repeat.confirmed;
+        if candidate_repeat.confirmed {
+            let reference_repeat = validate(&reference.id)?;
+            if reference_repeat.confirmed
+                && selection_latency::preserves_services(
+                    &reference_repeat.details,
+                    &candidate_repeat.details,
+                    Panel::Services,
+                )
+            {
+                speed.repeat = selection_latency::confirm(
+                    &speed,
+                    &reference_repeat.details,
+                    &candidate_repeat.details,
+                    Panel::Services,
+                    Some((
+                        &decision.checks[&reference.id].details,
+                        &decision.checks[&speed.candidate].details,
+                    )),
+                );
+                speed.confirmed = speed.repeat.as_ref().is_some_and(|pair| pair.faster());
+            }
+            latest_reference = Some(reference_repeat);
+        }
+        let confirmed = speed.confirmed;
+        decision
+            .checks
+            .insert(speed.candidate.clone(), candidate_repeat);
+        decision.repeat_candidates.push(speed.candidate.clone());
+        if confirmed || decision.repeat_candidates.len() == 1 {
+            decision.preference = Some(speed);
+        }
+        if confirmed
+            || latest_reference
+                .as_ref()
+                .is_some_and(|check| !check.confirmed)
+        {
+            break;
+        }
+    }
+    if recheck_fallback {
+        latest_reference = Some(validate(&reference.id)?);
+    }
+    if let Some(latest) = latest_reference {
+        decision.checks.insert(reference.id.clone(), latest);
+    }
+    decision.recommended =
+        if let Some(speed) = decision.preference.as_ref().filter(|p| p.confirmed) {
+            rows.iter().find(|r| r.id == speed.candidate)
+        } else if decision.checks[&reference.id].confirmed {
+            Some(reference)
+        } else {
+            rows.iter().find(|r| {
+                decision
+                    .checks
+                    .get(&r.id)
+                    .is_some_and(|check| check.confirmed)
+            })
+        }
+        .cloned();
+    Ok(decision)
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+    fn verified_preferred(
+        rows: &[RankRow],
+        full: bool,
+        details: &BTreeMap<String, Vec<Value>>,
+        validate: impl FnMut(&str) -> Result<Check>,
+    ) -> Result<Decision> {
+        super::verified_preferred(
+            rows,
+            full,
+            details,
+            Panel::for_trials(rows, details),
+            validate,
+        )
+    }
     fn sample(tls: f64) -> Vec<Value> {
         (0..6).map(|n|json!({"group":"NBA2K","name":format!("s{n}"),"url":format!("https://s{n}.test/"),"remote_address":"203.0.113.1:443",
             "state":"OK","certificate_validated":true,"flaky":false,"tries":1,"dns_ms":5.,"tcp_ms":35.,"tls_ms":tls+5.,
             "first_byte_ms":tls+15.,"total_ms":tls+35.,"code":"200","body_limit":65536,"body_bytes":1024,"post_bytes":0,"termination":"Complete"})).collect()
+    }
+
+    #[test]
+    fn fast_services_can_win_despite_synthetic_losses_only_after_reversed_confirmation() {
+        let observations = |tls, synthetic_ok: bool| {
+            let mut v = sample(tls);
+            for mut synthetic in sample(100.) {
+                synthetic["group"] = json!("DPI");
+                if !synthetic_ok {
+                    synthetic["state"] = json!("FREEZE");
+                }
+                v.push(synthetic);
+            }
+            v
+        };
+        let rows: Vec<_> = [("heavy", 12.), ("light", 6.)]
+            .into_iter()
+            .map(|(id, ok)| RankRow {
+                id: id.into(),
+                ok,
+                score: ok,
+                total: 12,
+                freeze: (12. - ok) as usize,
+                groups: BTreeMap::from([("NBA2K".into(), 6.), ("DPI".into(), ok - 6.)]),
+                group_totals: BTreeMap::from([("NBA2K".into(), 6), ("DPI".into(), 6)]),
+                ..Default::default()
+            })
+            .collect();
+        let details = BTreeMap::from([
+            ("heavy".into(), observations(160., true)),
+            ("light".into(), observations(80., false)),
+        ]);
+        for (last_ms, expected) in [(82., "light"), (180., "heavy")] {
+            let mut calls = Vec::new();
+            let decision = verified_preferred(&rows, true, &details, |id| {
+                let repeat = calls.iter().any(|previous| previous == id);
+                calls.push(id.to_owned());
+                let ms = if id == "heavy" {
+                    160.
+                } else if repeat {
+                    last_ms
+                } else {
+                    80.
+                };
+                Ok(Check {
+                    confirmed: true,
+                    error: None,
+                    details: observations(ms, id == "heavy"),
+                })
+            })
+            .unwrap();
+            assert_eq!(calls, ["heavy", "light", "light", "heavy"]);
+            assert_eq!(decision.recommended.unwrap().id, expected);
+            assert_eq!(decision.preference.unwrap().confirmed, expected == "light");
+        }
     }
     #[test]
     fn speed_preference_requires_a_second_success_in_the_working_mode() {
@@ -137,6 +329,104 @@ mod tests {
             assert_eq!(calls, ["52", "58"]);
             assert_eq!(decision.recommended.unwrap().id, expected);
             assert_eq!(decision.preference.unwrap().confirmed, expected == "58");
+        }
+    }
+
+    fn service_fixture(items: &[(&str, f64)]) -> (Vec<RankRow>, BTreeMap<String, Vec<Value>>) {
+        let mut rows = Vec::new();
+        let mut details = BTreeMap::new();
+        for &(id, tls) in items {
+            rows.push(RankRow {
+                id: id.into(),
+                total: 12,
+                ..Default::default()
+            });
+            let mut records = sample(tls);
+            let mut synthetic = records[0].clone();
+            synthetic["group"] = json!("DPI");
+            records.push(synthetic);
+            details.insert(id.to_owned(), records);
+        }
+        (rows, details)
+    }
+
+    #[test]
+    fn a_failed_repeat_gives_the_next_working_finalist_an_independent_pair() {
+        let (rows, details) =
+            service_fixture(&[("failed", 60.), ("anchor", 230.), ("a", 180.), ("b", 80.)]);
+        let mut order = Vec::new();
+        let decision = verified_preferred(&rows, true, &details, |id| {
+            let again = order.iter().any(|previous| previous == id);
+            order.push(id.to_owned());
+            Ok(Check {
+                confirmed: id != "failed" && !(id == "b" && again),
+                error: None,
+                details: details[id].clone(),
+            })
+        })
+        .unwrap();
+        assert_eq!(order, ["failed", "anchor", "b", "a", "b", "a", "anchor"]);
+        assert_eq!(decision.recommended.unwrap().id, "a");
+        assert!(decision.preference.unwrap().confirmed);
+        assert_eq!(decision.repeat_candidates, ["b", "a"]);
+        assert!(!decision.checks["b"].confirmed);
+    }
+
+    #[test]
+    fn a_shortlist_uses_at_most_two_reversed_pairs_and_refreshes_the_fallback() {
+        let (rows, details) =
+            service_fixture(&[("anchor", 230.), ("a", 80.), ("b", 100.), ("c", 120.)]);
+        for full in [false, true] {
+            let mut order = Vec::new();
+            let decision = verified_preferred(&rows, full, &details, |id| {
+                let repeated = order.iter().any(|old| old == id);
+                order.push(id.to_string());
+                Ok(Check {
+                    confirmed: !repeated || id == "anchor",
+                    error: None,
+                    details: details[id].clone(),
+                })
+            })
+            .unwrap();
+            assert_eq!(decision.recommended.unwrap().id, "anchor");
+            assert!(!decision.preference.unwrap().confirmed);
+            assert_eq!(decision.repeat_candidates, ["a", "b"]);
+            assert_eq!(order.last().unwrap(), "anchor");
+            assert_eq!(order.len(), if full { 7 } else { 6 });
+        }
+    }
+
+    #[test]
+    fn a_runner_up_keeps_the_original_endpoint_reference_and_stops_if_the_anchor_fails() {
+        let (rows, details) = service_fixture(&[("anchor", 230.), ("a", 80.), ("b", 100.)]);
+        for anchor_healthy in [false, true] {
+            let mut anchor_calls = 0;
+            let decision = verified_preferred(&rows, false, &details, |id| {
+                let mut records = details[id].clone();
+                if id == "anchor" {
+                    anchor_calls += 1;
+                }
+                if id == "anchor" && anchor_calls == 2 {
+                    for row in &mut records {
+                        row["remote_address"] = json!("203.0.113.55:443");
+                    }
+                }
+                Ok(Check {
+                    confirmed: id != "anchor" || anchor_calls != 2 || anchor_healthy,
+                    error: None,
+                    details: records,
+                })
+            })
+            .unwrap();
+            if anchor_healthy {
+                assert_eq!(decision.recommended.unwrap().id, "b");
+                assert!(decision.preference.unwrap().confirmed);
+                assert_eq!(decision.repeat_candidates, ["a", "b"]);
+            } else {
+                assert!(!decision.checks["anchor"].confirmed);
+                assert!(!decision.preference.unwrap().confirmed);
+                assert_eq!(decision.repeat_candidates, ["a"]);
+            }
         }
     }
 

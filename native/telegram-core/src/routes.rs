@@ -211,20 +211,21 @@ pub(crate) struct Router {
 impl Router {
     pub(crate) fn new(config: Config) -> Self {
         let mut direct = BTreeMap::new();
-        if config.pool_size > 0 {
-            for (&number, &target) in &config.dc_ips {
-                for test in [false, true] {
-                    if !supported_dc(number, test) || (config.force_test_dc && !test) {
+        for (&number, &target) in &config.dc_ips {
+            for test in [false, true] {
+                if !supported_dc(number, test) || (config.force_test_dc && !test) {
+                    continue;
+                }
+                for media in [false, true] {
+                    if config.pool_target(media) == 0 {
                         continue;
                     }
-                    for media in [false, true] {
-                        let dc = Dc {
-                            number,
-                            media,
-                            test,
-                        };
-                        direct.insert(dc, Arc::new(WsPool::new(dc.direct(target))));
-                    }
+                    let dc = Dc {
+                        number,
+                        media,
+                        test,
+                    };
+                    direct.insert(dc, Arc::new(WsPool::new(dc.direct(target))));
                 }
             }
         }
@@ -249,7 +250,7 @@ impl Router {
             }
             let pool = pool.clone();
             let capacity = capacity.clone();
-            let size = self.config.pool_size;
+            let size = self.config.pool_target(dc.media);
             let buffer = self.config.buffer_size;
             tasks.spawn(async move { pool.fill(capacity, size, buffer).await });
         }
@@ -262,11 +263,13 @@ impl Router {
     pub(crate) async fn relay(&self, socket: TcpStream, auth: Handshake) {
         let dc = Dc::from(&auth);
         let mut first_byte = [0];
+        let route = self.select(dc);
+        tokio::pin!(route);
         let route = tokio::select! {
-            route = self.select(dc) => route,
+            route = &mut route => route,
             peek = socket.peek(&mut first_byte) => {
                 if !matches!(peek, Ok(1)) { return; }
-                self.select(dc).await
+                route.await
             }
         };
         let Some(route) = route else { return };
@@ -293,8 +296,23 @@ impl Router {
                 if let Some(socket) = self.first_ws(pool.endpoints.clone()).await {
                     return Some(Upstream::Ws(Box::new(socket), "telegram-ws"));
                 }
+            } else if dc.media && !dc.test {
+                // File downloads can exhaust a healthy pool in a single burst.
+                // Race the configured media peer against fallback. A reusable
+                // HTTP/2 lane can serve immediately without waiting for TLS.
+                return tokio::select! {
+                    biased;
+                    Some(route) = self.fallback(dc) => Some(route),
+                    Some(socket) = self.first_ws(pool.endpoints.iter().take(1).cloned().collect()) =>
+                        Some(Upstream::Ws(Box::new(socket), "telegram-ws")),
+                    else => None,
+                };
             }
         }
+        self.fallback(dc).await
+    }
+
+    async fn fallback(&self, dc: Dc) -> Option<Upstream> {
         let secure = !self.config.no_secure;
         let workers = self
             .config
@@ -481,6 +499,57 @@ async fn first_route<T>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    #[allow(clippy::result_large_err)]
+    async fn empty_media_pool_opens_the_configured_telegram_socket() {
+        use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dc = Dc {
+            number: 2,
+            media: true,
+            test: false,
+        };
+        let mut router = Router::new(
+            Config::from_value(&serde_json::json!({
+                "secret": "11".repeat(16), "cfproxy": false, "dc_ip": []
+            }))
+            .unwrap(),
+        );
+        let endpoint = WsEndpoint {
+            connect_host: "127.0.0.1".into(),
+            port: listener.local_addr().unwrap().port(),
+            host: "kws2-1.web.telegram.org".into(),
+            path: "/apiws".into(),
+            secure: false,
+        };
+        router
+            .direct
+            .insert(dc, Arc::new(WsPool::new(vec![endpoint])));
+        router.tcp.lock().unwrap().insert(
+            dc.tcp_ip(),
+            Arc::new(AsyncMutex::new(Backoff {
+                failures: 1,
+                retry_at: Some(Instant::now() + COOLDOWN),
+            })),
+        );
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            tokio_tungstenite::accept_hdr_async(stream, |req: &Request, mut res: Response| {
+                assert_eq!(req.headers()["host"], "kws2-1.web.telegram.org");
+                res.headers_mut()
+                    .insert("sec-websocket-protocol", "binary".parse().unwrap());
+                Ok(res)
+            })
+            .await
+            .unwrap()
+        });
+        assert!(matches!(
+            router.select(dc).await,
+            Some(Upstream::Ws(_, "telegram-ws"))
+        ));
+        drop(server.await.unwrap());
+    }
 
     #[test]
     fn media_and_test_routes_keep_separate_hosts_and_dc_addresses() {

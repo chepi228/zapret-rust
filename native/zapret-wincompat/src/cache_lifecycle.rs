@@ -7,19 +7,17 @@ unsafe fn failure_purge(slot: usize, native: Native) {
         let mut cursor = 0u64;
         loop {
             let item = native(
-                2,
+                14,
                 (slot as *const usize).read(),
                 ptr::addr_of_mut!(cursor) as usize,
-                0,
+                now,
                 0,
                 0,
             );
             if item == 0 {
                 break;
             }
-            if native(3, item, now, 0, 0, 0) != 0 {
-                native(4, slot, item, 0, 0, 0);
-            }
+            native(4, slot, item, 0, 0, 0);
         }
     }
 }
@@ -27,26 +25,18 @@ unsafe fn ip_family(slot: usize, purge: Option<(usize, usize)>, native: Native) 
     unsafe {
         let mut cursor = 0u64;
         loop {
-            let item = native(
-                5,
-                (slot as *const usize).read(),
-                ptr::addr_of_mut!(cursor) as usize,
-                0,
-                0,
-                0,
-            );
+            let pool = (slot as *const usize).read();
+            let position = ptr::addr_of_mut!(cursor) as usize;
+            let item = match purge {
+                Some((life, now)) => native(15, pool, position, life, now, 0),
+                None => native(5, pool, position, 0, 0, 0),
+            };
             if item == 0 {
                 break;
             }
-            let remove = match purge {
-                None => true,
-                Some((life, now)) => native(6, item, life, now, 0, 0) != 0,
-            };
-            if remove {
-                let hostname = native(8, item, 0, 0, 0, 0);
-                native(9, hostname, 0, 0, 0, 0);
-                native(7, slot, item, 0, 0, 0);
-            }
+            let hostname = native(8, item, 0, 0, 0, 0);
+            native(9, hostname, 0, 0, 0, 0);
+            native(7, slot, item, 0, 0, 0);
         }
     }
 }
@@ -137,7 +127,7 @@ mod tests {
     use std::cell::RefCell;
     #[derive(Default)]
     struct Fixture {
-        trace: Vec<(u32, usize, usize)>,
+        trace: Vec<(u32, usize, usize, usize)>,
         time: usize,
         found: usize,
         added: usize,
@@ -163,14 +153,14 @@ mod tests {
     ) -> usize {
         FIX.with(|f| {
             let mut f = f.borrow_mut();
-            f.trace.push((op, a, b));
+            f.trace.push((op, a, b, c));
             match op {
                 1 => {
                     let t = f.time;
                     f.time += 1;
                     t
                 }
-                2 | 5 => {
+                5 | 14 | 15 => {
                     let cursor = b as *mut u64;
                     unsafe {
                         let n = cursor.read();
@@ -178,7 +168,6 @@ mod tests {
                         if n == 0 && a != 0 { 40 } else { 0 }
                     }
                 }
-                3 | 6 => 1,
                 4 | 7 => {
                     unsafe { (a as *mut usize).write(0) };
                     0
@@ -294,9 +283,9 @@ mod tests {
             let f = f.borrow();
             assert_eq!(
                 f.trace.iter().map(|v| v.0).collect::<Vec<_>>(),
-                [1, 13, 1, 2, 3, 4, 2]
+                [1, 13, 1, 14, 4, 14]
             );
-            assert_eq!(f.trace[4].2, 101);
+            assert_eq!(f.trace[3].3, 101);
         });
     }
     #[test]

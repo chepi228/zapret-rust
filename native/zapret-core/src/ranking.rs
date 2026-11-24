@@ -54,6 +54,13 @@ fn groups(parts: &[&str]) -> (BTreeMap<String, f64>, BTreeMap<String, usize>) {
 }
 /// Parse historical v1 and v2 data. Parsing alone does not make a rank trusted.
 pub fn parse_rank(text: &str, exists: &[String]) -> Result<Option<TestRank>> {
+    parse_rank_rows(text, exists, result_header(text))
+}
+fn parse_rank_rows(
+    text: &str,
+    exists: &[String],
+    context: Option<TestResultContext>,
+) -> Result<Option<TestRank>> {
     let mut rank = TestRank {
         date: None,
         version: "1.5".into(),
@@ -62,7 +69,7 @@ pub fn parse_rank(text: &str, exists: &[String]) -> Result<Option<TestRank>> {
         base_groups: BTreeMap::new(),
         base_group_totals: BTreeMap::new(),
         rows: Vec::new(),
-        context: result_header(text),
+        context,
     };
     let mut base = false;
     for line in text.trim_start_matches('\u{feff}').lines() {
@@ -118,18 +125,43 @@ pub fn read_rank(
     context: Option<&TestResultContext>,
     strategies: &[Strategy],
 ) -> Result<Option<TestRank>> {
+    let Some(context) = context else {
+        return Ok(None);
+    };
+    read_rank_for_network(root, &context.network_key, strategies, || {
+        Some(context.clone())
+    })
+}
+
+pub(crate) fn read_rank_for_network(
+    root: &Path,
+    network_key: &str,
+    strategies: &[Strategy],
+    current: impl FnOnce() -> Option<TestResultContext>,
+) -> Result<Option<TestRank>> {
     let path = root.join("runtime/test-rank.txt");
-    if !path.exists() || context.is_none() {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let text = match read_text(&path, 16 * 1024 * 1024) {
+        Ok(text) => text,
+        // Without a verifiable current context even an unreadable rank is unused.
+        Err(error) => {
+            return if current().is_some() {
+                Err(error)
+            } else {
+                Ok(None)
+            };
+        }
+    };
+    let Some(saved) = result_header(&text) else {
+        return Ok(None);
+    };
+    if saved.network_key != network_key || !current().is_some_and(|ctx| saved.compatible(&ctx)) {
         return Ok(None);
     }
     let ids = strategies.iter().map(|s| s.id.clone()).collect::<Vec<_>>();
-    let rank = parse_rank(&read_text(&path, 16 * 1024 * 1024)?, &ids)?;
-    Ok(rank.filter(|r| {
-        r.context
-            .as_ref()
-            .zip(context)
-            .is_some_and(|(a, b)| a.compatible(b))
-    }))
+    parse_rank_rows(&text, &ids, Some(saved))
 }
 pub fn parse_cover(text: &str) -> Coverage {
     text.trim_start_matches('\u{feff}')
@@ -158,6 +190,12 @@ pub fn read_cover(
     if !rank_context.compatible(context) {
         return Ok(None);
     }
+    read_rank_cover(root, rank_context)
+}
+pub(crate) fn read_rank_cover(
+    root: &Path,
+    rank_context: &TestResultContext,
+) -> Result<Option<Coverage>> {
     let path = root.join("runtime/test-cover.txt");
     if !path.exists() {
         return Ok(None);
@@ -166,7 +204,7 @@ pub fn read_cover(
     let Some(saved) = result_header(&text) else {
         return Ok(None);
     };
-    if !saved.compatible(context) || saved.run_id != rank_context.run_id {
+    if !saved.compatible(rank_context) || saved.run_id != rank_context.run_id {
         return Ok(None);
     }
     Ok(Some(parse_cover(&text)))
@@ -263,6 +301,53 @@ pub fn save_cover(root: &Path, cover: &Coverage, context: &TestResultContext) ->
     }
     publish(root, "test-cover.txt", &lines, context)
 }
+#[cfg(test)]
+#[test]
+fn foreign_rank_skips_input_hashing_and_local_rank_requires_the_exact_inputs() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::create_dir(temp.path().join("runtime")).unwrap();
+    let context = TestResultContext {
+        schema: 2,
+        network_key: "A".repeat(64),
+        inputs_hash: "B".repeat(64),
+        run_id: "1".repeat(32),
+    };
+    fs::write(
+        temp.path().join("runtime/test-rank.txt"),
+        format!(
+            "# context: {}\nbase 1 2\n31 2 2 2 0 0\n",
+            serde_json::to_string(&context).unwrap()
+        ),
+    )
+    .unwrap();
+    let strategies = [Strategy {
+        id: "31".into(),
+        ..Default::default()
+    }];
+    assert!(
+        read_rank_for_network(temp.path(), &"C".repeat(64), &strategies, || {
+            panic!("a different network must not hash package inputs")
+        })
+        .unwrap()
+        .is_none()
+    );
+    let mut changed = context.clone();
+    changed.inputs_hash = "D".repeat(64);
+    assert!(
+        read_rank(temp.path(), Some(&changed), &strategies)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        read_rank(temp.path(), Some(&context), &strategies)
+            .unwrap()
+            .unwrap()
+            .rows[0]
+            .id,
+        "31"
+    );
+}
+
 fn group_for_section(section: &str) -> Option<&'static str> {
     match section {
         "google" => Some("YouTube"),
@@ -388,6 +473,18 @@ pub fn rotation_order(
     rank: Option<&TestRank>,
     cover: Option<&Coverage>,
 ) -> Vec<Strategy> {
+    rotation_order_refs(strategies, primary_id, section, rank, cover)
+        .into_iter()
+        .cloned()
+        .collect()
+}
+pub(crate) fn rotation_order_refs<'a>(
+    strategies: &'a [Strategy],
+    primary_id: &str,
+    section: &str,
+    rank: Option<&TestRank>,
+    cover: Option<&Coverage>,
+) -> Vec<&'a Strategy> {
     let all: Vec<_> = strategies.iter().filter(|s| s.is_valid()).collect();
     if section != "game_tcp" {
         if let Some(rank) = rank {
@@ -419,11 +516,7 @@ pub fn rotation_order(
                             })
                     });
                 if ids.iter().any(|id| id == primary_id) || near_leader {
-                    order.extend(
-                        all.iter()
-                            .filter(|s| s.id == primary_id)
-                            .map(|s| (*s).clone()),
-                    );
+                    order.extend(all.iter().filter(|s| s.id == primary_id).copied());
                 }
                 for id in ids {
                     if order.len() >= 5 {
@@ -432,7 +525,7 @@ pub fn rotation_order(
                     order.extend(
                         all.iter()
                             .filter(|s| s.id == id && id != primary_id)
-                            .map(|s| (*s).clone()),
+                            .copied(),
                     );
                 }
                 if !order.is_empty() {
@@ -441,14 +534,10 @@ pub fn rotation_order(
             }
         }
     }
-    let mut order: Vec<Strategy> = all
-        .iter()
-        .filter(|s| s.id == primary_id)
-        .map(|s| (*s).clone())
-        .collect();
+    let mut order: Vec<_> = all.iter().filter(|s| s.id == primary_id).copied().collect();
     for id in ROTATION_PREFERENCE {
         if id != primary_id {
-            order.extend(all.iter().filter(|s| s.id == id).map(|s| (*s).clone()));
+            order.extend(all.iter().filter(|s| s.id == id).copied());
         }
     }
     order
@@ -485,8 +574,8 @@ pub fn test_strategy_ids(
         }
     }
     for section in ["general", "google", "discord_media", "game_tcp"] {
-        for s in rotation_order(&all, settings.get("alt"), section, rank, cover) {
-            ids.insert(s.id);
+        for s in rotation_order_refs(&all, settings.get("alt"), section, rank, cover) {
+            ids.insert(s.id.clone());
         }
     }
     let (mut preferred, others): (Vec<_>, Vec<_>) =

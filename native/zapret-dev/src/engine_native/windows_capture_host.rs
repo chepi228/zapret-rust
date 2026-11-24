@@ -154,6 +154,7 @@ unsafe extern "C" {
     fn rawsend_cleanup();
     fn loop_report(event: u32, id: u32, length: usize, other: usize);
     fn windivert_init(filter: *const c_char) -> bool;
+    fn zapret_trial_ready();
     fn win_sandbox() -> bool;
     fn windivert_send(packet: *const u8, length: usize, address: *const Address) -> bool;
     fn win_dark_init(
@@ -254,7 +255,10 @@ unsafe extern "C-unwind" fn activate(error: *mut u32) -> bool {
                     return false;
                 }
                 4 => windows_engine_fuzz::run(),
-                5 => return true,
+                5 => {
+                    zapret_trial_ready();
+                    return true;
+                }
                 _ => return false,
             }
         }

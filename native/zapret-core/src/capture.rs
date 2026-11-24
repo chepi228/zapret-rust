@@ -1,6 +1,50 @@
 use serde::{Deserialize, Serialize};
 use std::{collections::HashSet, net::Ipv4Addr};
 
+/// WinDivert expands each range to a separate predicate on every captured direction.
+pub(crate) fn merged_ports(base: &str, game: &str) -> anyhow::Result<String> {
+    use anyhow::Context;
+    let mut ranges =
+        crate::parse_port_list(&format!("{base},{game}")).context("Invalid capture ports")?;
+    ranges.sort_unstable();
+    let mut merged = Vec::<(u16, u16)>::new();
+    for (lo, hi) in ranges {
+        match merged.last_mut() {
+            Some((_, end)) if lo <= end.saturating_add(1) => *end = (*end).max(hi),
+            _ => merged.push((lo, hi)),
+        }
+    }
+    Ok(merged
+        .into_iter()
+        .map(|(lo, hi)| {
+            if lo == hi {
+                lo.to_string()
+            } else {
+                format!("{lo}-{hi}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(","))
+}
+
+#[cfg(test)]
+mod port_tests {
+    use super::merged_ports;
+
+    #[test]
+    fn capture_ranges_merge_duplicates_and_neighbours_without_filling_gaps() {
+        assert_eq!(
+            merged_ports("80,443,2053,8443", "1024-65535").unwrap(),
+            "80,443,1024-65535"
+        );
+        assert_eq!(
+            merged_ports("65535,15-20,3", "1-2,4,22,19-21,65534-65535").unwrap(),
+            "1-4,15-22,65534-65535"
+        );
+        assert!(merged_ports("80", "65536").is_err());
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CaptureExclusion {
     pub count: usize,

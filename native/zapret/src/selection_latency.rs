@@ -1,10 +1,122 @@
-//! Compare complete test requests across all target groups at comparable quality.
+//! Compare paired, completed requests and keep service availability ahead of latency.
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::BTreeMap;
+use std::cmp::Reverse;
+use std::collections::{BTreeMap, BTreeSet};
 use zapret_core::RankRow;
 
-pub const POLICY: &str = "availability-then-working-request-latency-v3";
+pub const PREVIOUS_POLICY: &str = "availability-then-working-request-latency-v3";
+pub const POLICY: &str = "service-availability-then-paired-latency-v5";
+pub const SERVICE_SCOPE: &str = "ServiceTargets";
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Panel {
+    All,
+    Services,
+}
+
+fn service(row: &Value) -> bool {
+    match row["group"].as_str() {
+        None | Some("DPI") => false,
+        Some("Clean") => matches!(
+            row["name"].as_str(),
+            Some("steam" | "steamapi" | "steam_asset")
+        ),
+        Some(_) => true,
+    }
+}
+
+fn stable(row: &Value) -> bool {
+    verified_response(row) && row["flaky"] != true && row["tries"] == 1
+}
+
+// Keep the incoming coverage/history order for otherwise equal candidates.
+pub fn service_rank(row: &RankRow, details: &BTreeMap<String, Vec<Value>>) -> (bool, usize, usize) {
+    let services = details
+        .get(&row.id)
+        .into_iter()
+        .flatten()
+        .filter(|v| service(v));
+    (
+        row.harm == 0,
+        services.clone().filter(|v| stable(v)).count(),
+        services.filter(|v| verified_response(v)).count(),
+    )
+}
+
+pub fn service_ready(row: &RankRow, details: &BTreeMap<String, Vec<Value>>) -> bool {
+    let total = details
+        .get(&row.id)
+        .into_iter()
+        .flatten()
+        .filter(|v| service(v))
+        .count();
+    let (healthy, stable, _) = service_rank(row, details);
+    healthy && stable >= Panel::Services.required_pairs(total)
+}
+
+pub fn complete_services(rows: &[Value]) -> bool {
+    let services = rows.iter().filter(|row| service(row));
+    services.clone().count() >= 5 && services.into_iter().all(stable)
+}
+
+impl Panel {
+    fn required_pairs(self, total: usize) -> usize {
+        5.max(match self {
+            Self::Services => (total * 4).div_ceil(5),
+            Self::All => total.div_ceil(2),
+        })
+    }
+
+    pub fn for_trials(rows: &[RankRow], details: &BTreeMap<String, Vec<Value>>) -> Self {
+        let Some(first) = rows.first().and_then(|r| details.get(&r.id)) else {
+            return Self::All;
+        };
+        let keys = |records: &[Value]| -> BTreeSet<String> {
+            records
+                .iter()
+                .filter(|v| service(v))
+                .filter_map(target_key)
+                .collect()
+        };
+        let expected = keys(first);
+        if expected.len() < 5 || !first.iter().any(|v| v["group"] == "DPI") {
+            return Self::All;
+        }
+        let same_panel = rows.iter().all(|r| {
+            details.get(&r.id).is_some_and(|records| {
+                records.iter().filter(|v| service(v)).count() == expected.len()
+                    && keys(records) == expected
+            })
+        });
+        let usable = rows.iter().any(|r| service_ready(r, details));
+        if same_panel && usable {
+            Self::Services
+        } else {
+            Self::All
+        }
+    }
+
+    pub fn prioritize(
+        self,
+        rows: &mut [RankRow],
+        details: &BTreeMap<String, Vec<Value>>,
+        primary: &str,
+    ) {
+        if self == Self::Services {
+            rows.sort_by_cached_key(|row| Reverse((service_rank(row, details), row.id == primary)));
+        }
+    }
+}
+
+fn target_key(row: &Value) -> Option<String> {
+    Some(format!(
+        "{}|{}|{}",
+        row["group"].as_str()?,
+        row["name"].as_str()?,
+        row["url"].as_str()?
+    ))
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Comparison {
@@ -27,11 +139,29 @@ pub struct Comparison {
     pub panel: Vec<String>,
 }
 impl Comparison {
-    pub fn faster(&self) -> bool {
-        self.candidate_total_ms < self.reference_total_ms
-            && self.gain_ms > 0.
+    pub fn screening_order(&self, other: &Self) -> std::cmp::Ordering {
+        self.regressions
+            .cmp(&other.regressions)
+            .then_with(|| other.gain_ms.total_cmp(&self.gain_ms))
+    }
+    // Screening admits a promising median despite an isolated slow site. Both
+    // working comparisons still have to pass the per-site and group checks.
+    pub fn promising(&self) -> bool {
+        self.gain_ms >= 1.
             && self.wins * 2 > self.targets
-            && self.regressions == 0
+            && self.candidate_p95_ms - self.reference_p95_ms
+                <= 20f64.max(self.reference_p95_ms * 0.10)
+    }
+
+    pub fn faster(&self) -> bool {
+        self.regressions == 0
+            && if self.scope == SERVICE_SCOPE {
+                self.promising()
+            } else {
+                self.candidate_total_ms < self.reference_total_ms
+                    && self.gain_ms > 0.
+                    && self.wins * 2 > self.targets
+            }
     }
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -40,41 +170,35 @@ pub struct Preference {
     pub candidate: String,
     pub trial: Comparison,
     pub working: Option<Comparison>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repeat: Option<Comparison>,
     pub confirmed: bool,
 }
 
-pub fn eligible(reference: &RankRow, candidate: &RankRow) -> bool {
-    candidate.total == reference.total
-        && reference.total > 0
-        && candidate.score.is_finite()
+pub fn eligible(reference: &RankRow, candidate: &RankRow, panel: Panel) -> bool {
+    candidate.score.is_finite()
         && reference.score.is_finite()
-        && reference.ok >= reference.total as f64 * 0.80
-        && candidate.ok >= candidate.total as f64 * 0.80
-        && candidate.score >= reference.score - zapret_core::NEAR_BEST_SCORE_MARGIN
+        && (panel == Panel::Services
+            || (reference.total > 0
+                && candidate.total == reference.total
+                && reference.ok >= reference.total as f64 * 0.80
+                && candidate.ok >= candidate.total as f64 * 0.80
+                && candidate.score >= reference.score - zapret_core::NEAR_BEST_SCORE_MARGIN
+                && candidate.freeze == 0))
         && reference.harm == 0
         && candidate.harm == 0
-        && candidate.freeze == 0
-        && [
-            "NBA2K",
-            "EAC",
-            "YouTube",
-            "Discord",
-            "SoundCloud",
-            "QUIC",
-            "CDN",
-        ]
-        .iter()
-        .all(|group| {
-            let total = reference.group_totals.get(*group).copied().unwrap_or(0);
-            total == 0
-                || (candidate.group_totals.get(*group) == Some(&total)
-                    && candidate.groups.get(*group).copied().unwrap_or(0.)
-                        >= reference.groups.get(*group).copied().unwrap_or(0.))
+        && reference.group_totals.iter().all(|(group, total)| {
+            matches!(group.as_str(), "DPI" | "Clean")
+                || *total == 0
+                || (candidate.group_totals.get(group) == Some(total)
+                    && candidate.groups.get(group).copied().unwrap_or(0.)
+                        >= reference.groups.get(group).copied().unwrap_or(0.))
         })
 }
 
 struct Sample {
     group: String,
+    mode: Option<String>,
     peer: String,
     code: String,
     termination: String,
@@ -108,7 +232,7 @@ pub struct OverallTiming {
     pub groups: BTreeMap<String, Timing>,
 }
 pub fn timing(rows: &[Value]) -> Timing {
-    let valid = samples(rows).unwrap_or_default();
+    let valid = samples(rows, Panel::All).unwrap_or_default();
     let med = |get: fn(&Sample) -> f64| {
         (!valid.is_empty()).then(|| median(valid.values().map(get).collect()))
     };
@@ -153,9 +277,11 @@ fn verified_response(row: &Value) -> bool {
                 || (url.starts_with("https://") && row["certificate_validated"] == true)
         })
 }
-pub fn preserves_services(reference: &[Value], candidate: &[Value]) -> bool {
+pub fn preserves_services(reference: &[Value], candidate: &[Value], panel: Panel) -> bool {
+    let protected = |row: &&Value| panel == Panel::All || row["group"] != "DPI";
     reference
         .iter()
+        .filter(protected)
         .filter(|row| row["state"] == "OK")
         .all(|before| {
             candidate
@@ -175,6 +301,10 @@ pub fn preserves_services(reference: &[Value], candidate: &[Value]) -> bool {
                         "tls_ms"
                     };
                     verified_response(after)
+                        && (panel == Panel::All
+                            || !service(before)
+                            || !stable(before)
+                            || stable(after))
                         && (before["group"] != "Clean"
                             || before[time].as_f64().zip(after[time].as_f64()).is_some_and(
                                 |(a, b)| {
@@ -187,19 +317,22 @@ pub fn preserves_services(reference: &[Value], candidate: &[Value]) -> bool {
                             ))
                 })
         })
-        && candidate.iter().filter(|row| row["flaky"] == true).count()
-            <= reference.iter().filter(|row| row["flaky"] == true).count()
+        && (panel == Panel::Services
+            || candidate.iter().filter(|row| row["flaky"] == true).count()
+                <= reference.iter().filter(|row| row["flaky"] == true).count())
         && candidate
             .iter()
+            .filter(protected)
             .filter(|row| row["state"] == "FREEZE")
             .count()
             <= reference
                 .iter()
+                .filter(protected)
                 .filter(|row| row["state"] == "FREEZE")
                 .count()
 }
 fn sample(row: &Value) -> Option<(String, Sample)> {
-    if !verified_response(row) || row["flaky"] == true || row["tries"] != 1 {
+    if !stable(row) {
         return None;
     }
     let group = row["group"].as_str()?;
@@ -238,9 +371,10 @@ fn sample(row: &Value) -> Option<(String, Sample)> {
         return None;
     }
     Some((
-        format!("{group}|{}|{url}", row["name"].as_str()?),
+        target_key(row)?,
         Sample {
             group: group.into(),
+            mode: row["mode"].as_str().map(str::to_owned),
             peer: row["remote_address"]
                 .as_str()
                 .filter(|peer| !peer.is_empty())?
@@ -258,9 +392,9 @@ fn sample(row: &Value) -> Option<(String, Sample)> {
         },
     ))
 }
-fn samples(rows: &[Value]) -> Option<BTreeMap<String, Sample>> {
+fn samples(rows: &[Value], panel: Panel) -> Option<BTreeMap<String, Sample>> {
     let mut result = BTreeMap::new();
-    for row in rows {
+    for row in rows.iter().filter(|r| panel == Panel::All || service(r)) {
         if let Some((key, sample)) = sample(row) {
             if result.insert(key, sample).is_some() {
                 return None;
@@ -270,7 +404,7 @@ fn samples(rows: &[Value]) -> Option<BTreeMap<String, Sample>> {
     Some(result)
 }
 pub fn median_request_ms(rows: &[Value]) -> Option<f64> {
-    let samples = samples(rows)?;
+    let samples = samples(rows, Panel::All)?;
     (!samples.is_empty()).then(|| median(samples.values().map(|s| s.total).collect()))
 }
 fn p95(mut values: Vec<f64>) -> f64 {
@@ -279,6 +413,7 @@ fn p95(mut values: Vec<f64>) -> f64 {
 }
 fn comparable(a: &Sample, b: &Sample) -> bool {
     a.peer == b.peer
+        && a.mode == b.mode
         && a.code == b.code
         && a.body_limit == b.body_limit
         && a.post_bytes == b.post_bytes
@@ -298,9 +433,17 @@ fn nonempty_median(values: Vec<f64>) -> Option<f64> {
     (!values.is_empty()).then(|| median(values))
 }
 
-pub fn compare(reference: &[Value], candidate: &[Value]) -> Option<Comparison> {
-    let reference = samples(reference)?;
-    let candidate = samples(candidate)?;
+fn compare_panel(reference: &[Value], candidate: &[Value], panel: Panel) -> Option<Comparison> {
+    let reference = samples(reference, panel)?;
+    let candidate = samples(candidate, panel)?;
+    compare_samples(&reference, &candidate, panel)
+}
+
+fn compare_samples(
+    reference: &BTreeMap<String, Sample>,
+    candidate: &BTreeMap<String, Sample>,
+    panel: Panel,
+) -> Option<Comparison> {
     let common: Vec<_> = reference
         .iter()
         .filter_map(|(key, a)| {
@@ -311,7 +454,7 @@ pub fn compare(reference: &[Value], candidate: &[Value]) -> Option<Comparison> {
         })
         .collect();
     // A few fast endpoints cannot stand in for the whole tested target set.
-    if common.len() < 5.max(reference.len().max(candidate.len()).div_ceil(2)) {
+    if common.len() < panel.required_pairs(reference.len().max(candidate.len())) {
         return None;
     }
     let pairs = common;
@@ -340,7 +483,12 @@ pub fn compare(reference: &[Value], candidate: &[Value]) -> Option<Comparison> {
         + group_regressions
         + usize::from(candidate_p95_ms - reference_p95_ms > 50f64.max(reference_p95_ms * 0.20));
     Some(Comparison {
-        scope: "AllTargets".into(),
+        scope: if panel == Panel::Services {
+            SERVICE_SCOPE
+        } else {
+            "AllTargets"
+        }
+        .into(),
         targets: pairs.len(),
         wins: gains.iter().filter(|gain| **gain > 0.).count(),
         regressions,
@@ -379,55 +527,75 @@ pub fn confirm(
     preference: &Preference,
     reference: &[Value],
     candidate: &[Value],
+    panel: Panel,
+    previous: Option<(&[Value], &[Value])>,
 ) -> Option<Comparison> {
-    let filter = |rows: &[Value]| {
-        rows.iter()
-            .filter(|row| {
-                let key = format!(
-                    "{}|{}|{}",
-                    row["group"].as_str().unwrap_or(""),
-                    row["name"].as_str().unwrap_or(""),
-                    row["url"].as_str().unwrap_or("")
-                );
-                preference.trial.panel.contains(&key)
-            })
-            .cloned()
-            .collect::<Vec<_>>()
+    let required = preference.working.as_ref().unwrap_or(&preference.trial);
+    let keys: BTreeSet<_> = required.panel.iter().collect();
+    let on_panel = |rows: &[Value], first: Option<&[Value]>| {
+        let mut current = samples(rows, panel)?;
+        if let Some(first) = first {
+            let previous = samples(first, panel)?;
+            current.retain(|key, sample| {
+                previous
+                    .get(key)
+                    .is_some_and(|before| comparable(before, sample))
+            });
+        }
+        current.retain(|key, _| keys.contains(key));
+        Some(current)
     };
-    let comparison = compare(&filter(reference), &filter(candidate))?;
-    (comparison.targets >= 5.max(preference.trial.targets.div_ceil(2))).then_some(comparison)
+    let before = on_panel(reference, previous.map(|(before, _)| before))?;
+    let after = on_panel(candidate, previous.map(|(_, after)| after))?;
+    let comparison = compare_samples(&before, &after, panel)?;
+    (comparison.targets >= panel.required_pairs(preference.trial.targets)).then_some(comparison)
 }
 
 pub fn preference(
     reference: &RankRow,
     row: &RankRow,
     details: &BTreeMap<String, Vec<Value>>,
+    panel: Panel,
 ) -> Option<Preference> {
-    if !eligible(reference, row) {
+    if !eligible(reference, row, panel) {
         return None;
     }
     let baseline = details.get(&reference.id)?;
     let candidate = details.get(&row.id)?;
-    if !preserves_services(baseline, candidate) {
+    if !preserves_services(baseline, candidate, panel) {
         return None;
     }
-    let trial = compare(baseline, candidate)?;
+    let trial = compare_panel(baseline, candidate, panel)?;
     Some(Preference {
         reference: reference.id.clone(),
         candidate: row.id.clone(),
         trial,
         working: None,
+        repeat: None,
         confirmed: false,
     })
 }
 
-pub fn recommend(rows: &[RankRow], details: &BTreeMap<String, Vec<Value>>) -> Option<Preference> {
+pub fn recommend(
+    rows: &[RankRow],
+    details: &BTreeMap<String, Vec<Value>>,
+    panel: Panel,
+) -> Option<Preference> {
     let reference = rows.first()?;
     rows.iter()
         .skip(1)
-        .filter_map(|row| preference(reference, row, details))
-        .filter(|preference| preference.trial.faster())
+        .filter_map(|row| preference(reference, row, details, panel))
+        .filter(|p| {
+            if panel == Panel::Services {
+                p.trial.promising()
+            } else {
+                p.trial.faster()
+            }
+        })
         .min_by(|a, b| {
+            if panel == Panel::Services {
+                return a.trial.screening_order(&b.trial);
+            }
             a.trial
                 .candidate_total_ms
                 .total_cmp(&b.trial.candidate_total_ms)
@@ -443,6 +611,12 @@ pub fn recommend(rows: &[RankRow], details: &BTreeMap<String, Vec<Value>>) -> Op
 mod tests {
     use super::*;
     use serde_json::json;
+    fn compare(reference: &[Value], candidate: &[Value]) -> Option<Comparison> {
+        compare_panel(reference, candidate, Panel::All)
+    }
+    fn recommend(rows: &[RankRow], details: &BTreeMap<String, Vec<Value>>) -> Option<Preference> {
+        super::recommend(rows, details, Panel::for_trials(rows, details))
+    }
     fn samples(tcp: f64, tls: f64) -> Vec<Value> {
         (0..6).map(|n|json!({"group":"NBA2K","name":format!("service{n}"),"url":format!("https://s{n}.test/"),
             "state":"OK","tries":1,"flaky":false,"certificate_validated":true,
@@ -619,7 +793,8 @@ mod tests {
         baseline[0]["group"] = json!("DPI");
         candidate[0]["group"] = json!("DPI");
         candidate[0]["state"] = json!("FAIL");
-        assert!(!preserves_services(&baseline, &candidate));
+        assert!(!preserves_services(&baseline, &candidate, Panel::All));
+        assert!(preserves_services(&baseline, &candidate, Panel::Services));
     }
 
     #[test]
@@ -634,9 +809,10 @@ mod tests {
             candidate: "58".into(),
             trial,
             working: None,
+            repeat: None,
             confirmed: false,
         };
-        assert!(confirm(&preference, &baseline, &candidate).is_none());
+        assert!(confirm(&preference, &baseline, &candidate, Panel::All, None).is_none());
     }
 
     #[test]
@@ -653,5 +829,80 @@ mod tests {
         let comparison = compare(&baseline, &candidate).unwrap();
         assert!(comparison.faster());
         assert_eq!(comparison.candidate_tls_ms, 0.);
+    }
+
+    #[test]
+    fn a_control_retry_within_tolerance_is_distinct_from_a_steam_retry_or_a_control_loss() {
+        let mut before = samples(30., 60.);
+        before[0]["group"] = json!("Clean");
+        before[0]["name"] = json!("adobe");
+        before[1]["group"] = json!("Clean");
+        before[1]["name"] = json!("steamapi");
+        let mut after = before.clone();
+        after[0]["tries"] = json!(2);
+        assert!(preserves_services(&before, &after, Panel::Services));
+        after[1]["tries"] = json!(2);
+        assert!(!preserves_services(&before, &after, Panel::Services));
+        after[1]["tries"] = json!(1);
+        after[0]["state"] = json!("FAIL");
+        assert!(!preserves_services(&before, &after, Panel::Services));
+    }
+
+    #[test]
+    fn repeat_requires_the_same_servers_and_most_of_the_original_service_panel() {
+        let before = samples(50., 100.);
+        let after = samples(35., 65.);
+        let trial = compare_panel(&before, &after, Panel::Services).unwrap();
+        let speed = Preference {
+            reference: "a".into(),
+            candidate: "b".into(),
+            working: Some(trial.clone()),
+            trial,
+            repeat: None,
+            confirmed: false,
+        };
+        let (mut next_a, mut next_b) = (before.clone(), after.clone());
+        for changed in 0..3 {
+            let repeat = confirm(
+                &speed,
+                &next_a,
+                &next_b,
+                Panel::Services,
+                Some((&before, &after)),
+            );
+            assert_eq!(
+                repeat.map(|p| p.targets),
+                (changed < 2).then_some(6 - changed)
+            );
+            for rows in [&mut next_a, &mut next_b] {
+                rows[changed]["remote_address"] = json!("198.51.100.10:443");
+            }
+        }
+    }
+
+    #[test]
+    fn a_larger_dpi_score_cannot_displace_the_primary_or_an_extra_healthy_service() {
+        let mut rows = vec![
+            score("strong", 52.),
+            score("current", 46.),
+            score("slow", 50.),
+        ];
+        let mut panel = samples(45., 80.);
+        let mut dpi = panel[0].clone();
+        dpi["group"] = json!("DPI");
+        panel.push(dpi);
+        let mut details: BTreeMap<_, _> =
+            rows.iter().map(|r| (r.id.clone(), panel.clone())).collect();
+        details.get_mut("slow").unwrap()[0]["tries"] = json!(2);
+        let selected = Panel::for_trials(&rows, &details);
+        assert!(selected == Panel::Services);
+        selected.prioritize(&mut rows, &details, "current");
+        assert_eq!(
+            rows.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+            ["current", "strong", "slow"]
+        );
+        details.get_mut("current").unwrap()[1]["state"] = json!("FAIL");
+        selected.prioritize(&mut rows, &details, "current");
+        assert_eq!(rows[0].id, "strong");
     }
 }

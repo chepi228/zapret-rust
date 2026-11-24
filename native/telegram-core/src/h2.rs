@@ -11,13 +11,13 @@ use hyper_util::rt::{TokioExecutor, TokioIo};
 use std::{
     sync::{
         Arc,
-        atomic::{AtomicU8, AtomicU64, Ordering},
+        atomic::{AtomicU8, Ordering},
     },
     time::{Duration, Instant},
 };
 use tokio::{
     net::TcpStream,
-    sync::{OwnedSemaphorePermit, Semaphore, mpsc},
+    sync::{OwnedSemaphorePermit, Semaphore, mpsc, watch},
     task::{JoinHandle, JoinSet},
     time::timeout,
 };
@@ -271,7 +271,6 @@ struct Channel {
     slots: Arc<Semaphore>,
     budget: Arc<Semaphore>,
     replay_slots: Semaphore,
-    sequence: AtomicU64,
 }
 
 struct RequestBudget {
@@ -285,7 +284,6 @@ impl Channel {
             slots: Arc::new(Semaphore::new(CHANNEL_REQUESTS)),
             budget: Arc::new(Semaphore::new(CHANNEL_BYTES)),
             replay_slots: Semaphore::new(2),
-            sequence: AtomicU64::new(0),
         }
     }
 
@@ -293,7 +291,7 @@ impl Channel {
         &self,
         lane: &Lane,
         body: Bytes,
-        sequence: u64,
+        mut newer_packet: watch::Receiver<()>,
         sender: mpsc::Sender<(Result<Reply>, Arc<RequestBudget>)>,
         budget: Arc<RequestBudget>,
     ) {
@@ -306,11 +304,14 @@ impl Channel {
         // An encrypted request can collect further Telegram messages on an
         // idle native channel. A new packet ends polling the older request.
         for _ in 0..3 {
-            tokio::time::sleep(POLL_INTERVAL).await;
-            if self.sequence.load(Ordering::Relaxed) != sequence
-                || self.slots.available_permits() != CHANNEL_REQUESTS - 1
+            tokio::select! {
+                biased;
+                _ = newer_packet.changed() => return,
+                _ = sender.closed() => return,
+                _ = tokio::time::sleep(POLL_INTERVAL) => {}
+            }
+            if self.slots.available_permits() != CHANNEL_REQUESTS - 1
                 || started.elapsed() >= Duration::from_secs(30)
-                || sender.is_closed()
             {
                 return;
             }
@@ -339,6 +340,7 @@ pub(crate) async fn bridge(client: TcpStream, mut auth: Handshake, lane: Arc<Lan
     let (sender, mut receiver) = mpsc::channel(2);
     let upload = async {
         let mut tasks = JoinSet::new();
+        let (activity, _) = watch::channel(());
         while let Some(frame) =
             protocol::read_frame(&mut reader, &mut auth.decrypt, auth.tag).await?
         {
@@ -346,7 +348,10 @@ pub(crate) async fn bridge(client: TcpStream, mut auth: Handshake, lane: Arc<Lan
             // the request body unchanged and lets the endpoint supply replies.
             let _quick = frame.quick;
             let body = protocol::http_body(frame, auth.tag)?;
-            let sequence = channel.sequence.fetch_add(1, Ordering::Relaxed) + 1;
+            // Wake older idle polls before waiting for a request slot. Their
+            // permits protect pending replies and must be freed for this packet.
+            activity.send_replace(());
+            let newer_packet = activity.subscribe();
             let budget = Arc::new(RequestBudget {
                 _slot: channel.slots.clone().acquire_owned().await?,
                 _bytes: channel
@@ -358,7 +363,11 @@ pub(crate) async fn bridge(client: TcpStream, mut auth: Handshake, lane: Arc<Lan
             let lane = lane.clone();
             let sender = sender.clone();
             let channel = channel.clone();
-            tasks.spawn(async move { channel.send(&lane, body, sequence, sender, budget).await });
+            tasks.spawn(async move {
+                channel
+                    .send(&lane, body, newer_packet, sender, budget)
+                    .await
+            });
             while tasks.try_join_next().is_some() {}
         }
         Ok::<_, anyhow::Error>(())
@@ -491,6 +500,47 @@ mod tests {
         server.abort();
         let _ = server.await;
     }
+    #[tokio::test]
+    async fn file_chunks_do_not_wait_for_the_idle_poll_interval() {
+        let (lane, server) = lane(|request| async move {
+            let body = request.into_body().collect().await.unwrap().to_bytes();
+            let size = if body[0] == 1 { 256 * 1024 } else { 32 };
+            Response::new(Full::new(Bytes::from(vec![body[0]; size])))
+        })
+        .await;
+        let (mut client, proxy) = local_pair().await;
+        let (init, mut encrypt, mut decrypt) = client_init(-2, Tag::Intermediate);
+        let auth = protocol::authenticate(&init, &[0x11; 16], false).unwrap();
+        let task = tokio::spawn(bridge(proxy, auth, lane));
+        let count = CHANNEL_REQUESTS + 1;
+        let mut requests = Vec::new();
+        for id in 1..=count {
+            requests.extend(32u32.to_le_bytes());
+            requests.extend([id as u8; 32]);
+        }
+        encrypt.apply_keystream(&mut requests);
+        client.write_all(&requests).await.unwrap();
+        let mut seen = std::collections::BTreeSet::new();
+        timeout(Duration::from_millis(1500), async {
+            for _ in 0..count {
+                let frame = protocol::read_frame(&mut client, &mut decrypt, Tag::Intermediate)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let body = &frame.wire[frame.header..];
+                assert_eq!(body.len(), if body[0] == 1 { 256 * 1024 } else { 32 });
+                assert!(body.iter().all(|&b| b == body[0]));
+                seen.insert(body[0] as usize);
+            }
+        })
+        .await
+        .expect("new file requests must supersede idle polling");
+        assert_eq!(seen, (1..=count).collect());
+        drop(client);
+        task.await.unwrap().unwrap();
+        server.abort();
+    }
+
     #[tokio::test]
     async fn bridge_strips_native_padding_and_returns_transport_errors_with_client_cipher() {
         let calls = Arc::new(AtomicUsize::new(0));

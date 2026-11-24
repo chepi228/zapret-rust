@@ -18,6 +18,12 @@ pub const SECTIONS: [&str; 7] = [
 ];
 pub const ROTATION_PREFERENCE: [&str; 9] = ["12", "11", "32", "31", "13", "10", "21", "22", "23"];
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct GameProtocols {
+    pub tcp: bool,
+    pub udp: bool,
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Strategy {
     pub id: String,
@@ -75,6 +81,8 @@ impl Strategy {
             ("61", "ALT11 белый 1 везде") => "WHITE-01-PLUS",
             ("70", "ALT11 без STUN") => "SOFT-NO-STUN",
             ("71", "ALT11 STUN вторым") => "SOFT-STUN-2ND",
+            ("75", "Мягкая для сайтов и Discord") => "SOFT-WEB",
+            ("76", "Белая 02-05 с игровым TCP") => "WHITE-TCP-LITE",
             _ => &self.name,
         }
     }
@@ -85,6 +93,20 @@ impl Strategy {
             .or_else(|| self.sections.get(fallback))
             .map(Vec::as_slice)
             .unwrap_or(&[])
+    }
+    /// A standalone engine --skip in a game section opts out of its port range.
+    pub fn skips_game_section(&self, section: &str) -> bool {
+        matches!(section, "game_tcp" | "game_udp")
+            && matches!(self.section(section, ""), [line] if line == "--skip")
+    }
+    pub fn game_protocols(&self, mode: &str) -> GameProtocols {
+        let mode = mode.to_ascii_lowercase();
+        GameProtocols {
+            tcp: matches!(mode.as_str(), "all" | "selected" | "tcp")
+                && !self.skips_game_section("game_tcp"),
+            udp: matches!(mode.as_str(), "all" | "selected" | "udp")
+                && !self.skips_game_section("game_udp"),
+        }
     }
     pub fn section_family(&self, name: &str, fallback: &str) -> &str {
         let actual = if self.sections.contains_key(name) {
@@ -259,7 +281,7 @@ mod tests {
         let strategies = list_strategies(&root)?;
         let retired = crate::list_lines(&root.join("strategies/retired.txt"))?;
         let mut codes = BTreeSet::new();
-        assert_eq!(strategies.len(), 36);
+        assert_eq!(strategies.len(), 34);
         for (index, strategy) in strategies.iter().enumerate() {
             assert!(!retired.contains(&format!("alt{}.txt", strategy.id)));
             let code = strategy.display_name();

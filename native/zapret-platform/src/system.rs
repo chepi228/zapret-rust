@@ -369,7 +369,6 @@ pub(crate) fn adapters() -> Result<Value> {
                 p = (*p).Next;
             }
             addresses.sort_by_key(ToString::to_string);
-            dns.sort();
             gateways.sort();
             let name = text16(a.FriendlyName);
             let description = text16(a.Description);
@@ -521,7 +520,8 @@ pub fn configured_proxy_server() -> Result<Option<String>> {
 pub(crate) fn proxy() -> Result<Value> {
     unsafe {
         let mut config: WINHTTP_CURRENT_USER_IE_PROXY_CONFIG = zeroed();
-        let known = WinHttpGetIEProxyConfigForCurrentUser(&mut config) != 0;
+        let known = WinHttpGetIEProxyConfigForCurrentUser(&mut config) != 0
+            || GetLastError() == ERROR_FILE_NOT_FOUND;
         let proxy = text16(config.lpszProxy);
         let pac = text16(config.lpszAutoConfigUrl);
         let bypass = text16(config.lpszProxyBypass);
@@ -550,18 +550,95 @@ pub(crate) fn proxy() -> Result<Value> {
         )
     }
 }
+// Keep the full Windows tables for diagnostics. Rank measurements identify the
+// path to remote services, which does not change when an IPv6 privacy IID rotates.
+fn network_key_parts(data: &Value) -> Value {
+    let mut interfaces = Vec::new();
+    let mut resolvers = Vec::new();
+    for row in data["adapters"].as_array().into_iter().flatten() {
+        if row["up"] != true || row["if_type"] == IF_TYPE_SOFTWARE_LOOPBACK {
+            continue;
+        }
+        let mut addresses = std::collections::BTreeSet::new();
+        for entry in row["addresses"].as_array().into_iter().flatten() {
+            let Some(ip) = entry["address"].as_str() else {
+                continue;
+            };
+            let cidr = format!("{ip}/{}", entry["prefix_length"]);
+            let address = match ip.parse::<Ipv6Addr>() {
+                Ok(v6) if v6.is_unicast_link_local() => continue,
+                Ok(_) => zapret_core::normalize_ip_network(&cidr).unwrap_or(cidr),
+                Err(_) => cidr,
+            };
+            addresses.insert(address);
+        }
+        interfaces.push(json!([
+            row["id"],
+            row["index"],
+            row["ipv6_index"],
+            row["if_type"],
+            row["ipv4_metric"],
+            row["ipv6_metric"],
+            row["mtu"],
+            row["gateways"],
+            addresses
+        ]));
+        resolvers.push(json!([row["index"], row["dns_suffix"], row["dns_servers"]]));
+    }
+    interfaces.sort_by_cached_key(ToString::to_string);
+    resolvers.sort_by_cached_key(ToString::to_string);
+    let routes: Vec<_> = data["routes"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|route| {
+            let ip = route["destination"]
+                .as_str()
+                .and_then(|s| s.parse::<IpAddr>().ok());
+            let local = route["protocol"] == MIB_IPPROTO_LOCAL;
+            match ip {
+                Some(ip) if ip.is_multicast() || ip.is_loopback() => false,
+                Some(IpAddr::V6(ip)) => {
+                    !ip.is_unicast_link_local() && !(local && route["prefix_length"] == 128)
+                }
+                Some(IpAddr::V4(ip)) => {
+                    !ip.is_link_local() && !(local && route["prefix_length"] == 32)
+                }
+                None => true,
+            }
+        })
+        .collect();
+    let mut profiles: Vec<_> = data["profiles"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|p| json!([p["id"], p["category"]]))
+        .collect();
+    profiles.sort_by_cached_key(ToString::to_string);
+    json!({"interfaces":hash(json!(interfaces).to_string().as_bytes()),
+        "dns":hash(json!(resolvers).to_string().as_bytes()), "routes":hash(json!(routes).to_string().as_bytes()),
+        "profiles":hash(json!(profiles).to_string().as_bytes()),"proxy":data["proxy_configuration_hash"]})
+}
+
 pub(crate) fn network(root: &Path) -> Result<Value> {
     let adapter = adapters();
     let routes = routes();
     let proxy = proxy();
     let profiles = network_profiles();
-    let known = adapter.is_ok()
-        && routes.is_ok()
-        && profiles.is_ok()
-        && proxy.as_ref().is_ok_and(|p| p["known"] == true);
+    let unavailable: Vec<_> = [
+        ("interfaces", adapter.is_ok()),
+        ("routes", routes.is_ok()),
+        ("profiles", profiles.is_ok()),
+        ("proxy", proxy.as_ref().is_ok_and(|p| p["known"] == true)),
+    ]
+    .into_iter()
+    .filter_map(|(name, ok)| (!ok).then_some(name))
+    .collect();
+    let known = unavailable.is_empty();
     let profiles_error = profiles.as_ref().err().map(ToString::to_string);
     let data = json!({"adapters":adapter.unwrap_or(json!([])),"routes":routes.unwrap_or(json!([])),"profiles":profiles.unwrap_or(json!([])),"proxy_configuration_hash":proxy.as_ref().ok().map(|p|p["configuration_hash"].clone())});
-    let key = hash(serde_json::to_string(&data)?.as_bytes());
+    let parts = network_key_parts(&data);
+    let key = hash(serde_json::to_string(&parts)?.as_bytes());
     let settings_hash = read_limited(&root.join("runtime/settings.ini"), 1024 * 1024)
         .ok()
         .map(|b| hash(&b));
@@ -569,7 +646,7 @@ pub(crate) fn network(root: &Path) -> Result<Value> {
     let observation = engine_observation(root, processes()?);
     let ownership_known = observation.unidentified.is_empty();
     Ok(
-        json!({"schema":"zapret-native-network-v1","known":known,"key":if known{key.clone()}else{String::new()},"stable_key":if known{key}else{String::new()},"adapters":data["adapters"],"routes":data["routes"],"profiles":data["profiles"],"profiles_error":profiles_error,"proxy":proxy.unwrap_or(json!({"known":false})),"processes":observation.processes,"ownership_known":ownership_known,"unidentified_engine_processes":observation.unidentified,"settings_hash":settings_hash,"wifi_event":wifi_event}),
+        json!({"schema":"zapret-native-network-v1","known":known,"key_parts":parts,"unavailable":unavailable,"key":if known{key.clone()}else{String::new()},"stable_key":if known{key}else{String::new()},"adapters":data["adapters"],"routes":data["routes"],"profiles":data["profiles"],"profiles_error":profiles_error,"proxy":proxy.unwrap_or(json!({"known":false})),"processes":observation.processes,"ownership_known":ownership_known,"unidentified_engine_processes":observation.unidentified,"settings_hash":settings_hash,"wifi_event":wifi_event}),
     )
 }
 fn network_profiles() -> Result<Value> {
@@ -579,6 +656,60 @@ fn network_profiles() -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn network_sample() -> Value {
+        json!({"adapters":[{"index":4,"if_type":71,"id":"wifi","up":true,"mtu":1500,
+            "dns_servers":["192.0.2.53","192.0.2.54"],"ipv6_metric":25,"gateways":["fe80::1"],
+            "addresses":[{"address":"2001:db8::3","prefix_length":64}]}],
+            "routes":[{"interface_index":4,"destination":"::","prefix_length":0,"next_hop":"fe80::1","metric":20,"protocol":3},
+            {"interface_index":4,"destination":"2001:db8::3","prefix_length":128,"next_hop":"::","protocol":2}],
+            "profiles":[{"id":"home","category":1,"name":"Wi-Fi"}],"proxy_configuration_hash":"proxy-a"})
+    }
+
+    #[test]
+    fn rotating_ipv6_addresses_and_local_routes_keep_the_same_network() {
+        let mut sample = network_sample();
+        let before = network_key_parts(&sample);
+        sample["adapters"][0]["addresses"][0]["address"] = json!("2001:db8::5");
+        sample["routes"][1]["destination"] = json!("2001:db8::5");
+        sample["adapters"][0]["addresses"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"address":"2001:db8::7","prefix_length":64}));
+        sample["adapters"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"index":9,"up":false,"name":"Bluetooth"}));
+        sample["profiles"][0]["name"] = json!("Wi-Fi 2");
+        assert_eq!(before, network_key_parts(&sample));
+    }
+
+    #[test]
+    fn genuine_path_and_configuration_changes_remain_visible() {
+        let sample = network_sample();
+        let before = network_key_parts(&sample);
+        for (pointer, replacement, part) in [
+            ("/routes/0/next_hop", json!("fe80::7"), "routes"),
+            ("/routes/1/protocol", json!(3), "routes"), // split-tunnel host route
+            (
+                "/adapters/0/addresses/0/address",
+                json!("2001:db8:1::3"),
+                "interfaces",
+            ),
+            ("/adapters/0/ipv6_metric", json!(8), "interfaces"),
+            (
+                "/adapters/0/dns_servers",
+                json!(["192.0.2.54", "192.0.2.53"]),
+                "dns",
+            ),
+            ("/profiles/0/id", json!("office"), "profiles"),
+            ("/proxy_configuration_hash", json!("proxy-b"), "proxy"),
+        ] {
+            let mut changed = sample.clone();
+            *changed.pointer_mut(pointer).unwrap() = replacement;
+            assert_ne!(before[part], network_key_parts(&changed)[part], "{pointer}");
+        }
+    }
     #[test]
     fn process_snapshot_distinguishes_unknown_engine_identity_from_foreign_processes() {
         assert_eq!(process_name("WINWS2.EXE"), "WINWS2");
