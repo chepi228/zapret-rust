@@ -17,6 +17,8 @@ pub struct Cli {
 #[derive(Subcommand)]
 pub enum Action {
     Menu,
+    /// Подготовить списки и проверить совместимость этой установки.
+    FirstRun,
     /// Safe presentation-only preview; does not read or change machine state.
     #[command(hide = true)]
     MenuPreview {

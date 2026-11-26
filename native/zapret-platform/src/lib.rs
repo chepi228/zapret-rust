@@ -10,6 +10,7 @@ mod launch;
 mod legacy;
 mod maintenance;
 mod metrics;
+mod network_events;
 mod network_settings;
 mod package;
 mod process;
@@ -34,6 +35,7 @@ pub use hosts::{
 pub use launch::validate_launch;
 pub use maintenance::is_admin;
 pub use metrics::ProcessMetrics;
+pub use network_events::NetworkEvents;
 pub use process::{
     OwnedChild, ProcessIdentity, RunOptions, RunOutput, process_identity, run_owned,
     terminate_owned,
@@ -138,6 +140,7 @@ pub fn command(
             tasks::action(root, args, tasks::Action::Delete)
         }
         "telegram-status" => telegram::status(root),
+        "telegram-media" => telegram::media_check(root),
         "telegram-start" => telegram::start(root, args),
         "telegram-stop" => telegram::stop(root, args),
         "telegram-run" => telegram::run(root),
@@ -157,7 +160,9 @@ pub fn command(
         "games" => Ok(json!(system::games(root)?)),
         "adapters" => system::adapters(),
         "wifi-events" => wifi::events(args),
-        "network" | "network-context" => system::network(root),
+        "network" | "network-context" => {
+            system::network_snapshot(root, args["identity_only"] == true)
+        }
         "proxy" => system::proxy(),
         "certificates" => certificates::inspect(),
         "protect-package" | "unprotect-package" | "unblock-package" => {

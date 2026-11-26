@@ -7,6 +7,8 @@ pub const CORE_VERSION: &str = "flowseal-1.11.4-rust-1";
 
 mod config;
 mod h2;
+mod media_check;
+pub use media_check::check as check_media;
 mod protocol;
 mod routes;
 mod transport;

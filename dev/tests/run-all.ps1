@@ -1,7 +1,7 @@
 ﻿# Все проверки разработчика по очереди - на копии папки, настоящий runtime не трогается.
 # Трафик не перехватывается: winws2 запускается с --dry-run или пустым фильтром --intercept=0 (luatest). liststest и hoststest ходят в интернет
 # (GitHub, DNS, TLS к GitHub/Telegram/Discord, мост Telegram); -Offline их пропускает.
-param([switch]$Offline,[switch]$RustRing,[switch]$NativeWindows,[string]$NativeRelease)
+param([switch]$Offline,[switch]$RustRing,[switch]$NativeWindows,[string]$NativeRelease,[string]$LegacyTgwsFile)
 $root = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
 $stage = Join-Path $env:TEMP ('nba-tests-' + [guid]::NewGuid().ToString('N'))
 $stage = [IO.Path]::GetFullPath($stage)
@@ -18,6 +18,7 @@ if ($NativeRelease) {
     }
     # Worker/recovery are exercised by check-package; the legacy snapshot has a 64 MiB input budget.
     Copy-Item -LiteralPath $sourceImage -Destination (Join-Path $pkg 'bin/zapret-rust.exe') -Force
+    Copy-Item -LiteralPath (Join-Path $NativeRelease 'zapret-launcher.exe') -Destination (Join-Path $pkg 'zapret-rust.exe') -Force
     Write-Host ('Native test image zapret-rust.exe: ' + (Get-FileHash -LiteralPath $sourceImage -Algorithm SHA256).Hash)
 }
 if($RustRing -or $NativeWindows){
@@ -59,8 +60,24 @@ $ps = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
 $failed = @()
 foreach ($t in $tests) {
     Write-Host ('===== ' + $t) -ForegroundColor Cyan
-    & $ps -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot ($t + '.ps1')) -Pkg $pkg
-    if ($LASTEXITCODE -ne 0) { $failed += $t }
+    $addedFixture=$null
+    try {
+        if($LegacyTgwsFile -and $t -in @('buildtest','migrationtest')){
+            . (Join-Path $pkg 'tools/tgws.ps1')
+            $legacy=Get-TgWsRelease
+            $destination=Join-Path $pkg $legacy.RelativePath
+            if(-not [IO.File]::Exists($destination)){
+                if((Get-FileHash -LiteralPath $LegacyTgwsFile).Hash -ne $legacy.Sha256){throw 'Incorrect Telegram fixture for the legacy package'}
+                [IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($destination))|Out-Null
+                Copy-Item -LiteralPath $LegacyTgwsFile -Destination $destination -ErrorAction Stop
+                $addedFixture=$destination
+            }
+        }
+        & $ps -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot ($t + '.ps1')) -Pkg $pkg
+        if ($LASTEXITCODE -ne 0) { $failed += $t }
+    } finally {
+        if($addedFixture){Remove-Item -LiteralPath $addedFixture -Force -ErrorAction Stop}
+    }
 }
 Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue
 if ($failed.Count) { Write-Host ('НЕ ПРОШЛИ: ' + ($failed -join ', ')) -ForegroundColor Red; exit 1 }

@@ -1,4 +1,5 @@
 //! Portable configuration, composition and historical measurement contracts.
+mod addresses;
 mod capture;
 mod compose;
 mod context;
@@ -13,6 +14,7 @@ mod selection;
 mod settings;
 mod strategy;
 
+pub use addresses::connection_addresses;
 pub use capture::*;
 pub use compose::*;
 pub use context::*;

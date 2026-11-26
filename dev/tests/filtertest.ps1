@@ -46,10 +46,10 @@ if($helper){
     }finally{[IO.File]::WriteAllBytes($source,$sourceBytes)}
 }
 # Exercise the actual launcher from both command interpreters without UAC or menu execution.
-$launcherName=if(Test-Path -LiteralPath (Join-Path $Pkg 'zapret-rust.bat')){'zapret-rust.bat'}else{'zapret.bat'}
+$launcherName=if(Test-Path -LiteralPath (Join-Path $Pkg 'zapret-rust.exe')){'zapret-rust.exe'}elseif(Test-Path -LiteralPath (Join-Path $Pkg 'zapret-rust.bat')){'zapret-rust.bat'}else{'zapret.bat'}
 $launcherPath=Join-Path $Pkg $launcherName
-$launcher=[IO.File]::ReadAllText($launcherPath)
-$controller=if($launcher.Contains('bin\zapret-rust.exe')){'zapret-rust'}elseif($launcher.Contains('bin\zapret.exe')){'zapret'}else{''}
+$launcher=if($launcherName -ne 'zapret-rust.exe'){[IO.File]::ReadAllText($launcherPath)}else{''}
+$controller=if($launcherName -eq 'zapret-rust.exe' -or $launcher.Contains('bin\zapret-rust.exe')){'zapret-rust'}elseif($launcher.Contains('bin\zapret.exe')){'zapret'}else{''}
 if($controller){
     $native=[IO.File]::ReadAllBytes((Join-Path $Pkg ('bin/'+$controller+'.exe')))
     $pe=[BitConverter]::ToInt32($native,0x3c)

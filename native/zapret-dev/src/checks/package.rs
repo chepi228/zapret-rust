@@ -46,6 +46,14 @@ pub(crate) fn run(archive: &Path, output: &Path) -> Result<()> {
             .any(|name| names.contains(&format!("zapret-rust/{name}"))),
             "ZIP contains only current native entries",
         )?;
+        evidence.check(
+            root.join("zapret-rust.exe").is_file() && !root.join("zapret-rust.bat").exists(),
+            "EXE is the only public launcher",
+        )?;
+        evidence.check(
+            zapret_core::list_lines(&root.join("lists/ipset-all.txt"))?.len() >= 1000,
+            "a clean offline installation includes the public IP list",
+        )?;
         let runner = Runner::new(&root);
         let executable = &runner.executable;
         let catalog: Value =
@@ -281,22 +289,34 @@ pub(crate) fn run(archive: &Path, output: &Path) -> Result<()> {
         fs::write(&queue, source)?;
         let settings_before = fs::read(&settings_path)?;
         let lab = runner.json(&["lab", "--dir", laboratory.to_str().unwrap(), "--plan-only"])?;
-        let tcp_targets: Vec<_> = plan["targets"]
+        let selection_targets = plan["targets"]
             .as_array()
-            .context("missing selection plan targets")?
+            .context("missing selection plan targets")?;
+        evidence.check(
+            selection_targets.iter().any(|target| {
+                target["name"] == "game_icon" && target["expected"]["mode"] == "roblox_icon"
+            }),
+            "autopick plan includes the two-origin Roblox game icon",
+        )?;
+        let single_peer_targets: Vec<_> = selection_targets
             .iter()
-            .filter(|target| target["expected"]["mode"] != "http3_head")
+            .filter(|target| {
+                !matches!(
+                    target["expected"]["mode"].as_str(),
+                    Some("http3_head" | "roblox_icon")
+                )
+            })
             .collect();
         evidence.check(
             lab["plan_only"] == true
                 && lab["queues"][0]["blocks"]
                     .as_array()
                     .is_some_and(|blocks| blocks.len() == 3)
-                && lab["targets"] == json!(tcp_targets)
+                && lab["targets"] == json!(single_peer_targets)
                 && fs::read_to_string(&queue)? == source
                 && fs::read(&settings_path)? == settings_before
                 && !laboratory.join("lab.log").exists(),
-            "native lab plan parses trials and includes every TCP target in order",
+            "native lab plan parses trials and includes every single-peer TCP target in order",
         )?;
         fs::write(&queue, "@ invalid\n--lua-init=@arbitrary.lua\n")?;
         runner.raw(
@@ -342,8 +362,8 @@ pub(crate) fn run(archive: &Path, output: &Path) -> Result<()> {
         let strategies = runner.json(&["strategies"])?;
         let strategies = strategies.as_array().context("strategy array")?;
         evidence.check(
-            strategies.len() == 34,
-            "all 34 bundled strategy records are available",
+            strategies.len() == 36,
+            "all 36 bundled strategy records are available",
         )?;
         fs::write(
             root.join("lists/autohostlist.txt"),
@@ -447,10 +467,11 @@ pub(crate) fn run(archive: &Path, output: &Path) -> Result<()> {
         let expected_engine = root.join("bin/winws2.exe");
         for architecture in ["System32", "SysWOW64"] {
             evidence.check(
-                text(&runner.bat(&["--version"], architecture, 0)?)?.trim() == expected_version,
-                format!("{architecture} BAT starts the native application"),
+                text(&runner.launcher_from_shell(&["--version"], architecture, 0)?)?.trim()
+                    == expected_version,
+                format!("{architecture} launcher starts the native application"),
             )?;
-            let output = runner.bat(
+            let output = runner.launcher_from_shell(
                 &["--json", "compose", "--no-auto", "--dry-run"],
                 architecture,
                 0,
@@ -461,17 +482,18 @@ pub(crate) fn run(archive: &Path, output: &Path) -> Result<()> {
                         .as_str()
                         .context("engine path")?,
                 ) == expected_engine,
-                format!("{architecture} BAT resolves the exact engine path"),
+                format!("{architecture} launcher resolves the exact engine path"),
             )?;
         }
         fs::rename(executable, root.join("bin/mapped-old-native.exe"))?;
         evidence.check(
-            text(&runner.bat(&["--version"], "System32", 0)?)?.trim() == expected_version,
-            "BAT executes recovery while the main image is absent",
+            text(&runner.launcher_from_shell(&["--version"], "System32", 0)?)?.trim()
+                == expected_version,
+            "EXE executes recovery while the main image is absent",
         )?;
         let recovered: Value = serde_json::from_slice(
             &runner
-                .bat(
+                .launcher_from_shell(
                     &["--json", "compose", "--no-auto", "--dry-run"],
                     "System32",
                     0,

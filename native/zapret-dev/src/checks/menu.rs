@@ -10,8 +10,8 @@ fn fixture() -> Value {
 }
 
 // This test never launches the interactive menu: startup has deliberate live
-// side effects. Keep the allowed read-only BAT routes explicit in this helper.
-fn run_bat(runner: &Runner, args: &[&str], expected: u32) -> Result<RunOutput> {
+// side effects. Keep the allowed read-only launcher routes explicit in this helper.
+fn run_launcher(runner: &Runner, args: &[&str], expected: u32) -> Result<RunOutput> {
     ensure!(
         args.first() == Some(&"menu-preview")
             || matches!(
@@ -27,7 +27,13 @@ fn run_bat(runner: &Runner, args: &[&str], expected: u32) -> Result<RunOutput> {
             ),
         "Mutating command in read-only menu fixture"
     );
-    runner.bat(args, "System32", expected)
+    invoke(
+        &runner.root.join("zapret-rust.exe"),
+        &args.iter().map(OsString::from).collect::<Vec<_>>(),
+        runner.root.parent(),
+        expected,
+        None,
+    )
 }
 
 fn cached(
@@ -40,12 +46,12 @@ fn cached(
     let encoded = serde_json::to_vec(report)?;
     fs::write(&path, &encoded)?;
     let structured: Value =
-        serde_json::from_slice(&run_bat(runner, &["--json", "test", "--last"], 0)?.stdout)?;
+        serde_json::from_slice(&run_launcher(runner, &["--json", "test", "--last"], 0)?.stdout)?;
     evidence.check(
         structured == *report,
         "cached JSON preserves the exact measured record",
     )?;
-    let human = text(&run_bat(runner, &["test", "--last"], 0)?)?;
+    let human = text(&run_launcher(runner, &["test", "--last"], 0)?)?;
     evidence.check(
         human.starts_with('╭')
             && human.contains("ALT11 белый 3")
@@ -78,37 +84,27 @@ pub(crate) fn run(archive: &Path, output: &Path) -> Result<()> {
             &archive,
             &root,
             Some(&[
-                "zapret-rust.bat",
+                "zapret-rust.exe",
                 "bin/zapret-rust.exe",
                 "bin/zapret-rust-recovery.exe",
             ]),
         )?;
         let runner = Runner::new(&root);
-        let launcher = fs::read_to_string(root.join("zapret-rust.bat"))?;
-        let lines = launcher
-            .trim_start_matches('\u{feff}')
-            .lines()
-            .map(str::trim)
-            .filter(|line| line.starts_with("\"%~dp0bin\\"))
-            .collect::<Vec<_>>();
-        let pattern = regex::Regex::new(
-            r#"^"%~dp0bin\\zapret-rust(?:-recovery)?\.exe" --root "%~dp0\." %\*$"#,
-        )?;
         evidence.check(
-            lines.len() == 2 && lines.iter().all(|line| pattern.is_match(line)),
-            "launcher forwards fixed read-only command arguments",
+            !root.join("zapret-rust.bat").exists() && root.join("zapret-rust.exe").is_file(),
+            "the public menu entry is a Windows executable",
         )?;
         for arch in ["System32", "SysWOW64"] {
             evidence.check(
-                text(&runner.bat(&["--version"], arch, 0)?)?
+                text(&runner.launcher_from_shell(&["--version"], arch, 0)?)?
                     .trim()
                     .starts_with("zapret-rust "),
-                format!("{arch} BAT starts the native application"),
+                format!("{arch} opens the native launcher"),
             )?;
         }
         for (screen, last) in [("main", 9), ("settings", 11), ("tools", 12), ("test", 5)] {
             for width in [55, 80] {
-                let human = text(&run_bat(
+                let human = text(&run_launcher(
                     &runner,
                     &[
                         "menu-preview",
@@ -273,7 +269,7 @@ pub(crate) fn run(archive: &Path, output: &Path) -> Result<()> {
             vec!["task", "status", "autotune"],
             vec!["telegram", "status"],
         ] {
-            let human = text(&run_bat(&runner, &args, 0)?)?;
+            let human = text(&run_launcher(&runner, &args, 0)?)?;
             let human = human.trim();
             evidence.check(
                 !human.is_empty()
@@ -290,7 +286,7 @@ pub(crate) fn run(archive: &Path, output: &Path) -> Result<()> {
             )?;
         }
         fs::remove_file(&saved)?;
-        let missing = run_bat(&runner, &["test", "--last"], 1)?;
+        let missing = run_launcher(&runner, &["test", "--last"], 1)?;
         evidence.check(
             String::from_utf8_lossy(&missing.stderr).contains("Результатов ещё нет"),
             "missing history is readable and never starts selection",
@@ -299,14 +295,14 @@ pub(crate) fn run(archive: &Path, output: &Path) -> Result<()> {
         value["schema"] = json!(999);
         fs::write(&saved, serde_json::to_vec(&value)?)?;
         evidence.check(
-            String::from_utf8_lossy(&run_bat(&runner, &["test", "--last"], 1)?.stderr)
+            String::from_utf8_lossy(&run_launcher(&runner, &["test", "--last"], 1)?.stderr)
                 .to_lowercase()
                 .contains("повреждён"),
             "unsupported saved schema is readable",
         )?;
         fs::write(&saved, b"{broken")?;
         evidence.check(
-            String::from_utf8_lossy(&run_bat(&runner, &["test", "--last"], 1)?.stderr)
+            String::from_utf8_lossy(&run_launcher(&runner, &["test", "--last"], 1)?.stderr)
                 .to_lowercase()
                 .contains("повреждён"),
             "malformed saved JSON is readable",
@@ -321,7 +317,7 @@ pub(crate) fn run(archive: &Path, output: &Path) -> Result<()> {
                 ]
                 .iter()
                 .any(|name| root.join("runtime").join(name).exists()),
-            "read-only BAT routes preserve engine intent and controller",
+            "read-only launcher routes preserve engine intent and controller",
         )?;
         Ok(())
     })();

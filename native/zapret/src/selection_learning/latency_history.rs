@@ -83,6 +83,7 @@ struct SavedRun {
     startup: Option<Startup>,
     startup_error: Option<String>,
     next_quick_latency: Option<Vec<String>>,
+    selection_policy: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -122,7 +123,9 @@ fn from_report(
     {
         return None;
     }
-    if let Some(ids) = run.next_quick_latency {
+    if run.selection_policy.as_deref() == Some(selection_latency::POLICY)
+        && let Some(ids) = run.next_quick_latency
+    {
         return (ids.len() <= SLOTS).then_some(ids);
     }
     let mut trials: SavedTrials = serde_json::from_slice(bytes).ok()?;
@@ -173,6 +176,7 @@ mod tests {
             run_id: "c".repeat(32),
         };
         let source = json!({"schema":1,"context":context,"primary":"50","timeout_ms":5000,"accepted":true,"quality_eligible":true,
+            "selection_policy":selection_latency::POLICY,
             "parallel":8,"next_quick_latency":["70","71"]});
         let mut current = context.clone();
         current.run_id = "d".repeat(32);

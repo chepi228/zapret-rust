@@ -288,7 +288,24 @@ mod maintenance {
     pub fn recover_start(_: &App) -> Result<()> {
         Ok(())
     }
-    pub fn start_background_maintenance(_: &App) {}
+    pub mod first_run {
+        use super::*;
+
+        pub fn lists_status(_: &Path) -> String {
+            "локальные копии".into()
+        }
+
+        pub fn run(_: &App, mut notify: impl FnMut(&str)) -> Result<Value> {
+            event("first-run", json!({}));
+            notify("Проверяю совместимость…");
+            Ok(json!({"complete":true,"text":"Первая настройка завершена."}))
+        }
+    }
+    pub fn start_background_maintenance(_: &App, _: bool) {}
+    pub fn track_city(_: &App) -> Result<String> {
+        event("track", json!({"process":"NBA2K*","seconds":120}));
+        Ok("Файл для передачи — runtime\\track-last.json".into())
+    }
     pub fn notices(_: &App) -> Result<Value> {
         event("notices", json!({}));
         Ok(json!({"notices":[{"text":"Тестовое уведомление"}]}))

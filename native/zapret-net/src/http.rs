@@ -6,10 +6,9 @@ use hyper::{
     client::conn::http1,
 };
 use hyper_util::rt::TokioIo;
-use std::{path::Path, time::Duration};
+use std::{net::SocketAddr, path::Path, time::Duration};
 use tokio::{
     io::{AsyncRead, AsyncWrite},
-    net::lookup_host,
     task::JoinHandle,
     time::timeout,
 };
@@ -55,32 +54,43 @@ pub(crate) fn hostname(url: &Url) -> String {
         Host::Ipv6(ip) => ip.to_string(),
     }
 }
-async fn response_accept(
+pub(crate) async fn response_accept(
     url: &Url,
     method: &str,
     connector: &tokio_native_tls::TlsConnector,
     accept: &str,
+    bootstrap: &[SocketAddr],
 ) -> Result<(Response<Incoming>, Driver)> {
     let host = hostname(url);
     let port = url.port_or_known_default().context("URL port")?;
-    let addresses: Vec<_> = lookup_host((host.as_str(), port))
-        .await
-        .context("DNS lookup failed")?
-        .take(16)
-        .collect();
-    let stream = crate::tcp::connect(&addresses, &mut Vec::new())
-        .await
-        .map_err(anyhow::Error::msg)
-        .context("TCP connection failed")?;
-    let io: Box<dyn Io> = if url.scheme() == "https" {
-        Box::new(
-            connector
-                .connect(&host, stream)
-                .await
-                .context("TLS certificate validation or handshake failed")?,
-        )
+    let resolved;
+    let addresses = if bootstrap.is_empty() {
+        resolved = crate::connection::resolve_addresses(&host, port)
+            .await
+            .context("DNS lookup failed")?;
+        resolved.as_slice()
     } else {
+        bootstrap
+    };
+    let io: Box<dyn Io> = if url.scheme() == "https" {
+        let (stream, _) =
+            crate::tcp::connect_tls(addresses, &mut Vec::new(), &host, connector, |_| {})
+                .await
+                .map_err(|(cause, error)| {
+                    anyhow::Error::msg(error).context(if cause == crate::Termination::TlsFailure {
+                        "TLS certificate validation or handshake failed"
+                    } else {
+                        "TCP connection failed"
+                    })
+                })?;
         Box::new(stream)
+    } else {
+        Box::new(
+            crate::tcp::connect(addresses, &mut Vec::new())
+                .await
+                .map_err(anyhow::Error::msg)
+                .context("TCP connection failed")?,
+        )
     };
     let (mut sender, connection) = http1::Builder::new()
         .max_buf_size(32768)
@@ -111,23 +121,32 @@ pub(crate) async fn fetch_async(
     timeout_ms: u64,
     ca_file: Option<&Path>,
 ) -> Result<Vec<u8>> {
-    fetch_accept(text, max_bytes, timeout_ms, ca_file, "*/*").await
+    fetch_accept(text, max_bytes, timeout_ms, ca_file, "*/*", &[]).await
 }
+
 pub(crate) async fn fetch_accept(
     text: &str,
     max_bytes: usize,
     timeout_ms: u64,
     ca_file: Option<&Path>,
     accept: &str,
+    bootstrap: &[SocketAddr],
 ) -> Result<Vec<u8>> {
     if !(1..=MAX_DOWNLOAD).contains(&max_bytes) || !(1..=300_000).contains(&timeout_ms) {
         bail!("invalid download limits")
     }
     let mut url = checked_url(text, false)?;
+    let origin = url.origin();
     let connector = crate::tls_connector(ca_file, &["http/1.1"])?;
     timeout(Duration::from_millis(timeout_ms), async {
         for redirects in 0..=5 {
-            let (mut response, _driver) = response_accept(&url, "GET", &connector, accept).await?;
+            let peers = if url.origin() == origin {
+                bootstrap
+            } else {
+                &[]
+            };
+            let (mut response, _driver) =
+                response_accept(&url, "GET", &connector, accept, peers).await?;
             if matches!(response.status().as_u16(), 301 | 302 | 303 | 307 | 308) {
                 if redirects == 5 {
                     bail!("redirect limit exceeded")
@@ -180,6 +199,14 @@ pub(crate) async fn fetch_accept(
 pub fn fetch(url: &str, max_bytes: usize, timeout_ms: u64) -> Result<Vec<u8>> {
     crate::runtime(fetch_async(url, max_bytes, timeout_ms, None))
 }
+pub fn fetch_with_accept(
+    url: &str,
+    max_bytes: usize,
+    timeout_ms: u64,
+    accept: &str,
+) -> Result<Vec<u8>> {
+    crate::runtime(fetch_accept(url, max_bytes, timeout_ms, None, accept, &[]))
+}
 pub fn download(url: &str, path: &Path, max_bytes: usize, timeout_ms: u64) -> Result<()> {
     use std::io::Write;
     let bytes = fetch(url, max_bytes, timeout_ms)?;
@@ -195,4 +222,54 @@ pub fn download(url: &str, path: &Path, max_bytes: usize, timeout_ms: u64) -> Re
         .persist(path)
         .context("atomically publish download")?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+    };
+
+    #[tokio::test]
+    async fn resolver_bootstrap_applies_only_to_the_original_origin() {
+        let first = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let next = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let bootstrap = first.local_addr().unwrap();
+        let redirect = next.local_addr().unwrap();
+        let serve = async move {
+            let (mut client, _) = first.accept().await.unwrap();
+            let mut buffer = [0; 4096];
+            client.read(&mut buffer).await.unwrap();
+            let response = format!(
+                "HTTP/1.1 302 Found\r\nLocation: http://{redirect}/answer\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+            client.write_all(response.as_bytes()).await.unwrap();
+            let (mut other, _) = next.accept().await.unwrap();
+            other.read(&mut buffer).await.unwrap();
+            other
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                .await
+                .unwrap();
+        };
+        let (reply, _) = tokio::time::timeout(Duration::from_secs(4), async {
+            // This port has no listener. Only the supplied bootstrap can reach the redirect.
+            let peers = [bootstrap];
+            tokio::join!(
+                fetch_accept(
+                    "http://localhost:0/dns",
+                    32,
+                    2000,
+                    None,
+                    "application/dns-json",
+                    &peers
+                ),
+                serve
+            )
+        })
+        .await
+        .unwrap();
+        assert_eq!(reply.unwrap(), b"ok");
+    }
 }

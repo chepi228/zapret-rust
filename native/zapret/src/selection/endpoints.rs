@@ -29,9 +29,22 @@ fn pin(target: &Target, peer: SocketAddr) -> Target {
     }
 }
 
+pub(super) fn multiple_tls_peers(raw: &Value) -> bool {
+    raw["tcp_attempts"].as_array().is_some_and(|attempts| {
+        attempts
+            .iter()
+            .filter(|attempt| attempt.get("error") == Some(&Value::Null))
+            .nth(1)
+            .is_some()
+    })
+}
+
 pub(super) fn for_round(targets: &[Target], baseline: &[Row]) -> Vec<Target> {
     let peers: BTreeMap<_, _> = baseline
         .iter()
+        .filter(|row| {
+            row.state == "OK" && !row.flaky && row.tries == 1 && row.code.starts_with('2')
+        })
         .filter_map(|row| {
             let peer = address(&row.raw)?;
             advertised(&row.raw, peer).then(|| (row.key(), peer))
@@ -40,8 +53,10 @@ pub(super) fn for_round(targets: &[Target], baseline: &[Row]) -> Vec<Target> {
     targets
         .iter()
         .map(|target| match peers.get(&target.key()) {
-            Some(&peer) => pin(target, peer),
-            None => target.clone(),
+            Some(&peer) if target.probe_mode() != zapret_net::ProbeMode::RobloxIcon => {
+                pin(target, peer)
+            }
+            _ => target.clone(),
         })
         .collect()
 }
@@ -62,7 +77,8 @@ pub(super) fn verify_peer(row: &zapret_net::Observation, peer: SocketAddr) -> Re
 }
 
 fn failed_handshake(raw: &Value) -> bool {
-    raw["status_code"].is_null()
+    !multiple_tls_peers(raw)
+        && raw["status_code"].is_null()
         && raw["body_bytes"] == 0
         && matches!(raw["stage"].as_str(), Some("Tls" | "Tcp"))
         && matches!(
@@ -98,6 +114,9 @@ fn comparisons<'a>(targets: &'a [Target], expected: &[Row], actual: &[Row]) -> V
             }
             let failed = address(&row.raw)?;
             let key = row.key();
+            if by_key.get(&key)?.probe_mode() == zapret_net::ProbeMode::RobloxIcon {
+                return None;
+            }
             let earlier = good.get(&key)?;
             // A failure on a previously successful peer must keep its veto. Do not
             // send requests to retired DNS addresses or erase two different failed attempts.

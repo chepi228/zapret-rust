@@ -24,7 +24,11 @@ pub(super) struct Fixture {
 
 impl Fixture {
     pub fn new(ipv6: bool, tls: Option<Arc<ServerConfig>>) -> Result<Self> {
-        let listener = TcpListener::bind(if ipv6 { "[::1]:0" } else { "127.0.0.1:0" })?;
+        Self::at(if ipv6 { "[::1]:0" } else { "127.0.0.1:0" }.parse()?, tls)
+    }
+
+    pub fn at(address: SocketAddr, tls: Option<Arc<ServerConfig>>) -> Result<Self> {
+        let listener = TcpListener::bind(address)?;
         listener.set_nonblocking(true)?;
         let address = listener.local_addr()?;
         let requests = Arc::new(Mutex::new(Vec::new()));

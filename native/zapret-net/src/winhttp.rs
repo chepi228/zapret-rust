@@ -148,6 +148,178 @@ fn connection(session: &Handle, host: &[u16], port: u16) -> Result<Handle> {
     )
 }
 
+/// Downloads a public file using the current Windows proxy configuration.
+/// The time spent in Windows proxy discovery also counts towards the caller's budget.
+pub fn fetch_via_windows(
+    url: &str,
+    max_bytes: usize,
+    timeout_ms: u64,
+    accept: &str,
+) -> Result<Vec<u8>> {
+    ensure!(
+        (1..=http::MAX_DOWNLOAD).contains(&max_bytes) && (1..=300_000).contains(&timeout_ms),
+        "Invalid download limits"
+    );
+    let url = http::checked_url(url, false)?;
+    let accept = hyper::header::HeaderValue::from_str(accept)?
+        .to_str()?
+        .to_owned();
+    let budget = std::time::Duration::from_millis(timeout_ms);
+    let deadline = std::time::Instant::now() + budget;
+    let (send, receive) = std::sync::mpsc::sync_channel(1);
+    // WinHTTP can finish a synchronous PAC lookup after its phase timeout.
+    // The worker owns only request handles and memory; it never publishes files.
+    std::thread::Builder::new()
+        .name("list-winhttp".into())
+        .spawn(move || {
+            let _ = send.send(system_download(url, max_bytes, deadline, &accept));
+        })?;
+    receive
+        .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+        .context("Windows download did not complete before its deadline")?
+}
+
+fn system_download(
+    url: Url,
+    limit: usize,
+    deadline: std::time::Instant,
+    accept: &str,
+) -> Result<Vec<u8>> {
+    let remaining = || -> Result<i32> {
+        let ms = deadline
+            .saturating_duration_since(std::time::Instant::now())
+            .as_millis() as i32;
+        ensure!(ms > 0, "Windows download deadline expired");
+        Ok(ms)
+    };
+    let session = Handle::new(
+        unsafe {
+            WinHttpOpen(
+                w!("zapret-rust"),
+                WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
+                null(),
+                null(),
+                0,
+            )
+        },
+        "WinHttpOpen",
+    )?;
+    let ms = remaining()?;
+    check(
+        unsafe { WinHttpSetTimeouts(session.0, ms, ms, ms, ms) },
+        "WinHttpSetTimeouts",
+    )?;
+    let connection = connection(
+        &session,
+        &wide(&http::hostname(&url)),
+        url.port_or_known_default().context("URL port")?,
+    )?;
+    let path = wide(&url[Position::BeforePath..]);
+    let secure = if url.scheme() == "https" {
+        WINHTTP_FLAG_SECURE
+    } else {
+        0
+    };
+    let request = Handle::new(
+        unsafe {
+            WinHttpOpenRequest(
+                connection.0,
+                w!("GET"),
+                path.as_ptr(),
+                null(),
+                null(),
+                null(),
+                secure | WINHTTP_FLAG_ESCAPE_DISABLE,
+            )
+        },
+        "WinHttpOpenRequest",
+    )?;
+    request.option(
+        WINHTTP_OPTION_DISABLE_FEATURE,
+        WINHTTP_DISABLE_REDIRECTS | WINHTTP_DISABLE_COOKIES,
+    )?;
+    request.option(WINHTTP_OPTION_MAX_RESPONSE_HEADER_SIZE, MAX_HEADER_BYTES)?;
+    let header = wide(&format!("Accept: {accept}\r\n"));
+    remaining()?;
+    check(
+        unsafe {
+            WinHttpSendRequest(
+                request.0,
+                header.as_ptr(),
+                (header.len() - 1) as u32,
+                null(),
+                0,
+                0,
+                0,
+            )
+        },
+        "WinHttpSendRequest",
+    )?;
+    remaining()?;
+    check(
+        unsafe { WinHttpReceiveResponse(request.0, null_mut()) },
+        "WinHttpReceiveResponse",
+    )?;
+    let status = status_code(&request)?;
+    ensure!(status == 200, "HTTP status {status}");
+    let mut declared = 0u32;
+    let mut size = size_of_val(&declared) as u32;
+    let queried = unsafe {
+        WinHttpQueryHeaders(
+            request.0,
+            WINHTTP_QUERY_CONTENT_LENGTH | WINHTTP_QUERY_FLAG_NUMBER,
+            null(),
+            (&raw mut declared).cast(),
+            &mut size,
+            null_mut(),
+        )
+    };
+    let length = if queried != 0 {
+        ensure!(
+            declared as usize <= limit,
+            "Response Content-Length exceeds {limit} bytes"
+        );
+        Some(declared as usize)
+    } else {
+        let code = unsafe { GetLastError() };
+        ensure!(
+            code == ERROR_WINHTTP_HEADER_NOT_FOUND,
+            "Invalid response length (WinHTTP error {code})"
+        );
+        None
+    };
+    let mut bytes = Vec::new();
+    let mut block = [0u8; 16 * 1024];
+    loop {
+        remaining()?;
+        let mut received = 0;
+        check(
+            unsafe {
+                WinHttpReadData(
+                    request.0,
+                    block.as_mut_ptr().cast(),
+                    block.len() as u32,
+                    &mut received,
+                )
+            },
+            "WinHttpReadData",
+        )?;
+        if received == 0 {
+            break;
+        }
+        ensure!(
+            received as usize <= limit - bytes.len(),
+            "Response exceeds {limit} bytes"
+        );
+        bytes.extend_from_slice(&block[..received as usize]);
+    }
+    ensure!(
+        length.is_none_or(|n| n == bytes.len()),
+        "Incomplete HTTP response"
+    );
+    Ok(bytes)
+}
+
 fn request(connection: &Handle, path: &[u16]) -> Result<Handle> {
     Handle::new(
         unsafe {
@@ -503,6 +675,67 @@ async fn request_headers(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn system_download_checks_accept_status_and_complete_bounded_bodies() -> Result<()> {
+        use std::io::{BufRead, BufReader, Write};
+        use std::net::TcpListener;
+        for (status, body, declared, limit, ok) in [
+            (200, "abc", 3, 3, true),
+            (200, "abc", 3, 2, false),
+            (200, "a", 3, 3, false),
+            (302, "", 0, 3, false),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0")?;
+            let address = listener.local_addr()?;
+            listener.set_nonblocking(true)?;
+            let server = std::thread::spawn(move || -> Result<()> {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(4);
+                let mut stream = loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => break stream,
+                        Err(e)
+                            if e.kind() == std::io::ErrorKind::WouldBlock
+                                && std::time::Instant::now() < deadline =>
+                        {
+                            std::thread::sleep(std::time::Duration::from_millis(5))
+                        }
+                        Err(e) => return Err(e.into()),
+                    }
+                };
+                stream.set_read_timeout(Some(std::time::Duration::from_secs(3)))?;
+                let mut accept = false;
+                for line in BufReader::new(&stream).lines() {
+                    let line = line?;
+                    if line.is_empty() {
+                        break;
+                    }
+                    if let Some((field, value)) = line.split_once(':') {
+                        accept |= field.eq_ignore_ascii_case("accept")
+                            && value.trim().contains("application/vnd.github.raw+json");
+                    }
+                }
+                ensure!(accept, "Missing raw media type");
+                write!(
+                    stream,
+                    "HTTP/1.1 {status} test\r\nContent-Length: {declared}\r\nConnection: close\r\n\r\n{body}"
+                )?;
+                Ok(())
+            });
+            let result = fetch_via_windows(
+                &format!("http://{address}/list"),
+                limit,
+                4000,
+                "application/vnd.github.raw+json",
+            );
+            server.join().expect("server thread")?;
+            assert_eq!(result.is_ok(), ok, "{result:?}");
+            if ok {
+                assert_eq!(result?, body.as_bytes());
+            }
+        }
+        Ok(())
+    }
 
     #[test]
     fn redirects_preserve_https_authority_and_reject_credentials_or_downgrades() {

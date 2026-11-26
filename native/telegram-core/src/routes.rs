@@ -152,15 +152,21 @@ impl WsPool {
                 sleep(Duration::from_secs(1)).await;
                 continue;
             };
-            let mut socket = None;
-            for endpoint in &self.endpoints {
-                if let Ok(Ok(ws)) =
-                    timeout(PROBE_TIME, transport::connect_ws(endpoint, buffer)).await
-                {
-                    socket = Some(ws);
-                    break;
-                }
-            }
+            let probes =
+                self.endpoints
+                    .iter()
+                    .cloned()
+                    .enumerate()
+                    .map(|(index, endpoint)| async move {
+                        if index > 0 {
+                            sleep(Duration::from_millis(250)).await;
+                        }
+                        timeout(PROBE_TIME, transport::connect_ws(&endpoint, buffer))
+                            .await
+                            .ok()?
+                            .ok()
+                    });
+            let socket = first_route(probes).await;
             if let Some(socket) = socket {
                 let Ok(mut idle) = self.idle.lock() else {
                     return;
@@ -303,7 +309,7 @@ impl Router {
                 return tokio::select! {
                     biased;
                     Some(route) = self.fallback(dc) => Some(route),
-                    Some(socket) = self.first_ws(pool.endpoints.iter().take(1).cloned().collect()) =>
+                    Some(socket) = self.first_ws(pool.endpoints.clone()) =>
                         Some(Upstream::Ws(Box::new(socket), "telegram-ws")),
                     else => None,
                 };
@@ -502,7 +508,7 @@ mod tests {
 
     #[tokio::test]
     #[allow(clippy::result_large_err)]
-    async fn empty_media_pool_opens_the_configured_telegram_socket() {
+    async fn empty_media_pool_can_use_the_second_websocket_when_the_first_stalls() {
         use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let dc = Dc {
@@ -523,9 +529,20 @@ mod tests {
             path: "/apiws".into(),
             secure: false,
         };
+        // The primary accepts TCP but never answers the WebSocket handshake.
+        let stalled = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let primary = WsEndpoint {
+            host: "kws2-1.web.telegram.org".into(),
+            port: stalled.local_addr().unwrap().port(),
+            ..endpoint.clone()
+        };
+        let backup = WsEndpoint {
+            host: "kws2.web.telegram.org".into(),
+            ..endpoint
+        };
         router
             .direct
-            .insert(dc, Arc::new(WsPool::new(vec![endpoint])));
+            .insert(dc, Arc::new(WsPool::new(vec![primary, backup])));
         router.tcp.lock().unwrap().insert(
             dc.tcp_ip(),
             Arc::new(AsyncMutex::new(Backoff {
@@ -536,7 +553,7 @@ mod tests {
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             tokio_tungstenite::accept_hdr_async(stream, |req: &Request, mut res: Response| {
-                assert_eq!(req.headers()["host"], "kws2-1.web.telegram.org");
+                assert_eq!(req.headers()["host"], "kws2.web.telegram.org");
                 res.headers_mut()
                     .insert("sec-websocket-protocol", "binary".parse().unwrap());
                 Ok(res)
@@ -545,7 +562,9 @@ mod tests {
             .unwrap()
         });
         assert!(matches!(
-            router.select(dc).await,
+            timeout(Duration::from_secs(2), router.select(dc))
+                .await
+                .unwrap(),
             Some(Upstream::Ws(_, "telegram-ws"))
         ));
         drop(server.await.unwrap());

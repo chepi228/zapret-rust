@@ -29,10 +29,12 @@ pub fn verified_preferred(
     full: bool,
     details: &BTreeMap<String, Vec<Value>>,
     panel: Panel,
+    primary: &str,
+    mut availability: impl FnMut(&str, &Check) -> Result<bool>,
     mut validate: impl FnMut(&str) -> Result<Check>,
 ) -> Result<Decision> {
     if panel == Panel::Services {
-        return verified_services(rows, full, details, validate);
+        return verified_services(rows, full, details, primary, availability, validate);
     }
     let mut decision = Decision::default();
     let Some(leader) = rows.first() else {
@@ -55,9 +57,9 @@ pub fn verified_preferred(
     let order = std::iter::once(leader)
         .chain(peers.into_iter().map(|(row, _)| row))
         .chain(rows.iter().take(QUICK_FINALISTS).skip(1));
-    for row in order {
-        if !full && decision.checks.len() >= QUICK_FINALISTS {
-            break;
+    for row in order.chain(rows.iter().filter(|r| r.id == primary)) {
+        if !full && decision.checks.len() >= QUICK_FINALISTS && row.id != primary {
+            continue;
         }
         if decision.checks.contains_key(&row.id) {
             continue;
@@ -86,7 +88,7 @@ pub fn verified_preferred(
                 if speed.confirmed {
                     decision.recommended = Some(row.clone());
                 }
-            } else {
+            } else if row.id == primary || availability(&row.id, &check)? {
                 decision.recommended = Some(row.clone());
             }
         }
@@ -103,6 +105,8 @@ fn verified_services(
     rows: &[RankRow],
     full: bool,
     details: &BTreeMap<String, Vec<Value>>,
+    primary: &str,
+    mut availability: impl FnMut(&str, &Check) -> Result<bool>,
     mut validate: impl FnMut(&str) -> Result<Check>,
 ) -> Result<Decision> {
     let mut decision = Decision::default();
@@ -112,9 +116,13 @@ fn verified_services(
         .iter()
         .filter(|row| selection_latency::service_ready(row, details))
         .take(limit)
+        .chain(rows.iter().filter(|row| row.id == primary))
     {
+        if decision.checks.contains_key(&row.id) {
+            continue;
+        }
         let check = validate(&row.id)?;
-        let passed = check.confirmed;
+        let passed = check.confirmed && (row.id == primary || availability(&row.id, &check)?);
         decision.checks.insert(row.id.clone(), check);
         if passed {
             reference = Some(row);
@@ -127,13 +135,18 @@ fn verified_services(
     decision.recommended = Some(reference.clone());
     let mut peers: Vec<_> = rows
         .iter()
-        .filter(|row| !decision.checks.contains_key(&row.id))
+        .filter(|row| {
+            row.id != reference.id && decision.checks.get(&row.id).is_none_or(|c| c.confirmed)
+        })
         .filter_map(|row| selection_latency::preference(reference, row, details, Panel::Services))
         .filter(|speed| speed.trial.promising())
         .collect();
     peers.sort_by(|a, b| a.trial.screening_order(&b.trial));
     let mut finalists = Vec::new();
-    for mut speed in peers.into_iter().take(limit - decision.checks.len()) {
+    for mut speed in peers.into_iter().take(limit.saturating_sub(1)) {
+        if decision.checks.len() >= limit && !decision.checks.contains_key(&speed.candidate) {
+            continue;
+        }
         let check = validate(&speed.candidate)?;
         let before = &decision.checks[&reference.id].details;
         if check.confirmed
@@ -143,8 +156,13 @@ fn verified_services(
                 selection_latency::confirm(&speed, before, &check.details, Panel::Services, None);
         }
         decision.checks.insert(speed.candidate.clone(), check);
-        if let Some(working) = speed.working.as_ref().filter(|pair| pair.faster()) {
-            finalists.push((working.gain_ms, speed));
+        if let Some(score) = speed
+            .working
+            .as_ref()
+            .filter(|pair| pair.faster())
+            .and_then(|pair| pair.service_score.as_ref())
+        {
+            finalists.push((score.points, speed));
         } else if decision.preference.is_none() {
             decision.preference = Some(speed);
         }
@@ -153,7 +171,13 @@ fn verified_services(
     // Preserve the original reference for the endpoint check of every reversed pair.
     let mut latest_reference = None;
     let mut recheck_fallback = false;
-    for (_, mut speed) in finalists.into_iter().take(MAX_REVERSED_PAIRS) {
+    let mut best_confirmed_points = None;
+    for (first_points, mut speed) in finalists.into_iter().take(MAX_REVERSED_PAIRS) {
+        // Finalists are sorted by the first working score. Their weaker of
+        // two working scores can never exceed that first score.
+        if best_confirmed_points.is_some_and(|best| best >= first_points) {
+            break;
+        }
         let candidate_repeat = validate(&speed.candidate)?;
         recheck_fallback = !candidate_repeat.confirmed;
         if candidate_repeat.confirmed {
@@ -175,22 +199,35 @@ fn verified_services(
                         &decision.checks[&speed.candidate].details,
                     )),
                 );
-                speed.confirmed = speed.repeat.as_ref().is_some_and(|pair| pair.faster());
+                if let (Some(first), Some(repeat)) = (&speed.working, &speed.repeat) {
+                    speed.repeatable_points = selection_latency::repeatable_points(
+                        first,
+                        repeat,
+                        &decision.checks[&reference.id].details,
+                        &decision.checks[&speed.candidate].details,
+                    );
+                    speed.confirmed = repeat.faster()
+                        && speed
+                            .repeatable_points
+                            .is_some_and(|points| points >= selection_latency::MIN_WORKING_POINTS);
+                }
             }
             latest_reference = Some(reference_repeat);
         }
-        let confirmed = speed.confirmed;
         decision
             .checks
             .insert(speed.candidate.clone(), candidate_repeat);
         decision.repeat_candidates.push(speed.candidate.clone());
-        if confirmed || decision.repeat_candidates.len() == 1 {
+        let points = speed.repeatable_points.filter(|_| speed.confirmed);
+        if points.is_some_and(|new| best_confirmed_points.is_none_or(|best| new > best)) {
+            best_confirmed_points = points;
+            decision.preference = Some(speed);
+        } else if decision.repeat_candidates.len() == 1 {
             decision.preference = Some(speed);
         }
-        if confirmed
-            || latest_reference
-                .as_ref()
-                .is_some_and(|check| !check.confirmed)
+        if latest_reference
+            .as_ref()
+            .is_some_and(|check| !check.confirmed)
         {
             break;
         }
@@ -208,10 +245,12 @@ fn verified_services(
             Some(reference)
         } else {
             rows.iter().find(|r| {
-                decision
-                    .checks
-                    .get(&r.id)
-                    .is_some_and(|check| check.confirmed)
+                r.id == primary && {
+                    decision
+                        .checks
+                        .get(&r.id)
+                        .is_some_and(|check| check.confirmed)
+                }
             })
         }
         .cloned();
@@ -233,6 +272,8 @@ mod tests {
             full,
             details,
             Panel::for_trials(rows, details),
+            rows.first().map(|r| r.id.as_str()).unwrap_or(""),
+            |_, _| Ok(true),
             validate,
         )
     }
@@ -348,6 +389,74 @@ mod tests {
             details.insert(id.to_owned(), records);
         }
         (rows, details)
+    }
+
+    #[test]
+    fn disjoint_service_gains_in_the_two_orders_cannot_switch_the_profile() {
+        let (rows, mut details) = service_fixture(&[("anchor", 200.), ("candidate", 120.)]);
+        let measurements = |first: f64, second: f64| {
+            let mut records = sample(first);
+            for (i, mut other) in sample(second).into_iter().enumerate().skip(3) {
+                other["group"] = json!("Discord");
+                records[i] = other;
+            }
+            records
+        };
+        for (id, ms) in [("anchor", 200.), ("candidate", 120.)] {
+            let synthetic = details[id].last().unwrap().clone();
+            let mut trial = measurements(ms, ms);
+            trial.push(synthetic);
+            details.insert(id.to_owned(), trial);
+        }
+        let mut candidates = 0;
+        let decision = verified_preferred(&rows, true, &details, |id| {
+            let records = if id == "anchor" {
+                measurements(200., 200.)
+            } else {
+                candidates += 1;
+                if candidates == 1 {
+                    measurements(120., 200.)
+                } else {
+                    measurements(200., 120.)
+                }
+            };
+            Ok(Check {
+                confirmed: true,
+                error: None,
+                details: records,
+            })
+        })
+        .unwrap();
+        let speed = decision.preference.unwrap();
+        assert!(speed.working.unwrap().faster() && speed.repeat.unwrap().faster());
+        assert_eq!(speed.repeatable_points, Some(0.));
+        assert!(!speed.confirmed);
+        assert_eq!(decision.recommended.unwrap().id, "anchor");
+    }
+
+    #[test]
+    fn stronger_repeatable_gain_beats_a_faster_first_final() {
+        let (rows, details) = service_fixture(&[("anchor", 230.), ("a", 80.), ("b", 100.)]);
+        let mut calls = Vec::new();
+        let decision = verified_preferred(&rows, true, &details, |id| {
+            let repeated = calls.iter().any(|previous| previous == id);
+            calls.push(id.to_owned());
+            let ms = match (id, repeated) {
+                ("anchor", _) => 230.,
+                ("a", false) => 80.,
+                ("a", true) => 210.,
+                ("b", _) => 100.,
+                _ => unreachable!(),
+            };
+            Ok(Check {
+                confirmed: true,
+                error: None,
+                details: sample(ms),
+            })
+        })
+        .unwrap();
+        assert_eq!(decision.repeat_candidates, ["a", "b"]);
+        assert_eq!(decision.recommended.unwrap().id, "b");
     }
 
     #[test]

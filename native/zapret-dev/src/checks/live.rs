@@ -265,16 +265,9 @@ pub(crate) fn run(
                 command.push(alt);
             }
             let result = if let Some(input) = case.menu_input {
-                let cmd = PathBuf::from(std::env::var_os("SystemRoot").context("SystemRoot")?)
-                    .join("System32/cmd.exe");
                 invoke(
-                    &cmd,
-                    &[
-                        "/d".into(),
-                        "/c".into(),
-                        root.join("zapret-rust.bat").into_os_string(),
-                        "menu".into(),
-                    ],
+                    &root.join("zapret-rust.exe"),
+                    &["menu".into()],
                     Some(root),
                     0,
                     Some(input.as_bytes().into()),

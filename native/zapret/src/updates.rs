@@ -178,7 +178,7 @@ pub fn update(
     let status = app.platform("status", json!({}))?;
     let was_running = confirmed_running(&status)?;
     // Keep a launchable native recovery entry before a mapped main image can
-    // be renamed. The batch launcher uses this copy if an interrupted update
+    // be renamed. The public launcher uses this copy if an interrupted update
     // temporarily leaves bin/zapret-rust.exe absent.
     stage_recovery_image(&app.root, &std::env::current_exe()?, &trust)?;
     let mut journal = prepare_transaction(
@@ -647,6 +647,12 @@ fn update_plan(
         }
     }
     let mut remove = Vec::new();
+    if source.join("zapret-rust.exe").is_file() && !source.join("zapret-rust.bat").exists() {
+        let old = checked_path(root, "zapret-rust.bat")?;
+        if old.is_file() && file_hash(&old)? == STOCK_BATCH_SHA256 {
+            remove.push("zapret-rust.bat".into());
+        }
+    }
     for (name, hash) in installed_license_hashes(root)? {
         let original = checked_path(root, &name)?;
         if !source.join(&name).exists()
@@ -1187,6 +1193,9 @@ fn unique_hashes<'de, D: serde::Deserializer<'de>>(
     }
     deserializer.deserialize_map(Unique)
 }
+// Shipped public BAT in 1.0–1.2. A locally edited launcher belongs to the user.
+const STOCK_BATCH_SHA256: &str = "91728FEC8260A243BBBF876B3238B26BCD7F820A01D3DA65DD895D7219E4FB51";
+
 fn allowed_package_path(name: &str) -> bool {
     if name.to_ascii_lowercase().ends_with(".ps1") || name.to_ascii_lowercase().ends_with(".cs") {
         return false;
@@ -1224,6 +1233,7 @@ fn allowed_package_path(name: &str) -> bool {
         "CHECKSUMS.txt",
         "README.md",
         "README.en.md",
+        "zapret-rust.exe",
         "zapret-rust.bat",
         CATALOG,
     ]
@@ -1286,7 +1296,6 @@ fn validate_package(
         "bin/zapret-rust.exe",
         "bin/zapret-rust-worker.exe",
         "bin/zapret-rust-recovery.exe",
-        "zapret-rust.bat",
         "tools/upstream.txt",
         "tools/targets.txt",
         "tools/dpi-suite.json",
@@ -1333,11 +1342,26 @@ fn validate_package(
         bad.join(", ")
     );
     zapret_core::verify_telegram(source)?;
-    let launcher = read_text(&source.join("zapret-rust.bat"), 65536)?.to_ascii_lowercase();
-    ensure!(
-        launcher.contains("bin\\zapret-rust.exe") || launcher.contains("bin/zapret-rust.exe"),
-        "Archive launcher does not use the native application"
-    );
+    if manifest.files.contains_key("zapret-rust.exe") {
+        let image = read_bounded(&source.join("zapret-rust.exe"), MAX_FILE)?;
+        let pe = image
+            .get(60..64)
+            .and_then(|s| s.try_into().ok())
+            .map(u32::from_le_bytes)
+            .map(|n| n as usize);
+        ensure!(
+            image.starts_with(b"MZ")
+                && pe.is_some_and(|n| image.get(n..n.saturating_add(6)) == Some(b"PE\0\0\x64\x86")),
+            "Invalid x64 Windows launcher"
+        );
+    } else {
+        // Recovery also accepts packages produced before the EXE launcher.
+        let launcher = read_text(&source.join("zapret-rust.bat"), 65536)?.to_ascii_lowercase();
+        ensure!(
+            launcher.contains("bin\\zapret-rust.exe") || launcher.contains("bin/zapret-rust.exe"),
+            "Archive launcher does not use the native application"
+        );
+    }
     let upstream = zapret_core::read_core_manifest(&source.join("tools/upstream.txt"))?;
     ensure!(
         manifest

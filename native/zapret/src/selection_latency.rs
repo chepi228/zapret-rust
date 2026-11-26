@@ -6,8 +6,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use zapret_core::RankRow;
 
 pub const PREVIOUS_POLICY: &str = "availability-then-working-request-latency-v3";
-pub const POLICY: &str = "service-availability-then-paired-latency-v5";
+pub const POLICY: &str = "repeatable-service-group-score-v8";
 pub const SERVICE_SCOPE: &str = "ServiceTargets";
+pub const MIN_WORKING_POINTS: f64 = 3.;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Panel {
@@ -15,18 +16,19 @@ pub enum Panel {
     Services,
 }
 
-fn service(row: &Value) -> bool {
+pub(crate) fn steam_target(name: &str) -> bool {
+    matches!(name, "steam" | "steamapi" | "steam_asset")
+}
+
+pub(crate) fn service(row: &Value) -> bool {
     match row["group"].as_str() {
         None | Some("DPI") => false,
-        Some("Clean") => matches!(
-            row["name"].as_str(),
-            Some("steam" | "steamapi" | "steam_asset")
-        ),
+        Some("Clean") => row["name"].as_str().is_some_and(steam_target),
         Some(_) => true,
     }
 }
 
-fn stable(row: &Value) -> bool {
+pub(crate) fn stable(row: &Value) -> bool {
     verified_response(row) && row["flaky"] != true && row["tries"] == 1
 }
 
@@ -42,6 +44,25 @@ pub fn service_rank(row: &RankRow, details: &BTreeMap<String, Vec<Value>>) -> (b
         services.clone().filter(|v| stable(v)).count(),
         services.filter(|v| verified_response(v)).count(),
     )
+}
+
+// All profiles share a target panel. Each service contributes one vote to coverage.
+pub(crate) fn availability_rank(rows: &[Value]) -> (usize, u64, u64) {
+    let mut groups = BTreeMap::<&str, (u64, u64, u64)>::new();
+    for row in rows.iter().filter(|row| service(row)) {
+        let group = row["group"].as_str().expect("service group");
+        let (total, reached, reliable) = groups.entry(group).or_default();
+        *total += 1;
+        *reached += u64::from(verified_response(row));
+        *reliable += u64::from(stable(row));
+    }
+    let mut rank = (0, 0, 0);
+    for (total, reached, reliable) in groups.into_values() {
+        rank.0 += usize::from(reached > 0);
+        rank.1 += 1_000_000 * reached / total;
+        rank.2 += 1_000_000 * reliable / total;
+    }
+    rank
 }
 
 pub fn service_ready(row: &RankRow, details: &BTreeMap<String, Vec<Value>>) -> bool {
@@ -104,7 +125,13 @@ impl Panel {
         primary: &str,
     ) {
         if self == Self::Services {
-            rows.sort_by_cached_key(|row| Reverse((service_rank(row, details), row.id == primary)));
+            rows.sort_by_cached_key(|row| {
+                Reverse((
+                    row.harm == 0,
+                    availability_rank(&details[&row.id]),
+                    row.id == primary,
+                ))
+            });
         }
     }
 }
@@ -119,8 +146,38 @@ fn target_key(row: &Value) -> Option<String> {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ServiceScore {
+    pub points: f64,
+    pub groups: BTreeMap<String, f64>,
+}
+
+impl ServiceScore {
+    fn from_groups(times: &BTreeMap<&str, (Vec<f64>, Vec<f64>)>) -> Self {
+        // Each address votes once within its group. Doubling and halving the
+        // same request time have equal and opposite effects on the score.
+        let groups: BTreeMap<_, _> = times
+            .iter()
+            .map(|(&name, (before, after))| {
+                let sum: f64 = before
+                    .iter()
+                    .zip(after)
+                    .map(|(&a, &b)| (a - b) / a.max(b) * 100.)
+                    .sum();
+                (name.to_owned(), sum / before.len() as f64)
+            })
+            .collect();
+        Self {
+            points: groups.values().sum::<f64>() / groups.len() as f64,
+            groups,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Comparison {
     pub scope: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_score: Option<ServiceScore>,
     pub targets: usize,
     pub wins: usize,
     pub regressions: usize,
@@ -140,28 +197,43 @@ pub struct Comparison {
 }
 impl Comparison {
     pub fn screening_order(&self, other: &Self) -> std::cmp::Ordering {
+        if let (Some(a), Some(b)) = (&self.service_score, &other.service_score) {
+            return b.points.total_cmp(&a.points);
+        }
         self.regressions
             .cmp(&other.regressions)
             .then_with(|| other.gain_ms.total_cmp(&self.gain_ms))
     }
-    // Screening admits a promising median despite an isolated slow site. Both
-    // working comparisons still have to pass the per-site and group checks.
     pub fn promising(&self) -> bool {
-        self.gain_ms >= 1.
-            && self.wins * 2 > self.targets
-            && self.candidate_p95_ms - self.reference_p95_ms
-                <= 20f64.max(self.reference_p95_ms * 0.10)
+        self.service_score
+            .as_ref()
+            .is_some_and(|score| score.points > 0.)
+    }
+
+    pub fn service_rejection(&self) -> Option<String> {
+        let Some(score) = &self.service_score else {
+            return Some("Недостаточно сопоставимых замеров.".into());
+        };
+        if score.points < MIN_WORKING_POINTS {
+            return Some(format!("Выигрыш меньше {MIN_WORKING_POINTS} баллов."));
+        }
+        if let Some((group, _)) = score.groups.iter().find(|(_, points)| **points < -20.) {
+            return Some(format!("Группа {group} потеряла больше 20 баллов."));
+        }
+        if self.candidate_p95_ms - self.reference_p95_ms > 20f64.max(self.reference_p95_ms * 0.10) {
+            return Some("Время самых медленных запросов (P95) заметно выросло.".into());
+        }
+        None
     }
 
     pub fn faster(&self) -> bool {
+        if self.scope == SERVICE_SCOPE {
+            return self.service_rejection().is_none();
+        }
         self.regressions == 0
-            && if self.scope == SERVICE_SCOPE {
-                self.promising()
-            } else {
-                self.candidate_total_ms < self.reference_total_ms
-                    && self.gain_ms > 0.
-                    && self.wins * 2 > self.targets
-            }
+            && self.candidate_total_ms < self.reference_total_ms
+            && self.gain_ms > 0.
+            && self.wins * 2 > self.targets
     }
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -172,6 +244,8 @@ pub struct Preference {
     pub working: Option<Comparison>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repeat: Option<Comparison>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repeatable_points: Option<f64>,
     pub confirmed: bool,
 }
 
@@ -199,6 +273,7 @@ pub fn eligible(reference: &RankRow, candidate: &RankRow, panel: Panel) -> bool 
 struct Sample {
     group: String,
     mode: Option<String>,
+    media_url: Option<String>,
     peer: String,
     code: String,
     termination: String,
@@ -301,6 +376,9 @@ pub fn preserves_services(reference: &[Value], candidate: &[Value], panel: Panel
                         "tls_ms"
                     };
                     verified_response(after)
+                        && (before["group"] != "Clean"
+                            || !before["code"].as_str().is_some_and(|s| s.starts_with('2'))
+                            || after["code"].as_str().is_some_and(|s| s.starts_with('2')))
                         && (panel == Panel::All
                             || !service(before)
                             || !stable(before)
@@ -332,7 +410,7 @@ pub fn preserves_services(reference: &[Value], candidate: &[Value], panel: Panel
                 .count()
 }
 fn sample(row: &Value) -> Option<(String, Sample)> {
-    if !stable(row) {
+    if !stable(row) || row["tls_peer_retry"] == true {
         return None;
     }
     let group = row["group"].as_str()?;
@@ -375,6 +453,7 @@ fn sample(row: &Value) -> Option<(String, Sample)> {
         Sample {
             group: group.into(),
             mode: row["mode"].as_str().map(str::to_owned),
+            media_url: row["media_url"].as_str().map(str::to_owned),
             peer: row["remote_address"]
                 .as_str()
                 .filter(|peer| !peer.is_empty())?
@@ -407,12 +486,14 @@ pub fn median_request_ms(rows: &[Value]) -> Option<f64> {
     let samples = samples(rows, Panel::All)?;
     (!samples.is_empty()).then(|| median(samples.values().map(|s| s.total).collect()))
 }
+
 fn p95(mut values: Vec<f64>) -> f64 {
     values.sort_by(f64::total_cmp);
     values[(values.len() * 95).div_ceil(100) - 1]
 }
 fn comparable(a: &Sample, b: &Sample) -> bool {
     a.peer == b.peer
+        && a.media_url == b.media_url
         && a.mode == b.mode
         && a.code == b.code
         && a.body_limit == b.body_limit
@@ -433,7 +514,11 @@ fn nonempty_median(values: Vec<f64>) -> Option<f64> {
     (!values.is_empty()).then(|| median(values))
 }
 
-fn compare_panel(reference: &[Value], candidate: &[Value], panel: Panel) -> Option<Comparison> {
+pub(crate) fn compare_panel(
+    reference: &[Value],
+    candidate: &[Value],
+    panel: Panel,
+) -> Option<Comparison> {
     let reference = samples(reference, panel)?;
     let candidate = samples(candidate, panel)?;
     compare_samples(&reference, &candidate, panel)
@@ -469,6 +554,18 @@ fn compare_samples(
         before.push(a.total);
         after.push(b.total);
     }
+    let service_score = if panel == Panel::Services {
+        if reference
+            .values()
+            .chain(candidate.values())
+            .any(|s| !groups.contains_key(s.group.as_str()))
+        {
+            return None;
+        }
+        Some(ServiceScore::from_groups(&groups))
+    } else {
+        None
+    };
     let group_regressions = groups
         .into_values()
         .filter(|(a, b)| {
@@ -483,6 +580,7 @@ fn compare_samples(
         + group_regressions
         + usize::from(candidate_p95_ms - reference_p95_ms > 50f64.max(reference_p95_ms * 0.20));
     Some(Comparison {
+        service_score,
         scope: if panel == Panel::Services {
             SERVICE_SCOPE
         } else {
@@ -548,7 +646,58 @@ pub fn confirm(
     let before = on_panel(reference, previous.map(|(before, _)| before))?;
     let after = on_panel(candidate, previous.map(|(_, after)| after))?;
     let comparison = compare_samples(&before, &after, panel)?;
+    if panel == Panel::Services
+        && !comparison
+            .service_score
+            .as_ref()?
+            .groups
+            .keys()
+            .eq(preference.trial.service_score.as_ref()?.groups.keys())
+    {
+        return None;
+    }
     (comparison.targets >= panel.required_pairs(preference.trial.targets)).then_some(comparison)
+}
+
+// Score the first pair on the same addresses as the reversed run.
+pub fn repeatable_points(
+    first: &Comparison,
+    repeat: &Comparison,
+    reference: &[Value],
+    candidate: &[Value],
+) -> Option<f64> {
+    let original = first.service_score.as_ref()?;
+    let reverse = repeat.service_score.as_ref()?;
+    let shared;
+    let forward = if first.panel == repeat.panel {
+        original
+    } else {
+        let keys: BTreeSet<_> = repeat.panel.iter().collect();
+        let restrict = |rows: &[Value]| {
+            let mut points = samples(rows, Panel::Services)?;
+            points.retain(|key, _| keys.contains(key));
+            Some(points)
+        };
+        let pair = compare_samples(
+            &restrict(reference)?,
+            &restrict(candidate)?,
+            Panel::Services,
+        )?;
+        if pair.panel != repeat.panel {
+            return None;
+        }
+        shared = pair.service_score?;
+        &shared
+    };
+    if forward.groups.is_empty() || !forward.groups.keys().eq(reverse.groups.keys()) {
+        return None;
+    }
+    let sum: f64 = forward
+        .groups
+        .iter()
+        .map(|(g, a)| a.min(reverse.groups[g]))
+        .sum();
+    Some(original.points.min(sum / forward.groups.len() as f64))
 }
 
 pub fn preference(
@@ -572,19 +721,40 @@ pub fn preference(
         trial,
         working: None,
         repeat: None,
+        repeatable_points: None,
         confirmed: false,
     })
+}
+
+#[derive(Default)]
+pub struct Screening {
+    pub preference: Option<Preference>,
+    pub service_scores: BTreeMap<String, f64>,
 }
 
 pub fn recommend(
     rows: &[RankRow],
     details: &BTreeMap<String, Vec<Value>>,
     panel: Panel,
-) -> Option<Preference> {
-    let reference = rows.first()?;
-    rows.iter()
+) -> Screening {
+    let mut screening = Screening::default();
+    let Some(reference) = rows.first() else {
+        return screening;
+    };
+    if panel == Panel::Services {
+        screening.service_scores.insert(reference.id.clone(), 0.);
+    }
+    screening.preference = rows
+        .iter()
         .skip(1)
         .filter_map(|row| preference(reference, row, details, panel))
+        .inspect(|p| {
+            if let Some(score) = &p.trial.service_score {
+                screening
+                    .service_scores
+                    .insert(p.candidate.clone(), score.points);
+            }
+        })
         .filter(|p| {
             if panel == Panel::Services {
                 p.trial.promising()
@@ -604,7 +774,8 @@ pub fn recommend(
                         .candidate_p95_ms
                         .total_cmp(&b.trial.candidate_p95_ms),
                 )
-        })
+        });
+    screening
 }
 
 #[cfg(test)]
@@ -615,13 +786,20 @@ mod tests {
         compare_panel(reference, candidate, Panel::All)
     }
     fn recommend(rows: &[RankRow], details: &BTreeMap<String, Vec<Value>>) -> Option<Preference> {
-        super::recommend(rows, details, Panel::for_trials(rows, details))
+        super::recommend(rows, details, Panel::for_trials(rows, details)).preference
     }
     fn samples(tcp: f64, tls: f64) -> Vec<Value> {
         (0..6).map(|n|json!({"group":"NBA2K","name":format!("service{n}"),"url":format!("https://s{n}.test/"),
             "state":"OK","tries":1,"flaky":false,"certificate_validated":true,
             "remote_address":format!("203.0.113.{}:443",n+1),"dns_ms":5.,"tcp_ms":5.+tcp,"tls_ms":5.+tcp+tls,
             "first_byte_ms":15.+tcp+tls,"total_ms":35.+tcp+tls,"code":"200","body_limit":65536,"body_bytes":1024,"post_bytes":0,"termination":"Complete"})).collect()
+    }
+    #[test]
+    fn a_verified_alternate_tls_peer_counts_for_access_and_excludes_mixed_latency() {
+        let mut row = samples(30., 60.).remove(0);
+        assert!(sample(&row).is_some());
+        row["tls_peer_retry"] = json!(true);
+        assert!(stable(&row) && sample(&row).is_none());
     }
     fn score(id: &str, points: f64) -> RankRow {
         RankRow {
@@ -634,6 +812,77 @@ mod tests {
             ..Default::default()
         }
     }
+    #[test]
+    fn a_service_with_many_addresses_cannot_outvote_an_unreachable_group() {
+        let mut many = samples(50., 100.);
+        for r in &mut many {
+            r["group"] = json!("Discord");
+        }
+        let mut icon = many[0].clone();
+        icon["group"] = json!("Roblox");
+        many.push(icon);
+        let mut one_missing = many.clone();
+        one_missing.last_mut().unwrap()["state"] = json!("FAIL");
+        let mut both_reached = many.clone();
+        for r in &mut both_reached[1..4] {
+            r["state"] = json!("FAIL");
+        }
+        assert!(availability_rank(&both_reached) > availability_rank(&one_missing));
+        let doubled: Vec<_> = many
+            .iter()
+            .chain(many.iter().filter(|r| r["group"] == "Discord"))
+            .cloned()
+            .collect();
+        assert_eq!(availability_rank(&many), availability_rank(&doubled));
+    }
+
+    #[test]
+    fn a_service_group_has_the_same_vote_regardless_of_its_number_of_targets() {
+        let mut base = samples(50., 100.);
+        let mut other = base.clone();
+        for (i, (a, b)) in base.iter_mut().zip(&mut other).enumerate() {
+            let group = if i == 0 { "Discord" } else { "NBA2K" };
+            a["group"] = json!(group);
+            b["group"] = json!(group);
+            a["total_ms"] = json!(400.);
+            b["total_ms"] = json!(if i == 0 { 800. } else { 200. });
+        }
+        let pair = compare_panel(&base, &other, Panel::Services).unwrap();
+        let score = pair.service_score.as_ref().unwrap();
+        assert_eq!(score.groups["Discord"], -50.);
+        assert_eq!(score.groups["NBA2K"], 50.);
+        assert_eq!(score.points, 0.);
+        assert!(!pair.faster());
+        other[0]["remote_address"] = json!("203.0.113.99:443");
+        assert!(compare_panel(&base, &other, Panel::Services).is_none());
+    }
+
+    #[test]
+    fn one_slow_endpoint_can_be_outweighed_but_noise_cannot_switch_the_profile() {
+        let mut base = samples(50., 100.);
+        for i in 6..32 {
+            let mut extra = base[0].clone();
+            extra["name"] = json!(format!("extra-{i}"));
+            base.push(extra);
+        }
+        let mut other = base.clone();
+        for row in &mut base {
+            row["total_ms"] = json!(600.);
+        }
+        for row in &mut other {
+            row["total_ms"] = json!(500.);
+        }
+        other[0]["total_ms"] = json!(1000.);
+        let pair = compare_panel(&base, &other, Panel::Services).unwrap();
+        assert_eq!(pair.regressions, 1);
+        assert!(pair.faster());
+        for row in &mut other {
+            row["total_ms"] = json!(590.);
+        }
+        let noise = compare_panel(&base, &other, Panel::Services).unwrap();
+        assert!(noise.promising() && !noise.faster());
+    }
+
     #[test]
     fn fast_near_winner_can_win_without_choosing_a_fast_broken_strategy() {
         let mut rows = vec![score("52", 49.), score("58", 48.5), score("13", 20.)];
@@ -810,6 +1059,7 @@ mod tests {
             trial,
             working: None,
             repeat: None,
+            repeatable_points: None,
             confirmed: false,
         };
         assert!(confirm(&preference, &baseline, &candidate, Panel::All, None).is_none());
@@ -859,6 +1109,7 @@ mod tests {
             working: Some(trial.clone()),
             trial,
             repeat: None,
+            repeatable_points: None,
             confirmed: false,
         };
         let (mut next_a, mut next_b) = (before.clone(), after.clone());

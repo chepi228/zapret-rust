@@ -1,5 +1,6 @@
 [package]
 name = "zapret"
+default-run = "zapret"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

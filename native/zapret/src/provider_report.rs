@@ -408,7 +408,17 @@ fn probe_fields(
     } else {
         row["Stage"]
             .as_str()
-            .filter(|stage| ["main", "control-before", "control-after"].contains(stage))
+            .filter(|stage| {
+                [
+                    "main",
+                    "baseline-recheck",
+                    "control-before",
+                    "control-after",
+                    "control-quick-end",
+                    "quick-screen",
+                ]
+                .contains(stage)
+            })
             .unwrap_or("Unknown")
     };
     let state = row["State"]

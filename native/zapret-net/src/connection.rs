@@ -9,7 +9,7 @@ use std::{
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    net::TcpStream,
+    net::{TcpStream, lookup_host},
     sync::watch,
     task::JoinSet,
     time::{Instant, timeout},
@@ -19,26 +19,11 @@ use url::{Position, Url};
 
 const HEADER_LIMIT: usize = 32768;
 
-pub(crate) fn connection_order(addresses: &[SocketAddr]) -> Vec<SocketAddr> {
-    let preferred_v6 = addresses.first().is_some_and(SocketAddr::is_ipv6);
-    let mut preferred = addresses
-        .iter()
-        .filter(|address| address.is_ipv6() == preferred_v6);
-    let mut other = addresses
-        .iter()
-        .filter(|address| address.is_ipv6() != preferred_v6);
-    let mut ordered = Vec::new();
-    loop {
-        let pair = (preferred.next(), other.next());
-        if pair == (None, None) {
-            return ordered;
-        }
-        for address in [pair.0, pair.1].into_iter().flatten() {
-            if ordered.len() < 16 && !ordered.contains(address) {
-                ordered.push(*address);
-            }
-        }
-    }
+pub(crate) async fn resolve_addresses(host: &str, port: u16) -> std::io::Result<Vec<SocketAddr>> {
+    Ok(zapret_core::connection_addresses(
+        lookup_host((host, port)).await?,
+        16,
+    ))
 }
 
 #[derive(Clone, Debug, Serialize)]

@@ -691,6 +691,32 @@ fn describe(
 pub(crate) fn status(root: &Path) -> Result<Value> {
     inspect(root, false)
 }
+
+pub(crate) fn media_check(root: &Path) -> Result<Value> {
+    let state = inspect(root, false)?;
+    if state["running"] != true
+        || state["current"] != true
+        || state["requires_restart"] == true
+        || !state["ownership_error"].is_null()
+        || state["active_link"].as_str().is_none_or(str::is_empty)
+    {
+        let reason = if state["running"] == false && state["ownership_error"].is_null() {
+            "Мост остановлен"
+        } else {
+            "Работающий мост этой установки не подтверждён"
+        };
+        return Ok(
+            json!({"bridge":{"state":"unavailable","reason":reason},"media_route":{"state":"unavailable"},"file":{"state":"unavailable","reason":reason}}),
+        );
+    }
+    let path = root.join("runtime/tgws/TgWsProxy/config.json");
+    let config: Value = serde_json::from_slice(&read_config_file(&path, 65536)?)?;
+    ensure!(
+        config["port"] == state["active_port"],
+        "Порт работающего моста изменился"
+    );
+    telegram_core::check_media(telegram_core::Config::from_value(&config)?)
+}
 fn inspect(root: &Path, strict: bool) -> Result<Value> {
     let config = read_config(root, false, &json!({}))?;
     let path = root.join("runtime/tgws/TgWsProxy/config.json");

@@ -1,3 +1,6 @@
+pub(crate) mod first_run;
+mod list_sources;
+
 use crate::{App, VERSION, cli::TestArgs, runtime_file, snapshot::check_plain};
 use anyhow::{Context, Result, ensure};
 use chrono::{DateTime, Local, NaiveDateTime};
@@ -601,6 +604,14 @@ fn pc_check_text(result: &Value) -> String {
             "проверка недоступна".into()
         }
     ));
+    for row in result["dns"]["rows"].as_array().into_iter().flatten() {
+        if row["conclusion"] == "SuspiciousMissingAddress" {
+            lines.push(format!(
+                "  {} — Windows не вернула IP, адрес из защищённого DNS прошёл проверку TLS.",
+                row["host"].as_str().unwrap_or("?")
+            ));
+        }
+    }
     lines.push(format!(
         "IPv6: {}",
         if result["ipv6"]["status"] == "Unavailable" {
@@ -904,6 +915,92 @@ fn booster_observations(app: &App) -> Result<Value> {
 
 pub fn track(app: &App, process: &str, seconds: u64, voice: bool) -> Result<Value> {
     track_game_connections(app, process, seconds, voice, true)
+}
+
+pub fn track_city(app: &App) -> Result<String> {
+    crate::ensure_controller_current()?;
+    let before = city_engine_state(app);
+    let mut capture = track_game_connections(app, "NBA2K*", 120, false, false)?;
+    let path = runtime_file(&app.root, "track-last.json")?;
+    capture["city"] = json!({"before":before,"after":city_engine_state(app)});
+    atomic_write(&path, &serde_json::to_vec_pretty(&capture)?)?;
+    Ok(format!(
+        "{}\nФайл для передачи — {}",
+        city_summary(&capture),
+        path.display()
+    ))
+}
+
+fn city_engine_state(app: &App) -> Value {
+    let state = observation_result(app.platform("status", json!({})));
+    let conflicts = observation_result(app.platform("conflicts", json!({})));
+    json!({"running":state["running"],"ownership_known":state["ownership_known"],
+        "processes":state["processes"],"foreign_bypass_count":conflicts["foreign_bypass"].as_array().map(Vec::len),
+        "foreign_service":conflicts["foreign_service"]})
+}
+
+fn city_summary(capture: &Value) -> String {
+    let mut lines = vec![
+        match capture["status"].as_str() {
+            Some("Captured") => "Запись NBA City завершена.",
+            Some("Partial") => "Запись NBA City неполная.",
+            _ => "Не удалось записать соединения NBA City.",
+        }
+        .to_owned(),
+    ];
+    let flows = capture["flows"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    if flows.is_empty() {
+        lines.push(
+            "Соединений NBA 2K в записи нет. Откройте игру и нажмите T перед входом в City.".into(),
+        );
+    } else {
+        for protocol in ["tcp", "udp"] {
+            let mut sent = 0;
+            let mut received = 0;
+            let mut ports = BTreeSet::new();
+            for flow in flows.iter().filter(|row| row["protocol"] == protocol) {
+                sent += flow["out"].as_u64().unwrap_or(0);
+                received += flow["in"].as_u64().unwrap_or(0);
+                if let Some(port) = flow["port"].as_u64() {
+                    ports.insert(port);
+                }
+            }
+            let label = protocol.to_uppercase();
+            if ports.is_empty() {
+                lines.push(format!("{label} — событий в записи нет."));
+            } else {
+                let shown = ports
+                    .iter()
+                    .take(8)
+                    .map(u64::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let more = if ports.len() > 8 {
+                    " и другие"
+                } else {
+                    ""
+                };
+                lines.push(format!(
+                    "{label} — исходящих событий {sent}, входящих {received}. Порты {shown}{more}."
+                ));
+            }
+        }
+    }
+    let after = &capture["city"]["after"];
+    if after["foreign_bypass_count"]
+        .as_u64()
+        .is_some_and(|n| n > 0)
+        || after["foreign_service"] == true
+    {
+        lines.push("В конце записи обнаружен другой обход или его служба.".into());
+    }
+    if after["running"] == false && after["ownership_known"] == true {
+        lines.push("В конце записи обход этой установки остановлен.".into());
+    }
+    lines.join("\n")
 }
 
 fn track_game_connections(
@@ -1551,6 +1648,11 @@ pub fn report(app: &App, output: Option<&Path>) -> Result<Value> {
         "Контекст подключения\n{}",
         json!({"known":network["known"],"key":network["key"]})
     ));
+    if let Ok(Some((_, reason))) = crate::selection::last_interruption(&app.root) {
+        sections.push(format!(
+            "Последняя остановка автоподбора из-за сети\n{reason}"
+        ));
+    }
     for (label, command) in [
         ("Конфликты", "conflicts"),
         ("hosts", "hosts-status"),
@@ -1682,7 +1784,7 @@ fn redact_report_value(value: &mut Value) {
     }
 }
 
-fn read_tail_text(path: &Path, max_bytes: u64, max_lines: usize) -> Result<String> {
+pub(crate) fn read_tail_text(path: &Path, max_bytes: u64, max_lines: usize) -> Result<String> {
     let mut file = fs::File::open(path)?;
     let length = file.metadata()?.len();
     let text = if length <= max_bytes {
@@ -1795,46 +1897,114 @@ pub fn lists(app: &App, update: bool) -> Result<Value> {
         }).collect();
         return Ok(json!(status));
     }
-    let _guard = ControlGuard::acquire(&app.root, "lists-update")?;
+    update_lists(app, 30000, || Ok(()))
+}
+
+fn update_lists(
+    app: &App,
+    timeout_ms: u64,
+    before_write: impl FnOnce() -> Result<()>,
+) -> Result<Value> {
+    let _lease = worker_lease(&app.root, "lists-update-native.lock")?
+        .context("Другое окно уже обновляет списки в этой папке")?;
+    crate::ensure_controller_current()?;
     crate::interrupt::install()?;
-    let mut staged = Vec::new();
-    for (name, source) in LISTS {
-        crate::interrupt::check()?;
-        let url = format!(
-            "https://raw.githubusercontent.com/Flowseal/zapret-discord-youtube/refs/heads/main/{source}"
-        );
-        let bytes = zapret_net::fetch(&url, 16 * 1024 * 1024, 30000)?;
-        let path = list_path(&app.root, name)?;
-        let old = if path.exists() {
-            Some(read_bounded(&path, 32 * 1024 * 1024)?)
-        } else {
-            None
-        };
-        let old_lines = if old.is_some() {
-            read_text(&path, 32 * 1024 * 1024)?
-                .lines()
-                .filter(|line| !list_content(line).is_empty())
-                .count()
-        } else {
-            0
-        };
-        validate_download(name, &bytes, old_lines)?;
-        staged.push(ListReplacement {
-            path,
-            previous: old,
-            bytes,
+    crate::interrupt::check()?;
+    let downloads = thread::scope(|scope| {
+        let pending = LISTS.map(|(name, source)| {
+            scope.spawn(move || {
+                let path = list_path(&app.root, name)?;
+                let previous = existing_list(&path)?;
+                let old_lines = previous
+                    .as_ref()
+                    .and_then(|bytes| zapret_core::decode_text(bytes.clone()).ok())
+                    .map_or(0, |text| {
+                        text.lines()
+                            .map(list_content)
+                            .filter(|line| !line.is_empty())
+                            .filter_map(|line| download_entry(name, line).ok())
+                            .collect::<BTreeSet<_>>()
+                            .len()
+                    });
+                let (bytes, route) = list_sources::download(name, source, old_lines, timeout_ms)?;
+                let details = json!({"name":name,"bytes":bytes.len(),"route":route});
+                Ok((
+                    ListReplacement {
+                        path,
+                        previous,
+                        bytes,
+                    },
+                    details,
+                ))
+            })
         });
+        pending
+            .into_iter()
+            .map(|worker| {
+                worker
+                    .join()
+                    .map_err(|_| anyhow::anyhow!("Поток загрузки списка завершился с ошибкой"))?
+            })
+            .collect::<Result<Vec<_>>>()
+    })?;
+    let (staged, details): (Vec<_>, Vec<_>) = downloads.into_iter().unzip();
+    // A slow download must not hold up Start/Stop in another menu. Only
+    // publication needs exclusive control, including checking the previous bytes.
+    let _guard = ControlGuard::acquire(&app.root, "lists-update")?;
+    crate::ensure_controller_current()?;
+    before_write()?;
+    for item in &staged {
+        crate::interrupt::check()?;
+        check_existing_plain(&item.path)?;
+        ensure!(
+            existing_list(&item.path)? == item.previous,
+            "Список изменился во время загрузки. Повторите обновление."
+        );
     }
     crate::interrupt::check()?;
     apply_list_replacements(&staged, atomic_write)?;
-    Ok(
-        json!({"updated":true,"lists":staged.iter().map(|item|json!({"name":item.path.file_name(),"bytes":item.bytes.len()})).collect::<Vec<_>>(),
-        "text":format!("Списки Flowseal обновлены: {}. Комментарии и порядок строк сохранены.",staged.len())}),
-    )
+    let routes = details
+        .iter()
+        .filter_map(|item| item["route"].as_str())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut report = json!({"updated":true,"updated_at":chrono::Utc::now().to_rfc3339(),"lists":details,
+        "text":format!("Обновлены все {} списков Flowseal. Источник загрузки — {routes}.",staged.len())});
+    let saved = runtime_file(&app.root, "list-update-last.json")
+        .and_then(|path| atomic_write(&path, &serde_json::to_vec(&report)?));
+    report["report_saved"] = json!(saved.is_ok());
+    Ok(report)
+}
+
+fn existing_list(path: &Path) -> Result<Option<Vec<u8>>> {
+    if path.try_exists()? {
+        Ok(Some(read_bounded(path, 32 * 1024 * 1024)?))
+    } else {
+        Ok(None)
+    }
 }
 
 fn list_content(line: &str) -> &str {
     line.split(['#', ';']).next().unwrap_or("").trim()
+}
+
+fn download_entry(name: &str, content: &str) -> Result<String> {
+    Ok(if name == "hosts-flowseal.txt" {
+        let mut fields = content.split_whitespace();
+        let ip: IpAddr = fields.next().context("Отсутствует адрес hosts")?.parse()?;
+        let domains = fields.map(normalize_domain).collect::<Result<Vec<_>>>()?;
+        ensure!(!domains.is_empty(), "В записи hosts отсутствует имя");
+        format!("{ip} {}", domains.join(" "))
+    } else if name.starts_with("ipset-") {
+        normalize_ip_network(content)?
+    } else {
+        let (prefix, domain) = content
+            .strip_prefix('^')
+            .map_or(("", content), |domain| ("^", domain));
+        format!("{prefix}{}", normalize_domain(domain)?)
+    })
 }
 
 fn validate_download(name: &str, bytes: &[u8], old_lines: usize) -> Result<()> {
@@ -1843,28 +2013,12 @@ fn validate_download(name: &str, bytes: &[u8], old_lines: usize) -> Result<()> {
         !text.contains('\0'),
         "Список {name} содержит нулевой символ"
     );
-    let mut entries = BTreeSet::new();
-    for content in text
+    let entries = text
         .lines()
         .map(list_content)
         .filter(|content| !content.is_empty())
-    {
-        let normalized = if name == "hosts-flowseal.txt" {
-            let mut fields = content.split_whitespace();
-            let ip: IpAddr = fields.next().context("Отсутствует адрес hosts")?.parse()?;
-            let domains = fields.map(normalize_domain).collect::<Result<Vec<_>>>()?;
-            ensure!(!domains.is_empty(), "В записи hosts отсутствует имя");
-            format!("{ip} {}", domains.join(" "))
-        } else if name.starts_with("ipset-") {
-            normalize_ip_network(content)?
-        } else {
-            let (prefix, domain) = content
-                .strip_prefix('^')
-                .map_or(("", content), |domain| ("^", domain));
-            format!("{prefix}{}", normalize_domain(domain)?)
-        };
-        entries.insert(normalized);
-    }
+        .map(|content| download_entry(name, content))
+        .collect::<Result<BTreeSet<_>>>()?;
     let minimum = old_lines
         .div_ceil(2)
         .max(if name == "ipset-all.txt" { 1000 } else { 1 });
@@ -2077,7 +2231,7 @@ pub fn autotune(app: &App, force: bool) -> Result<Value> {
         return Ok(json!({"deferred":true,"games":games,"conflicts":conflicts}));
     }
     if force || older_than(&app.root.join("lists/ipset-all.txt"), 7) {
-        lists(app, true)?;
+        refresh_for_autotune(&app.root, || lists(app, true))?;
     }
     if !force && !older_than(&app.root.join("runtime/test-rank.txt"), 7) {
         return Ok(json!({"due":false}));
@@ -2104,13 +2258,32 @@ pub fn autotune(app: &App, force: bool) -> Result<Value> {
     result
 }
 
+fn refresh_for_autotune(root: &Path, update: impl FnOnce() -> Result<Value>) -> Result<()> {
+    if let Err(error) = update() {
+        crate::interrupt::check()?;
+        crate::ensure_controller_current()?;
+        if !first_run::local_lists_ready(root) {
+            return Err(error);
+        }
+        log(
+            root,
+            "autotune.log",
+            &format!(
+                "Обновление списков недоступно. Автоподбор использует локальные списки ({error:#})."
+            ),
+        )?;
+    }
+    Ok(())
+}
+
 /// Preserve the menu's passive startup maintenance without blocking menu input.
 /// No strategy test, engine restart or system-setting change runs in this thread.
-pub fn start_background_maintenance(app: &App) {
+pub fn start_background_maintenance(app: &App, refresh_lists: bool) {
     let updates_due = older_than(&app.root.join("runtime/update-check-native.json"), 3);
-    let lists_due = LISTS
-        .iter()
-        .any(|(name, _)| older_than(&app.root.join("lists").join(name), 7));
+    let lists_due = refresh_lists
+        && LISTS
+            .iter()
+            .any(|(name, _)| older_than(&app.root.join("lists").join(name), 7));
     if !updates_due && !lists_due {
         return;
     }
@@ -2139,11 +2312,9 @@ pub fn start_background_maintenance(app: &App) {
                 if status["known"] != true || status["ownership_known"] != true {
                     return Ok(());
                 }
-                // Acquire control before fetching/staging. A concurrent menu
-                // action can defer this background attempt without affecting it.
-                let _guard = ControlGuard::acquire(&background.root, "startup-lists")?;
-                background.platform("control-check", json!({}))?;
-                lists(&background, true)?;
+                update_lists(&background, 30000, || {
+                    background.platform("control-check", json!({})).map(|_| ())
+                })?;
                 log(
                     &background.root,
                     "startup-native.log",
@@ -2517,6 +2688,24 @@ pub fn uninstall(app: &App) -> Result<Value> {
 mod tests {
     use super::*;
     use std::cell::{Cell, RefCell};
+
+    #[test]
+    fn city_summary_counts_observed_directions_and_does_not_guess_a_disconnect() {
+        let capture = json!({"status":"Partial","flows":[
+            {"protocol":"tcp","port":20895,"out":6,"in":1},{"protocol":"tcp","port":443,"out":2,"in":3}],
+            "city":{"after":{"foreign_bypass_count":1,"ownership_known":true,"running":false}}});
+        let text = city_summary(&capture);
+        for expected in [
+            "неполная",
+            "исходящих событий 8, входящих 4",
+            "443, 20895",
+            "UDP — событий в записи нет",
+            "другой обход",
+            "установки остановлен",
+        ] {
+            assert!(text.contains(expected), "{text}");
+        }
+    }
 
     #[test]
     fn scanner_never_applies_partial_or_changed_observations() {

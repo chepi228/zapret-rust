@@ -43,8 +43,8 @@ try{
     $inputs=@()
     foreach($path in $paths){
         $relative=$path
-        # Historical fixtures retain the old ZIP layout, using the renamed source launcher.
-        if($path -ceq 'zapret.bat'){$relative='zapret-rust.bat'}
+        # The historical ZIP has its own launcher fixture now that the public launcher is an EXE.
+        if($path -ceq 'zapret.bat'){$relative='dev/tests/fixtures/legacy-launcher.bat'}
         if($path.StartsWith('lists/',[StringComparison]::OrdinalIgnoreCase) -and $defaults -contains $path.Substring(6)){$relative='dev/package-defaults/'+$path}
         # Check every component: a file in a linked directory is also outside the declared input tree.
         $source=$root

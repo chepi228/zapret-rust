@@ -94,14 +94,19 @@ impl Runner {
         let result = self.raw(args, true, 0, None)?;
         serde_json::from_slice(&result.stdout).with_context(|| format!("JSON from {args:?}"))
     }
-    fn bat(&self, args: &[&str], architecture: &str, expected: u32) -> Result<RunOutput> {
+    fn launcher_from_shell(
+        &self,
+        args: &[&str],
+        architecture: &str,
+        expected: u32,
+    ) -> Result<RunOutput> {
         let cmd = PathBuf::from(std::env::var_os("SystemRoot").context("SystemRoot missing")?)
             .join(architecture)
             .join("cmd.exe");
         let mut command = vec![
             "/d".into(),
             "/c".into(),
-            self.root.join("zapret-rust.bat").into_os_string(),
+            self.root.join("zapret-rust.exe").into_os_string(),
         ];
         command.extend(args.iter().map(OsString::from));
         invoke(&cmd, &command, Some(&self.root), expected, None)
@@ -331,7 +336,7 @@ pub(crate) fn install(build: &crate::Build<'_>, output: &Path) -> Result<()> {
             "mapped GUI host is ready",
         )?;
         build.release(Some("zapret"), false)?;
-        for name in ["zapret.exe", "zapret-worker.exe"] {
+        for name in ["zapret.exe", "zapret-worker.exe", "zapret-launcher.exe"] {
             fs::copy(build.target.join("release").join(name), release.join(name))?;
         }
         crate::install::publish(root, &target)?;

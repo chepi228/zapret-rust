@@ -18,6 +18,7 @@ import sys
 import tempfile
 import threading
 import time
+from urllib.parse import parse_qs, urlsplit
 
 ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT / "dist/native/test-python"))
@@ -43,7 +44,9 @@ class HttpHandler(http.server.BaseHTTPRequestHandler):
         status = 200
         if self.path.startswith("/doh"):
             assert self.headers["Accept"] == "application/dns-json"
-            body = b'{"Status":0,"Answer":[{"type":1,"data":"127.0.0.1"}]}'
+            query = parse_qs(urlsplit(self.path).query)
+            record = {"type": 28, "data": "::1"} if query["type"] == ["AAAA"] else {"type": 1, "data": "127.0.0.1"}
+            body = json.dumps({"Status": 0, "Answer": [record]}).encode()
         elif self.path.startswith("/primary-fail"):
             body = b'{"success":false,"message":"fixture"}'
         elif self.path.startswith("/fallback"):
@@ -206,6 +209,12 @@ def main():
                                               "doh_urls": [base + "/doh"], "timeout_ms": 1000})
             check(dns["checked"] == 1 and dns["suspect"] == [] and dns["rows"][0]["conclusion"] == "SharedAddress",
                   "native DoH validates JSON addresses and requires comparable system evidence")
+            dns6 = invoke(args.binary, "dns", {"host": "::1", "compare": True, "no_hosts": False,
+                                               "doh_urls": [base + "/doh"], "timeout_ms": 1000})
+            row6 = dns6["rows"][0]
+            check(row6["conclusion"] == "SharedAddress" and row6["doh_addresses"] == ["127.0.0.1", "::1"]
+                  and [r["query_type"] for r in row6["doh_attempts"]] == ["A", "AAAA"],
+                  "IPv6-only system answers are compared with AAAA records")
             provider = invoke(args.binary, "provider", {"primary_url": base + "/primary-fail", "fallback_url": base + "/fallback", "timeout_ms": 1000})
             row = provider["rows"][0]
             check(row["provider"]["isp"] == "Fallback ISP" and row["provider"]["masked_ip"] == "203.0.113.x"

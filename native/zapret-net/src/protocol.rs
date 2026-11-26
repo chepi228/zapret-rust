@@ -12,6 +12,7 @@ pub enum ProbeMode {
     #[default]
     Range,
     FullGet,
+    RobloxIcon,
     Http3Head,
 }
 
@@ -86,7 +87,9 @@ pub fn read_jobs(reader: impl Read) -> Result<Vec<Target>, String> {
             job.method
                 .as_deref()
                 .unwrap_or(if job.post_bytes == 0 { "GET" } else { "POST" });
-        if (job.mode == ProbeMode::FullGet && method != "GET")
+        if (matches!(job.mode, ProbeMode::FullGet | ProbeMode::RobloxIcon) && method != "GET")
+            || (job.mode == ProbeMode::RobloxIcon
+                && (crate::roblox::universe(&url).is_none() || job.connect_ip.is_some()))
             || (job.mode == ProbeMode::Http3Head && (url.scheme() != "https" || method != "HEAD"))
         {
             return Err(format!(
@@ -140,6 +143,8 @@ pub struct TcpAttempt {
     pub address: String,
     pub elapsed_ms: f64,
     pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls_error: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -158,6 +163,10 @@ pub struct Observation {
     pub received_body_bytes: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub body_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub media_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub media_lookup_ms: Option<f64>,
     pub body_limit: usize,
     pub body_complete: bool,
     pub target_reached: bool,
@@ -202,6 +211,8 @@ impl Observation {
             body_bytes: 0,
             received_body_bytes: 0,
             body_sha256: None,
+            media_url: None,
+            media_lookup_ms: None,
             body_limit: target.job.body_limit,
             body_complete: false,
             target_reached: false,

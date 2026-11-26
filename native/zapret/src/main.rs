@@ -397,6 +397,7 @@ impl App {
         ensure_controller_current()?;
         match action {
             Action::Menu => bail!("Меню запускается отдельным входом"),
+            Action::FirstRun => maintenance::first_run::run(self, |_| {}),
             Action::MenuPreview { .. } => bail!("Предпросмотр запускается отдельным входом"),
             Action::Probe { .. } => bail!("Probe использует стандартный ввод и вывод"),
             Action::Status => self.platform("status", json!({})),

@@ -27,11 +27,8 @@ pub(crate) const WRITE_TIMEOUT: Duration = Duration::from_secs(20);
 
 pub(crate) async fn open_tcp(host: &str, port: u16, buffer: usize) -> Result<TcpStream> {
     timeout(CONNECT_TIMEOUT, async {
-        let addresses: Vec<_> = tokio::net::lookup_host((host, port))
-            .await?
-            .take(16)
-            .collect();
-        connect_addresses_with(&addresses, |address| async move {
+        let addresses = tokio::net::lookup_host((host, port)).await?;
+        connect_addresses_with(addresses, |address| async move {
             let socket = if address.is_ipv4() {
                 TcpSocket::new_v4()?
             } else {
@@ -50,53 +47,32 @@ pub(crate) async fn open_tcp(host: &str, port: u16, buffer: usize) -> Result<Tcp
     .context("upstream TCP connection timed out")?
 }
 
-fn connection_order(addresses: &[SocketAddr]) -> Vec<SocketAddr> {
-    let preferred_v6 = addresses.first().is_some_and(SocketAddr::is_ipv6);
-    let preferred = addresses
-        .iter()
-        .filter(|address| address.is_ipv6() == preferred_v6);
-    let mut other = addresses
-        .iter()
-        .filter(|address| address.is_ipv6() != preferred_v6);
-    let mut ordered = Vec::new();
-    for address in preferred {
-        for address in [Some(address), other.next()].into_iter().flatten() {
-            if !ordered.contains(address) {
-                ordered.push(*address);
-            }
-        }
-    }
-    for address in other {
-        if !ordered.contains(address) {
-            ordered.push(*address);
-        }
-    }
-    ordered.truncate(8);
-    ordered
-}
-
 async fn connect_addresses_with<T, F, Fut>(
-    addresses: &[SocketAddr],
+    addresses: impl IntoIterator<Item = SocketAddr>,
     connector: F,
 ) -> std::io::Result<T>
 where
     F: Fn(SocketAddr) -> Fut,
     Fut: std::future::Future<Output = std::io::Result<T>>,
 {
-    let ordered = connection_order(addresses);
+    let addresses = zapret_core::connection_addresses(addresses, 8);
     let mut pending = FuturesUnordered::new();
     let mut next = 0;
     let mut launch_at = Instant::now();
     let mut last_error =
         std::io::Error::new(std::io::ErrorKind::NotFound, "DNS returned no addresses");
     loop {
-        if next < ordered.len()
+        if next < addresses.len()
             && pending.len() < 2
             && (pending.is_empty() || Instant::now() >= launch_at)
         {
-            let connection = connector(ordered[next]);
+            let connection = connector(addresses[next]);
+            let rotate = next != 0 && next + 1 < addresses.len();
             next += 1;
             pending.push(async move {
+                if !rotate {
+                    return connection.await;
+                }
                 timeout(Duration::from_secs(2), connection)
                     .await
                     .unwrap_or_else(|_| {
@@ -108,7 +84,7 @@ where
             });
             launch_at = Instant::now() + Duration::from_millis(250);
         }
-        if pending.is_empty() && next == ordered.len() {
+        if pending.is_empty() && next == addresses.len() {
             return Err(last_error);
         }
         tokio::select! {
@@ -121,7 +97,7 @@ where
                 }
                 launch_at = Instant::now();
             }
-            _ = tokio::time::sleep_until(launch_at), if next < ordered.len() && pending.len() < 2 => {}
+            _ = tokio::time::sleep_until(launch_at), if next < addresses.len() && pending.len() < 2 => {}
         }
     }
 }
@@ -201,7 +177,7 @@ pub(crate) async fn bridge_ws(client: TcpStream, mut auth: Handshake, mut ws: Ws
         while let Some(message) = ws_read.next().await {
             match message {
                 Ok(Message::Binary(data))=>{
-                    let mut data=data.to_vec();
+                    let mut data = bytes::BytesMut::from(data);
                     relay.decrypt.apply_keystream(&mut data);
                     auth.encrypt.apply_keystream(&mut data);
                     write_bytes(&mut client_write,&data).await?;
@@ -280,7 +256,7 @@ pub(crate) mod tests {
         let addresses = ["[::1]:1", "[::1]:2", "127.0.0.1:3"].map(|text| text.parse().unwrap());
         let active = Arc::new(AtomicUsize::new(0));
         let started = Instant::now();
-        let connected = connect_addresses_with(&addresses, |address| {
+        let connected = connect_addresses_with(addresses, |address| {
             let active = active.clone();
             async move {
                 assert!(active.fetch_add(1, Ordering::SeqCst) < 2);
@@ -308,7 +284,7 @@ pub(crate) mod tests {
         let active = Arc::new(AtomicUsize::new(0));
         let result = timeout(
             Duration::from_millis(350),
-            connect_addresses_with(&addresses, |_| {
+            connect_addresses_with(addresses, |_| {
                 let active = active.clone();
                 async move {
                     assert!(active.fetch_add(1, Ordering::SeqCst) < 2);
@@ -328,7 +304,7 @@ pub(crate) mod tests {
         addresses
             .extend((2..20).map(|port| format!("[::1]:{port}").parse::<SocketAddr>().unwrap()));
         addresses.push("127.0.0.1:80".parse().unwrap());
-        let selected = connection_order(&addresses);
+        let selected = zapret_core::connection_addresses(addresses.iter().copied(), 8);
         assert_eq!(selected.len(), 8);
         assert_eq!(selected[0], addresses[0]);
         assert_eq!(selected[1], *addresses.last().unwrap());
@@ -342,10 +318,26 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn a_single_upstream_address_uses_the_outer_connection_deadline() {
+        let peer = SocketAddr::from(([127, 0, 0, 1], 443));
+        let connected = timeout(
+            CONNECT_TIMEOUT,
+            connect_addresses_with([peer], |address| async move {
+                tokio::time::sleep(Duration::from_millis(2200)).await;
+                Ok(address)
+            }),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(peer, connected);
+    }
+
+    #[tokio::test]
     async fn failed_address_is_replaced_without_waiting_for_the_stagger() {
         let addresses = ["127.0.0.1:1", "127.0.0.1:2"].map(|text| text.parse().unwrap());
         let started = Instant::now();
-        let connected = connect_addresses_with(&addresses, |address| async move {
+        let connected = connect_addresses_with(addresses, |address| async move {
             if address.port() == 1 {
                 Err(std::io::Error::from(std::io::ErrorKind::ConnectionRefused))
             } else {
@@ -436,6 +428,13 @@ pub(crate) mod tests {
             let mut reply = vec![4, 0, 0, 0, 108, 254, 255, 255];
             encrypt.apply_keystream(&mut reply);
             ws.send(Message::Binary(reply.into())).await.unwrap();
+            // Three ordinary media chunks cross the socket buffers and keep one continuous cipher.
+            for tag in [0x31, 0x52, 0x93] {
+                let mut frame = (1024u32 * 1024).to_le_bytes().to_vec();
+                frame.resize(4 + 1024 * 1024, tag);
+                encrypt.apply_keystream(&mut frame);
+                ws.send(Message::Binary(frame.into())).await.unwrap();
+            }
         });
         let (mut client, server) = local_pair().await;
         let (init, mut enc, mut dec) = client_init(-10002, Tag::Intermediate);
@@ -454,6 +453,16 @@ pub(crate) mod tests {
             .unwrap();
         dec.apply_keystream(&mut reply);
         assert_eq!(reply, [4, 0, 0, 0, 108, 254, 255, 255]);
+        let mut chunk = vec![0; 4 + 1024 * 1024];
+        for tag in [0x31, 0x52, 0x93] {
+            timeout(Duration::from_secs(10), client.read_exact(&mut chunk))
+                .await
+                .unwrap()
+                .unwrap();
+            dec.apply_keystream(&mut chunk);
+            assert_eq!(&chunk[..4], &(1024u32 * 1024).to_le_bytes());
+            assert!(chunk[4..].iter().all(|byte| *byte == tag));
+        }
         drop(client);
         timeout(Duration::from_secs(2), bridge)
             .await

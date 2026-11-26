@@ -7,6 +7,7 @@ use chrono::{Local, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
+    cell::{Cell, RefCell},
     collections::{BTreeMap, BTreeSet, HashMap},
     ffi::OsString,
     fs,
@@ -25,6 +26,11 @@ use zapret_platform::{ControlGuard, OwnedChild, RunOptions};
 
 mod endpoints;
 pub(crate) mod families;
+mod gains;
+mod network_monitor;
+pub(crate) use network_monitor::last_interruption;
+mod quick;
+mod retries;
 mod startup;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -47,8 +53,9 @@ impl ExpectedResponse {
         };
         let mode = match *method {
             "GET" => ProbeMode::FullGet,
+            "ROBLOX_ICON" => ProbeMode::RobloxIcon,
             "H3" => ProbeMode::Http3Head,
-            _ => bail!("Допустимы GET и H3"),
+            _ => bail!("Допустимы GET, ROBLOX_ICON и H3"),
         };
         let status = status.parse()?;
         let (min_bytes, max_bytes) = size.split_once("..").unwrap_or((size, size));
@@ -120,7 +127,7 @@ impl Target {
         let mode = self.probe_mode();
         let method = match mode {
             ProbeMode::Http3Head => "HEAD",
-            ProbeMode::FullGet => "GET",
+            ProbeMode::FullGet | ProbeMode::RobloxIcon => "GET",
             ProbeMode::Range if control => "HEAD",
             ProbeMode::Range if self.post => "POST",
             ProbeMode::Range => "GET",
@@ -189,13 +196,32 @@ impl Row {
             && ms > 0.
             && before.is_none_or(|limit| ms <= limit + 500.)
     }
+    fn healthy_control(&self, before: Option<f64>) -> bool {
+        self.code.starts_with('2') && self.healthy_connection(before)
+    }
+
+    fn preserves_clean(&self, before: &Row) -> bool {
+        self.healthy_connection(Some(before.connection_ms()))
+            && (!before.code.starts_with('2') || self.code.starts_with('2'))
+    }
+
+    fn meets_baseline(&self, before: Option<f64>) -> bool {
+        self.healthy_connection(before) && (before.is_none() || self.code.starts_with('2'))
+    }
+
+    fn dns_failure(&self) -> bool {
+        self.state == "NA" && self.termination == "DnsFailure"
+    }
 }
 
 fn read_targets(root: &Path, args: &TestArgs) -> Result<Vec<Target>> {
     let mut targets = read_targets_with_suite(root, &root.join("tools/dpi-suite.json"))?;
     if args.compare_a.is_some() || args.compare_b.is_some() {
         // The saved A/B protocol compares the TCP/TLS handshake under matched conditions.
-        targets.retain(|t| t.url.starts_with("https://") && t.probe_mode() != ProbeMode::Http3Head);
+        targets.retain(|t| {
+            t.url.starts_with("https://")
+                && !matches!(t.probe_mode(), ProbeMode::Http3Head | ProbeMode::RobloxIcon)
+        });
         ensure!(
             !targets.is_empty(),
             "Для сравнения финалистов нужны HTTPS-адреса с TCP"
@@ -419,7 +445,8 @@ fn convert(target: &Target, value: Value, started: chrono::DateTime<Utc>) -> Res
             tls
         } else {
             tcp
-        } + number(&value, "headers_ms"),
+        } + number(&value, "headers_ms")
+            + observation.media_lookup_ms.unwrap_or_default(),
         total_ms: total,
         started_utc: (started + chrono::Duration::microseconds((start_ms * 1000.) as i64))
             .to_rfc3339(),
@@ -442,16 +469,33 @@ struct RunContext<'a> {
     app: &'a App,
     snapshot: &'a Snapshot,
     network_key: String,
-    network_parts: Value,
+    network_monitor: &'a network_monitor::Monitor,
+    failed_profiles: &'a RefCell<BTreeMap<String, String>>,
+    sampled_batches: &'a Cell<usize>,
+    expanded_batches: &'a Cell<usize>,
     native_hash: &'a str,
     journal: PathBuf,
     deadline: Option<Instant>,
     clock_origin: f64,
-    approved_games: BTreeSet<String>,
+    approved_games: &'a BTreeSet<String>,
     details: bool,
 }
 impl RunContext<'_> {
+    fn candidate<T>(&self, id: &str, primary: &str, result: Result<T>) -> Result<Option<T>> {
+        optional_candidate(id, primary, result, |reason| {
+            self.check_current(true)?;
+            crate::selection_ui::progress(self.app, &format!("Пропускаю ALT{id}. {reason}"))?;
+            self.failed_profiles
+                .borrow_mut()
+                .insert(id.to_owned(), reason);
+            Ok(())
+        })
+    }
+
     fn assert_current(&self) -> Result<()> {
+        self.check_current(false)
+    }
+    fn check_current(&self, fresh: bool) -> Result<()> {
         interrupt::check()?;
         ensure!(
             self.deadline
@@ -459,12 +503,11 @@ impl RunContext<'_> {
             "Превышен общий лимит сравнения 30 минут"
         );
         ensure!(
-            game_snapshot(self.app)?.is_subset(&self.approved_games),
+            game_snapshot(self.app)?.is_subset(self.approved_games),
             "Во время измерения запущена новая игра"
         );
         crate::ensure_snapshot_current(self.snapshot)?;
-        let current = measurement_network(self.app)?;
-        verify_measurement_network(&self.network_key, &self.network_parts, &current)
+        self.network_monitor.check(self.app, &self.journal, fresh)
     }
 }
 
@@ -493,7 +536,7 @@ fn verify_measurement_network(key: &str, parts: &Value, current: &Value) -> Resu
 
 fn measurement_network(app: &App) -> Result<Value> {
     read_measurement_network(
-        || app.platform("network", json!({})),
+        || app.platform("network", json!({"identity_only":true})),
         || {
             interrupt::check()?;
             thread::sleep(Duration::from_millis(200));
@@ -582,12 +625,7 @@ fn probe_batch(
     let mut progress_at = Instant::now();
     while worker.is_running()? {
         interrupt::check()?;
-        if let Some(engine) = engine.as_mut() {
-            ensure!(
-                engine.is_running()?,
-                "Тестовый движок завершился во время проб"
-            );
-        }
+        engine_alive(engine)?;
         if checked.elapsed() >= Duration::from_secs(1) {
             context.assert_current()?;
             checked = Instant::now();
@@ -686,15 +724,58 @@ fn align_observations(
 fn engine_budget(count: usize, arguments: &TestArgs, warmup: bool) -> Result<u64> {
     let main = batch_budget(count, arguments.parallel(), arguments.timeout_ms)?;
     let retry = batch_budget(count, arguments.retry_parallel(), arguments.timeout_ms)?;
-    Ok((main + retry + if warmup { main } else { 0 } + 30000).max(120000))
+    let extra_batch = if count > retries::FAILURE_LIMIT {
+        batch_budget(1, arguments.retry_parallel(), arguments.timeout_ms)?
+    } else {
+        0
+    };
+    Ok((main + retry + extra_batch + if warmup { main } else { 0 } + 30000).max(120000))
+}
+
+#[derive(Debug)]
+struct TrialExit {
+    phase: &'static str,
+    code: u32,
+}
+
+impl std::fmt::Display for TrialExit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Тестовый движок завершился {} (код {}).",
+            self.phase, self.code
+        )
+    }
+}
+impl std::error::Error for TrialExit {}
+
+fn optional_candidate<T>(
+    id: &str,
+    primary: &str,
+    result: Result<T>,
+    report: impl FnOnce(String) -> Result<()>,
+) -> Result<Option<T>> {
+    match result {
+        Ok(value) => Ok(Some(value)),
+        Err(error) if id != primary && error.is::<TrialExit>() => {
+            report(format!("{error:#}"))?;
+            Ok(None)
+        }
+        Err(error) => Err(error.context(format!("При проверке ALT{id}"))),
+    }
 }
 
 fn engine_alive(engine: &mut Option<OwnedChild>) -> Result<()> {
-    if let Some(child) = engine {
-        ensure!(
-            child.is_running()?,
-            "Тестовый движок завершился до подтверждения измерений"
-        );
+    if let Some(child) = engine
+        && !child.is_running()?
+    {
+        let output = engine.take().expect("observed child").finish()?;
+        ensure!(!output.timed_out, "Истёк срок работы тестового движка");
+        return Err(TrialExit {
+            phase: "во время измерения",
+            code: output.exit_code,
+        }
+        .into());
     }
     Ok(())
 }
@@ -707,6 +788,26 @@ fn stop_trial(mut engine: Option<OwnedChild>) -> Result<()> {
         ensure!(!output.timed_out, "Истёк срок работы тестового движка");
     }
     Ok(())
+}
+
+fn finish_trial<T>(engine: Option<OwnedChild>, measured: Result<T>) -> Result<T> {
+    match (measured, stop_trial(engine)) {
+        (result, Ok(())) => result,
+        (Ok(_), Err(stop)) => Err(stop),
+        (Err(error), Err(stop)) if stop.is::<TrialExit>() => Err(error.context(stop.to_string())),
+        (Err(error), Err(stop)) => Err(stop.context(format!(
+            "Замер прерван: {error:#}. Не удалось завершить тестовый процесс"
+        ))),
+    }
+}
+
+fn run_trial<T>(
+    child: Result<OwnedChild>,
+    measure: impl FnOnce(&mut Option<OwnedChild>) -> Result<T>,
+) -> Result<T> {
+    let mut engine = Some(child?);
+    let result = measure(&mut engine);
+    finish_trial(engine, result)
 }
 
 pub(crate) fn parse_observations(
@@ -775,35 +876,130 @@ impl Journal {
 }
 
 fn merge_retry(rows: &mut [Row], retry: &[Row]) {
+    let usable =
+        |row: &Row| row.state == "OK" && (row.group != "Clean" || row.code.starts_with('2'));
     for row in rows {
         let Some(next) = retry.iter().find(|next| next.key() == row.key()) else {
             continue;
         };
         row.tries = 2;
-        if next.state != "OK" {
+        let first_ok = usable(row);
+        if !usable(next) {
+            if !first_ok
+                && (row.dns_failure() && !next.dns_failure()
+                    || next.state == "FREEZE" && row.state != "FREEZE")
+            {
+                let mut replacement = next.clone();
+                replacement.tries = 2;
+                replacement.failed_retry = Some(row.raw.clone());
+                *row = replacement;
+                continue;
+            }
             row.failed_retry = Some(next.raw.clone());
-            if row.state != "OK" && next.state == "FREEZE" {
-                row.state = "FREEZE".into();
+            if first_ok {
+                row.flaky = true;
             }
             continue;
         }
-        if row.state == "OK" {
-            row.tls_ms = row.tls_ms.min(next.tls_ms);
-            row.conn_ms = row.conn_ms.min(next.conn_ms);
-        } else {
+        if !first_ok || next.connection_ms() < row.connection_ms() {
+            // The remote peer, clocks and durations must come from the same request.
             let mut replacement = next.clone();
             replacement.tries = 2;
-            replacement.flaky = true;
+            replacement.flaky |= row.flaky || !first_ok;
             *row = replacement;
         }
     }
+}
+
+// Keep connectivity checks independent of the applications being compared.
+fn select_controls(targets: &[Target], base: &[Row]) -> Vec<Target> {
+    let measured: BTreeMap<_, _> = base
+        .iter()
+        .filter(|r| r.group == "Clean" && r.tries == 1 && !r.flaky && r.healthy_control(None))
+        .map(|r| (r.key(), r))
+        .collect();
+    let mut candidates = targets
+        .iter()
+        .filter(|t| t.group == "Clean" && t.probe_mode() != ProbeMode::Http3Head)
+        .filter_map(|t| Some((t, *measured.get(&t.key())?)))
+        .collect::<Vec<_>>();
+    candidates.sort_by_cached_key(|(t, r)| {
+        let purpose = match t.url.as_str() {
+            "http://www.msftconnecttest.com/connecttest.txt"
+            | "https://detectportal.firefox.com/success.txt" => 0,
+            _ if crate::selection_latency::steam_target(&t.name) => 2,
+            _ => 1,
+        };
+        (purpose, (r.connection_ms() * 1000.) as u64)
+    });
+    let mut hosts = BTreeSet::new();
+    candidates
+        .into_iter()
+        .filter(|(target, _)| control_host(target).is_some_and(|host| hosts.insert(host)))
+        .take(4)
+        .map(|(t, _)| t.clone())
+        .collect()
+}
+
+fn control_host(target: &Target) -> Option<String> {
+    hostname(&target.url)
+}
+
+fn hostname(url: &str) -> Option<String> {
+    let url = url::Url::parse(url).ok()?;
+    Some(url.host_str()?.trim_end_matches('.').to_ascii_lowercase())
+}
+
+struct RoundBaseline {
+    rows: Vec<Row>,
+    eligible: bool,
+    controls: Vec<Target>,
+    repeated: bool,
+}
+
+fn round_baseline(
+    targets: &[Target],
+    report_only: bool,
+    mut measure: impl FnMut(bool) -> Result<(Vec<Row>, bool)>,
+) -> Result<RoundBaseline> {
+    let configured = targets
+        .iter()
+        .filter(|t| t.group == "Clean" && t.probe_mode() != ProbeMode::Http3Head)
+        .filter_map(control_host)
+        .collect::<BTreeSet<_>>()
+        .len();
+    ensure!(
+        report_only || configured >= 2,
+        "Для выбора стратегии нужны два контрольных сервера с разными именами в tools/targets.txt"
+    );
+    let mut sample = |repeated| -> Result<RoundBaseline> {
+        let (rows, eligible) = measure(repeated)?;
+        Ok(RoundBaseline {
+            controls: select_controls(targets, &rows),
+            rows,
+            eligible,
+            repeated,
+        })
+    };
+    let first = sample(false)?;
+    if first.controls.len() >= 2 || configured < 2 {
+        return Ok(first);
+    }
+    let second = sample(true)?;
+    let dns = second.rows.iter().filter(|r| r.dns_failure()).count();
+    ensure!(
+        second.controls.len() >= 2 || report_only && second.rows.iter().any(|r| r.state == "OK"),
+        "После двух исходных замеров пригодных контрольных серверов {} из {configured}. Ошибок DNS в последнем замере: {dns}. Подбор остановлен до переключения профилей.",
+        second.controls.len()
+    );
+    Ok(second)
 }
 
 fn baseline(rows: &[Row]) -> BTreeMap<String, f64> {
     let mut result = BTreeMap::<String, f64>::new();
     for row in rows
         .iter()
-        .filter(|row| row.group == "Clean" && row.healthy_connection(None))
+        .filter(|row| row.group == "Clean" && row.healthy_control(None))
     {
         result
             .entry(row.name.clone())
@@ -867,7 +1063,7 @@ fn summary(id: &str, rows: &[Row], clean: &BTreeMap<String, f64>) -> RankRow {
         } else if id != "0"
             && clean
                 .get(&row.name)
-                .is_some_and(|before| !row.healthy_connection(Some(*before)))
+                .is_some_and(|before| !row.healthy_control(Some(*before)))
         {
             result.harm += 1;
         }
@@ -902,11 +1098,17 @@ fn final_check<'a>(expected: impl IntoIterator<Item = &'a Row>, actual: &[Row]) 
         let key = row.key();
         let reason = match actual.get(&key) {
             Some(next)
-                if next.state == "OK"
-                    && (row.group != "Clean"
-                        || next.healthy_connection(Some(row.connection_ms()))) =>
+                if next.state == "OK" && (row.group != "Clean" || next.preserves_clean(row)) =>
             {
                 continue;
+            }
+            Some(next)
+                if row.group == "Clean"
+                    && row.code.starts_with('2')
+                    && next.code != "000"
+                    && !next.code.starts_with('2') =>
+            {
+                format!("HTTP {}, ранее HTTP {}", next.code, row.code)
             }
             Some(next) if next.termination == "TlsFailure" && next.raw["mode"] == "http3_head" => {
                 "сбой рукопожатия QUIC".to_owned()
@@ -977,7 +1179,7 @@ fn learning_key(
     let retry_parallel = arguments.retry_parallel();
     Ok(sha256(
         format!(
-            "native-quick-learning-v1-connect-v2\n{}\n{}\n{}\n{}\n{retry_parallel}\n{}",
+            "native-quick-learning-v1-connect-v4\n{}\n{}\n{}\n{}\n{retry_parallel}\n{}",
             context.network_key,
             context.inputs_hash,
             arguments.timeout_ms,
@@ -1048,7 +1250,8 @@ fn probe_details(rows: &[Row]) -> Vec<Value> {
     rows.iter()
         .map(|r| {
             json!({"group":r.group,"name":r.name,"state":r.state,"code":r.code,
-        "url":r.url,"remote_address":r.raw["remote_address"],"certificate_validated":r.raw["certificate_validated"],
+        "tls_peer_retry":endpoints::multiple_tls_peers(&r.raw),
+        "url":r.url,"remote_address":r.raw["remote_address"],"certificate_validated":r.raw["certificate_validated"],"media_url":r.raw["media_url"],"error":r.raw["error"],
         "mode":r.raw["mode"],"dns_source":r.raw["dns_source"],"dns_ms":r.dns_ms,"tcp_ms":if r.raw["mode"] == "http3_head" {None}else{Some(r.conn_ms)},"tls_ms":r.tls_ms,"first_byte_ms":r.first_byte_ms,"total_ms":r.total_ms,
         "body_bytes":r.body_bytes,"body_limit":r.body_limit,"body_complete":r.body_complete,"body_sha256":r.raw["body_sha256"],"target_reached":r.target_reached,"post_bytes":r.raw["post_bytes"],
         "tries":r.tries,"flaky":r.flaky,"up":r.up,"down":r.down,"termination":r.termination})
@@ -1197,7 +1400,8 @@ fn prepare_trial_command(
 fn start_trial(root: &Path, arguments: &[String], lifetime: u64) -> Result<OwnedChild> {
     maintenance::check_engine_args(root, arguments)?;
     let args: Vec<_> = arguments.iter().map(OsString::from).collect();
-    for attempt in 1..=3 {
+    let mut attempt = 1;
+    loop {
         let mut options = RunOptions {
             cwd: Some(root.join("bin")),
             timeout: Duration::from_millis(lifetime),
@@ -1213,11 +1417,18 @@ fn start_trial(root: &Path, arguments: &[String], lifetime: u64) -> Result<Owned
             "Движок завершился при старте: {}",
             String::from_utf8_lossy(&output.stderr)
         );
-        if attempt < 3 {
-            thread::sleep(Duration::from_millis(700));
+        ensure!(!output.timed_out, "Истёк срок запуска тестового движка");
+        if attempt == 3 {
+            return Err(TrialExit {
+                phase: "при запуске после трёх попыток",
+                code: output.exit_code,
+            }
+            .into());
         }
+        interrupt::check()?;
+        thread::sleep(Duration::from_millis(700));
+        attempt += 1;
     }
-    bail!("Движок не запустился после трёх попыток")
 }
 
 fn capture_trial_autolist(root: &Path) -> Result<()> {
@@ -1266,72 +1477,210 @@ fn measured(
         metadata,
         1,
     )?;
-    let first = rows.clone();
-    let failed = rows
-        .iter()
-        .filter(|row| {
-            row.group != "Clean"
-                && matches!(row.state.as_str(), "FAIL" | "FREEZE")
-                && !hopeless.contains(&row.key())
-        })
-        .count();
-    let retry_keys: BTreeSet<_> = rows
-        .iter()
-        .filter(|row| {
-            if row.group == "Clean" {
-                matches!(row.state.as_str(), "FAIL" | "FREEZE")
-                    || clean.get(&row.name).is_some_and(|before| {
-                        row.state == "OK" && !row.healthy_connection(Some(*before))
-                    })
-            } else {
-                failed <= 16
-                    && matches!(row.state.as_str(), "FAIL" | "FREEZE")
-                    && !hopeless.contains(&row.key())
-            }
-        })
-        .map(Row::key)
-        .collect();
-    let retry_targets: Vec<_> = targets
-        .iter()
-        .filter(|target| retry_keys.contains(&target.key()))
-        .cloned()
-        .collect();
-    let mut eligible = first.iter().all(|row| {
+    let plan = retries::Plan::new(
+        &rows,
+        clean,
+        hopeless,
+        arguments.retry_parallel() < parallel,
+    );
+    let mut eligible = rows.iter().all(|row| {
         matches!(row.state.as_str(), "OK" | "FAIL" | "FREEZE")
             && !row.flaky
-            && (row.group != "Clean" || row.healthy_connection(clean.get(&row.name).copied()))
+            && (row.group != "Clean" || row.meets_baseline(clean.get(&row.name).copied()))
     });
-    if !retry_targets.is_empty() {
+    if !plan.first.is_empty() {
         let retry_parallel = arguments.retry_parallel();
+        let mut batch = |keys: &BTreeSet<String>| {
+            let requests = targets
+                .iter()
+                .filter(|t| keys.contains(&t.key()))
+                .cloned()
+                .collect::<Vec<_>>();
+            probe_batch(
+                context,
+                &requests,
+                retry_parallel,
+                arguments.timeout_ms,
+                engine,
+                metadata,
+                2,
+            )
+        };
+        if !plan.sampled.is_empty() {
+            context
+                .sampled_batches
+                .set(context.sampled_batches.get() + 1);
+        }
         crate::selection_ui::detail(
             context.app,
             arguments.details,
             &format!(
                 "  Повторная попытка: {} адресов, одновременно {}.",
-                retry_targets.len(),
+                plan.first.len(),
                 retry_parallel
             ),
         )?;
         thread::sleep(Duration::from_millis(250));
-        let retry = probe_batch(
-            context,
-            &retry_targets,
-            retry_parallel,
-            arguments.timeout_ms,
-            engine,
-            metadata,
-            2,
-        )?;
+        let mut retry = batch(&plan.first)?;
+        if plan.expand(&retry) {
+            context
+                .expanded_batches
+                .set(context.expanded_batches.get() + 1);
+            crate::selection_ui::detail(
+                context.app,
+                arguments.details,
+                &format!(
+                    "  Несколько сервисов ответили при меньшей нагрузке. Повторяю ещё {} запросов.",
+                    plan.reserve.len()
+                ),
+            )?;
+            retry.extend(batch(&plan.reserve)?);
+        }
         eligible &= retry.iter().all(|row| {
-            first
-                .iter()
+            rows.iter()
                 .find(|first| first.key() == row.key())
                 .is_some_and(|first| first.state == row.state)
-                && (row.group != "Clean" || row.healthy_connection(clean.get(&row.name).copied()))
+                && (row.group != "Clean" || row.meets_baseline(clean.get(&row.name).copied()))
         });
         merge_retry(&mut rows, &retry);
     }
     Ok((rows, eligible))
+}
+
+struct ControlBoundary {
+    strategy: String,
+    finished: Instant,
+    generation: u64,
+    rows: Vec<Row>,
+}
+
+impl ControlBoundary {
+    fn current(&self, now: Instant, generation: Option<u64>) -> bool {
+        now.duration_since(self.finished) <= Duration::from_secs(2)
+            && generation == Some(self.generation)
+    }
+}
+
+struct Trial {
+    control_source: Option<String>,
+    replacement_controls: Option<Vec<String>>,
+    rows: Vec<Row>,
+    eligible: bool,
+    failures: Vec<String>,
+    elapsed_ms: f64,
+}
+
+fn trial_order(targets: &[Target], baseline: &[Row], parallel: usize) -> Vec<Target> {
+    let mut order = targets.to_vec();
+    if order.len() > parallel {
+        let costs: BTreeMap<_, _> = baseline.iter().map(|r| (r.key(), r.total_ms)).collect();
+        order.sort_by_cached_key(|t| {
+            let micros = costs.get(&t.key()).copied().unwrap_or(0.) * 1000.;
+            std::cmp::Reverse(micros as u64)
+        });
+    }
+    order
+}
+
+fn measure_profile(
+    context: &RunContext<'_>,
+    settings: &Settings,
+    strategy: &Strategy,
+    targets: &[Target],
+    control_targets: &[Target],
+    boundary: &mut Option<ControlBoundary>,
+    arguments: &TestArgs,
+    metadata: &Value,
+    clean: &BTreeMap<String, f64>,
+    hopeless: &BTreeSet<String>,
+) -> Result<Trial> {
+    let start = Instant::now();
+    context.assert_current()?;
+    let mut info = metadata.clone();
+    info["StrategyId"] = json!(strategy.id);
+    info["StrategyHash"] = json!(strategy.fingerprint()?);
+    let previous = boundary
+        .take()
+        .filter(|last| last.current(Instant::now(), context.network_monitor.generation()));
+    let (before, control_source) = match previous {
+        Some(last) => (last.rows, Some(last.strategy)),
+        None => (
+            controls(context, control_targets, arguments, &info, "before")?,
+            None,
+        ),
+    };
+    // Fix the panel before the candidate starts. A failure appearing only
+    // after the trial must remain visible, even if the spare later succeeds.
+    let panel = controls_for_trial(control_targets, &before, clean);
+    let replacement_controls = (panel
+        .iter()
+        .map(Target::key)
+        .ne(control_targets.iter().take(3).map(Target::key)))
+    .then(|| panel.iter().map(|t| t.name.clone()).collect());
+    let child = launch(
+        context,
+        settings,
+        &strategy.id,
+        false,
+        engine_budget(targets.len(), arguments, false)?,
+    );
+    let (rows, eligible) = run_trial(child, |engine| {
+        measured(context, targets, arguments, engine, &info, clean, hopeless)
+    })?;
+    let generation = context.network_monitor.generation();
+    let after = controls(context, control_targets, arguments, &info, "after")?;
+    let selected: BTreeSet<_> = panel.iter().map(Target::key).collect();
+    let failures = control_failures(&panel, &before, &after);
+    if let Some(generation) = generation
+        && context.network_monitor.generation() == Some(generation)
+        && failures.is_empty()
+        && after
+            .iter()
+            .filter(|r| selected.contains(&r.key()))
+            .all(|r| r.healthy_control(clean.get(&r.name).copied()))
+    {
+        *boundary = Some(ControlBoundary {
+            strategy: strategy.id.clone(),
+            finished: Instant::now(),
+            generation,
+            rows: after,
+        });
+    }
+    Ok(Trial {
+        rows,
+        eligible,
+        failures,
+        control_source,
+        replacement_controls,
+        elapsed_ms: start.elapsed().as_secs_f64() * 1000.,
+    })
+}
+
+fn controls_for_trial(
+    targets: &[Target],
+    before: &[Row],
+    clean: &BTreeMap<String, f64>,
+) -> Vec<Target> {
+    let wanted = targets.len().min(3);
+    if targets.len() > wanted {
+        let healthy: Vec<_> = targets
+            .iter()
+            .filter(|target| {
+                let key = target.key();
+                let samples: Vec<_> = before.iter().filter(|r| r.key() == key).collect();
+                samples.len() == 2
+                    && samples
+                        .iter()
+                        .all(|r| r.healthy_control(clean.get(&target.name).copied()))
+            })
+            .take(wanted)
+            .cloned()
+            .collect();
+        if healthy.len() == wanted {
+            return healthy;
+        }
+    }
+    targets.iter().take(wanted).cloned().collect()
 }
 
 fn controls(
@@ -1363,12 +1712,17 @@ fn controls(
 
 fn control_failures(targets: &[Target], before: &[Row], after: &[Row]) -> Vec<String> {
     let mut failures = Vec::new();
-    if targets.len() < 2 {
-        failures.push("Доступно меньше двух контрольных адресов.".into());
+    if targets
+        .iter()
+        .filter_map(control_host)
+        .collect::<BTreeSet<_>>()
+        .len()
+        < 2
+    {
+        failures.push("Доступно меньше двух независимых контрольных серверов.".into());
     }
-    if before.len() != targets.len() * 2 || after.len() != targets.len() * 2 {
-        failures.push("Контрольные измерения выполнены не полностью.".into());
-    }
+    // The batches can include a standby. Each selected control must still have
+    // exactly two observations on each side of the trial.
     for target in targets {
         let first: Vec<_> = before
             .iter()
@@ -1385,16 +1739,16 @@ fn control_failures(targets: &[Target], before: &[Row], after: &[Row]) -> Vec<St
             ));
             continue;
         }
-        let healthy = |rows: &[&Row]| rows.iter().all(|row| row.healthy_connection(None));
+        let healthy = |rows: &[&Row]| rows.iter().all(|row| row.healthy_control(None));
         if !healthy(&first) {
             failures.push(format!(
-                "Контрольный адрес {} не ответил до измерения.",
+                "Контрольный адрес {} не подтвердил доступность до измерения.",
                 target.name
             ));
         }
         if !healthy(&last) {
             failures.push(format!(
-                "Контрольный адрес {} не ответил после измерения.",
+                "Контрольный адрес {} не подтвердил доступность после измерения.",
                 target.name
             ));
         }
@@ -1422,6 +1776,11 @@ fn qualified_scores(rows: &[RankRow], quality: &BTreeMap<String, bool>) -> Vec<R
         .collect()
 }
 
+fn missing_comparison(primary: &str, candidates: &[Strategy], qualified: &[RankRow]) -> bool {
+    candidates.iter().any(|strategy| strategy.id != primary)
+        && !qualified.iter().any(|row| row.id != primary)
+}
+
 fn fully_covered(base: &[Row], actual: &[Row]) -> bool {
     let base_keys: BTreeSet<_> = base.iter().map(Row::key).collect();
     let actual_keys: BTreeSet<_> = actual.iter().map(Row::key).collect();
@@ -1441,7 +1800,7 @@ fn fully_covered(base: &[Row], actual: &[Row]) -> bool {
                     || base
                         .iter()
                         .find(|before| before.key() == row.key())
-                        .is_some_and(|before| row.healthy_connection(Some(before.connection_ms()))))
+                        .is_some_and(|before| row.preserves_clean(before)))
         })
         && actual.iter().any(|row| row.group == "Clean")
         && actual.iter().any(|row| row.group != "Clean")
@@ -1582,11 +1941,14 @@ fn score_history(
 
 fn read_last(app: &App) -> Result<Value> {
     let path = runtime_file(&app.root, "test-native-last.json")?;
-    ensure!(
-        path.is_file(),
-        "Результатов ещё нет. Сначала запустите подбор."
-    );
-    let report: Value =
+    let interruption = last_interruption(&app.root).ok().flatten();
+    if !path.is_file() {
+        if let Some((_, reason)) = interruption {
+            bail!("Последний автоподбор прерван. {reason} Завершённых результатов ещё нет.");
+        }
+        bail!("Результатов ещё нет. Сначала запустите подбор.");
+    }
+    let mut report: Value =
         serde_json::from_slice(&zapret_core::read_bounded(&path, 16 * 1024 * 1024)?)
             .context("Сохранённый результат повреждён. Запустите подбор заново.")?;
     ensure!(
@@ -1596,6 +1958,15 @@ fn read_last(app: &App) -> Result<Value> {
             && report["primary"].is_string(),
         "Сохранённый результат повреждён. Запустите подбор заново."
     );
+    if let Some((time, reason)) = interruption {
+        if path
+            .metadata()
+            .and_then(|m| m.modified())
+            .is_ok_and(|t| chrono::DateTime::<Utc>::from(t) < time)
+        {
+            report["later_interruption"] = json!(reason);
+        }
+    }
     Ok(report)
 }
 
@@ -1616,7 +1987,7 @@ pub fn run(app: &App, arguments: &TestArgs) -> Result<Value> {
     let settings = read_settings(&app.root)?;
     let targets = read_targets(&app.root, arguments)?;
     let native_hash = crate::controller_hash()?;
-    let local_network = app.platform("network", json!({}))?;
+    let local_network = app.platform("network", json!({"identity_only":true}))?;
     let local_context = local_network["key"]
         .as_str()
         .filter(|_| local_network["known"] == true)
@@ -1682,7 +2053,7 @@ pub fn run(app: &App, arguments: &TestArgs) -> Result<Value> {
             None
         };
         return Ok(
-            json!({"schema":1,"policy":"native-quick-families-v5","preferred_selection_policy":crate::selection_latency::POLICY,"context":local_context,"targets":targets,"strategies":plan.strategies,"deferred_history":plan.deferred,"queued_candidates":plan.queued,"latency_candidates":plan.latency_candidates,"lighter_candidate":plan.lighter_candidate,"strategy_families":families::catalog(&initial),"family_representatives":representatives,"settings":settings,
+            json!({"schema":1,"policy":"native-quick-service-screen-v8","quick_screen_requested":!arguments.full && arguments.rounds==1 && arguments.compare_a.is_none() && arguments.compare_b.is_none(),"preferred_selection_policy":crate::selection_latency::POLICY,"context":local_context,"targets":targets,"strategies":plan.strategies,"deferred_history":plan.deferred,"queued_candidates":plan.queued,"latency_candidates":plan.latency_candidates,"lighter_candidate":plan.lighter_candidate,"strategy_families":families::catalog(&initial),"family_representatives":representatives,"settings":settings,
             "rounds":arguments.rounds,"parallel":arguments.parallel(),"retry_parallel":arguments.retry_parallel(),"timeout_ms":arguments.timeout_ms,"report_only":arguments.report_only}),
         );
     }
@@ -1738,7 +2109,22 @@ pub fn run(app: &App, arguments: &TestArgs) -> Result<Value> {
         approved_games: approved_games.clone(),
     };
     app.platform("stop", json!({"game_approved":true}))?;
-    let mut result = run_inner(app, arguments, &network, approved_games);
+    let mut result = network_monitor::run_with_recovery(
+        &network,
+        || run_inner(app, arguments, &network, approved_games.clone()),
+        || app.platform("network", json!({"identity_only":true})),
+        || {
+            interrupt::check()?;
+            thread::sleep(Duration::from_millis(250));
+            interrupt::check()
+        },
+        || {
+            crate::selection_ui::heading(
+                app,
+                "Прежнее подключение восстановилось. Начинаю подбор заново с замера без обхода.",
+            )
+        },
+    );
     if let Ok(report) = &result {
         restore.needed |= selection_start_requested(arguments, report);
     }
@@ -1770,11 +2156,20 @@ pub fn run(app: &App, arguments: &TestArgs) -> Result<Value> {
     }
     if let Ok(report) = result.as_mut() {
         if report["protocol"] != "finalists-native-v1" {
+            if restart.is_ok() {
+                report["telegram_media"] = app.platform("telegram-media",json!({})).unwrap_or_else(|e|
+                    json!({"bridge":{"state":"unavailable","reason":format!("{e:#}")},"file":{"state":"unavailable","reason":"Состояние моста неизвестно"}}));
+            }
             save_report(app, report)?;
         }
     }
-    restart?;
-    result
+    match (result, restart) {
+        (Err(measurement), Err(restore)) => Err(measurement.context(format!(
+            "Не удалось восстановить рабочий обход: {restore:#}. Автоподбор прерван"
+        ))),
+        (_, Err(restore)) => Err(restore),
+        (result, Ok(_)) => result,
+    }
 }
 
 fn selection_start_requested(arguments: &TestArgs, report: &Value) -> bool {
@@ -1839,11 +2234,18 @@ fn run_inner(
         .seed
         .unwrap_or(Utc::now().timestamp_micros() as u64)
         .max(1);
+    let failed_profiles = RefCell::new(BTreeMap::new());
+    let sampled_batches = Cell::new(0);
+    let expanded_batches = Cell::new(0);
+    let network_monitor = network_monitor::Monitor::new(network);
     let context = RunContext {
         app,
         snapshot: &snapshot,
         network_key: network_key.clone(),
-        network_parts: network["key_parts"].clone(),
+        network_monitor: &network_monitor,
+        failed_profiles: &failed_profiles,
+        sampled_batches: &sampled_batches,
+        expanded_batches: &expanded_batches,
         native_hash,
         journal: journal.clone(),
         deadline: if arguments.compare_a.is_some() || arguments.compare_b.is_some() {
@@ -1852,7 +2254,7 @@ fn run_inner(
             None
         },
         clock_origin: zapret_platform::monotonic_ms()?,
-        approved_games,
+        approved_games: &approved_games,
         details: arguments.details,
     };
     let lifetime = engine_budget(targets.len(), arguments, false)?;
@@ -1943,9 +2345,13 @@ fn run_inner(
     let mut eligible = BTreeMap::<String, bool>::new();
     let mut skipped = Vec::new();
     let mut family_selection = None;
+    let mut quick_screen = None;
+    let mut shared_controls = Vec::new();
+    let mut control_substitutions = Vec::new();
     let mut strategy_quality = BTreeMap::<String, bool>::new();
     let mut quality_reasons = BTreeMap::<String, BTreeSet<String>>::new();
     let mut round_sums = BTreeMap::<String, Vec<RankRow>>::new();
+    let mut repeated_baselines = Vec::new();
     for round in 1..=arguments.rounds {
         if arguments.rounds > 1 {
             crate::selection_ui::progress(app, &format!("Круг {round} из {}", arguments.rounds))?;
@@ -1954,16 +2360,36 @@ fn run_inner(
         let baseline_started = Instant::now();
         let mut round_ids = BTreeSet::<String>::new();
         let metadata = json!({"Schema":1,"RunId":run_id,"Stage":"main","Round":round,"CapturedNetworkKey":network_key,"CapturedInputsHash":snapshot.fingerprint(),"NativeIdentity":native_hash});
-        let (base, base_eligible) = measured(
-            &context,
-            &targets,
-            arguments,
-            &mut None,
-            &metadata,
-            &BTreeMap::new(),
-            &BTreeSet::new(),
-        )?;
+        let RoundBaseline {
+            rows: base,
+            eligible: base_eligible,
+            controls: quick_controls,
+            repeated,
+        } = round_baseline(&targets, arguments.report_only, |again| {
+            let mut baseline_meta = metadata.clone();
+            if again {
+                context.check_current(true)?;
+                crate::selection_ui::progress(
+                    app,
+                    "В исходном замере мало надёжных контрольных серверов. Проверяю подключение ещё раз.",
+                )?;
+                baseline_meta["Stage"] = json!("baseline-recheck");
+            }
+            measured(
+                &context,
+                &targets,
+                arguments,
+                &mut None,
+                &baseline_meta,
+                &BTreeMap::new(),
+                &BTreeSet::new(),
+            )
+        })?;
+        if repeated {
+            repeated_baselines.push(round);
+        }
         let round_targets = endpoints::for_round(&targets, &base);
+        let trial_targets = trial_order(&round_targets, &base, arguments.parallel());
         let clean = baseline(&base);
         let base_counts = availability(&base);
         let base_timing = timing_summary(&base, baseline_started.elapsed().as_secs_f64() * 1000.);
@@ -1986,20 +2412,81 @@ fn run_inner(
         timings.insert("0".into(), base_timing);
         eligible.insert("0".into(), base_eligible);
         table.insert("0".into(), base);
-        let control_targets: Vec<_> = targets
-            .iter()
-            .filter(|target| {
-                target.group == "Clean"
-                    && clean.contains_key(&target.name)
-                    && target.probe_mode() != ProbeMode::Http3Head
-            })
-            .take(3)
-            .map(|target| Target {
-                expected: None,
-                ..target.clone()
-            })
-            .collect();
-        let (mut initial, mut deferred) = if arguments.full || arguments.rounds > 1 {
+        let mut control_targets = quick_controls.clone();
+        let primary_id = settings.get("alt");
+        let mut primary_trial = None;
+        let mut short_targets = Vec::new();
+        if !arguments.full && arguments.rounds == 1 && candidates.len() > 4 {
+            let initial_panel = quick::panel(&round_targets, &table["0"], &[], &quick_controls);
+            if initial_panel.len() * 2 < targets.len()
+                && initial_panel.iter().filter(|t| t.group == "Clean").count() >= 2
+            {
+                if let Some(active) = candidates.iter().find(|s| s.id == primary_id) {
+                    crate::selection_ui::heading(
+                        app,
+                        &format!(
+                            "Полная проверка текущей стратегии {}",
+                            active.display_name()
+                        ),
+                    )?;
+                    let trial = measure_profile(
+                        &context,
+                        &settings,
+                        active,
+                        &trial_targets,
+                        &control_targets,
+                        &mut None,
+                        arguments,
+                        &metadata,
+                        &clean,
+                        &BTreeSet::new(),
+                    )
+                    .with_context(|| format!("При проверке текущей стратегии ALT{primary_id}"))?;
+                    short_targets =
+                        quick::panel(&round_targets, &table["0"], &trial.rows, &quick_controls);
+                    primary_trial = Some(trial);
+                }
+            }
+        }
+        let staged = primary_trial
+            .as_ref()
+            .is_some_and(|trial| trial.failures.is_empty())
+            && short_targets.len() * 2 < targets.len();
+        let (mut initial, mut deferred) = if staged {
+            let active = primary_trial.as_ref().expect("measured primary");
+            let (finalists, confirmed_controls, report) = quick::screen(
+                &context,
+                &settings,
+                &candidates,
+                &short_targets,
+                &quick_controls,
+                &active.rows,
+                active.failures.is_empty(),
+                arguments,
+                &metadata,
+                &clean,
+            )?;
+            if confirmed_controls.len() >= 2 {
+                control_targets = confirmed_controls;
+            }
+            skipped.extend(
+                candidates
+                    .iter()
+                    .filter(|s| !finalists.iter().any(|f| f.id == s.id))
+                    .map(|s| s.id.clone()),
+            );
+            crate::selection_ui::progress(
+                app,
+                &format!(
+                    "Полная проверка: {} профилей из {}, {} адресов.",
+                    finalists.len(),
+                    candidates.len(),
+                    targets.len()
+                ),
+            )?;
+            quick_screen = Some(report);
+            (finalists, Vec::new())
+        } else if arguments.full || arguments.rounds > 1 {
             (candidates.clone(), Vec::new())
         } else {
             let plan = families::schedule(
@@ -2023,102 +2510,133 @@ fn run_inner(
             )?;
             plan
         };
+        initial.retain(|s| !failed_profiles.borrow().contains_key(&s.id));
+        deferred.retain(|s| !failed_profiles.borrow().contains_key(&s.id));
         shuffle(&mut initial, &mut random);
         let initial_len = initial.len();
+        let total_scheduled = if staged {
+            initial_len
+        } else {
+            candidates.len()
+        };
         let mut schedule = initial;
+        let mut boundary = None;
         let mut index = 0;
         while index < schedule.len() {
             if index == initial_len && !deferred.is_empty() {
                 unreachable!("continuation is appended at boundary below")
             }
             let strategy = schedule[index].clone();
-            let trial_started = Instant::now();
             crate::selection_ui::heading(
                 app,
                 &format!(
                     "[{} / {}] {}",
                     index + 1,
-                    candidates.len(),
+                    total_scheduled,
                     strategy.display_name()
                 ),
             )?;
-            context.assert_current()?;
-            let mut metadata = metadata.clone();
-            metadata["StrategyId"] = json!(strategy.id);
-            metadata["StrategyHash"] = json!(strategy.fingerprint()?);
-            let before = controls(&context, &control_targets, arguments, &metadata, "before")?;
-            let mut engine = Some(launch(&context, &settings, &strategy.id, false, lifetime)?);
             let hopeless: BTreeSet<_> = failure_runs
                 .iter()
                 .filter(|(_, count)| **count >= 3)
                 .map(|(key, _)| key.clone())
                 .collect();
-            let result = measured(
-                &context,
-                &round_targets,
-                arguments,
-                &mut engine,
-                &metadata,
-                &clean,
-                &hopeless,
-            );
-            stop_trial(engine)?;
-            let (rows, can_skip) = result?;
-            let after = controls(&context, &control_targets, arguments, &metadata, "after")?;
-            let counts = availability(&rows);
-            let run_summary = summary(&strategy.id, &rows, &clean);
-            let timing = timing_summary(&rows, trial_started.elapsed().as_secs_f64() * 1000.);
-            let failures = control_failures(&control_targets, &before, &after);
-            let stable = failures.is_empty();
-            strategy_quality
-                .entry(strategy.id.clone())
-                .and_modify(|qualified| *qualified &= stable)
-                .or_insert(stable);
-            let previous_best = round_ids
-                .iter()
-                .filter(|id| strategy_quality.get(*id) == Some(&true))
-                .map(|id| summary(id, &table[id], &clean).score)
-                .reduce(f64::max);
-            let confirmed = strategy_quality.get(&strategy.id) == Some(&true);
-            crate::selection_ui::run_summary(
-                app,
-                strategy.display_name(),
-                &run_summary,
-                &counts,
-                &timing,
-                &rows,
-                crate::selection_ui::RunState {
-                    qualified: confirmed,
-                    leader: confirmed
-                        && previous_best.is_none_or(|score| run_summary.score >= score),
-                    response_delta: counts.change_from(&base_counts),
-                    details: arguments.details,
-                    position: index + 1,
-                    total: candidates.len(),
-                },
-            )?;
-            timings.insert(strategy.id.clone(), timing);
-            if !stable {
-                crate::selection_ui::detail(
-                    app,
-                    arguments.details,
-                    &format!("  Измерение вне выбора: {}", failures[0]),
-                )?;
-                quality_reasons
-                    .entry(strategy.id.clone())
-                    .or_default()
-                    .extend(failures);
-            }
-            for row in &rows {
-                if matches!(row.state.as_str(), "FAIL" | "FREEZE") {
-                    *failure_runs.entry(row.key()).or_default() += 1;
-                } else {
-                    failure_runs.remove(&row.key());
+            let cached = if strategy.id == primary_id {
+                primary_trial.take()
+            } else {
+                None
+            };
+            let result = match cached {
+                Some(trial) => Ok(trial),
+                None => measure_profile(
+                    &context,
+                    &settings,
+                    &strategy,
+                    &trial_targets,
+                    &control_targets,
+                    &mut boundary,
+                    arguments,
+                    &metadata,
+                    &clean,
+                    &hopeless,
+                ),
+            };
+            if let Some(Trial {
+                rows,
+                eligible: can_skip,
+                control_source,
+                replacement_controls,
+                failures,
+                elapsed_ms,
+            }) = context.candidate(&strategy.id, primary_id, result)?
+            {
+                if let Some(controls) = replacement_controls {
+                    control_substitutions
+                        .push(json!({"round":round, "strategy":strategy.id,"controls":controls}));
                 }
+                if let Some(source) = control_source {
+                    shared_controls
+                        .push(json!({"round":round, "before":strategy.id, "after":source,
+                    "requests_saved":control_targets.len() * 2}));
+                }
+                let counts = availability(&rows);
+                let run_summary = summary(&strategy.id, &rows, &clean);
+                let timing = timing_summary(&rows, elapsed_ms);
+                let stable = failures.is_empty();
+                strategy_quality
+                    .entry(strategy.id.clone())
+                    .and_modify(|qualified| *qualified &= stable)
+                    .or_insert(stable);
+                let previous_best = round_ids
+                    .iter()
+                    .filter(|id| strategy_quality.get(*id) == Some(&true))
+                    .map(|id| summary(id, &table[id], &clean).score)
+                    .reduce(f64::max);
+                let confirmed = strategy_quality.get(&strategy.id) == Some(&true);
+                crate::selection_ui::run_summary(
+                    app,
+                    strategy.display_name(),
+                    &run_summary,
+                    &counts,
+                    &timing,
+                    &rows,
+                    crate::selection_ui::RunState {
+                        qualified: confirmed,
+                        leader: confirmed
+                            && previous_best.is_none_or(|score| run_summary.score >= score),
+                        response_delta: counts.change_from(&base_counts),
+                        details: arguments.details,
+                        position: index + 1,
+                        total: total_scheduled,
+                    },
+                )?;
+                timings.insert(strategy.id.clone(), timing);
+                if !stable {
+                    crate::selection_ui::detail(
+                        app,
+                        arguments.details,
+                        &format!("  Измерение вне выбора: {}", failures[0]),
+                    )?;
+                    quality_reasons
+                        .entry(strategy.id.clone())
+                        .or_default()
+                        .extend(failures);
+                }
+                for row in &rows {
+                    if matches!(row.state.as_str(), "FAIL" | "FREEZE") || row.dns_failure() {
+                        *failure_runs.entry(row.key()).or_default() += 1;
+                    } else {
+                        failure_runs.remove(&row.key());
+                    }
+                }
+                eligible.insert(strategy.id.clone(), can_skip);
+                round_ids.insert(strategy.id.clone());
+                table.insert(strategy.id.clone(), rows);
+            } else {
+                eligible.insert(strategy.id.clone(), false);
+                strategy_quality.insert(strategy.id, false);
+                boundary = None;
             }
-            eligible.insert(strategy.id.clone(), can_skip);
-            round_ids.insert(strategy.id.clone());
-            table.insert(strategy.id.clone(), rows);
             index += 1;
             if index == initial_len && !deferred.is_empty() {
                 let clean_base = &table["0"];
@@ -2210,11 +2728,12 @@ fn run_inner(
             .then(a.freeze.cmp(&b.freeze))
     });
     let qualified = qualified_scores(&sums, &strategy_quality);
-    let quality_ok = !qualified.is_empty();
+    let no_comparison = missing_comparison(settings.get("alt"), &candidates, &qualified);
+    let quality_ok = !qualified.is_empty() && !no_comparison;
     let best = qualified.first().unwrap_or(&sums[0]).clone();
     let history_context = sha256(
         format!(
-            "native-score-v1\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
+            "native-score-v3\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
             result_context.network_key,
             result_context.inputs_hash,
             serde_json::to_string(&targets)?,
@@ -2247,7 +2766,8 @@ fn run_inner(
     let panel = Panel::for_trials(&order, &details);
     panel.prioritize(&mut order, &details, settings.get("alt"));
     let proposed = order.first().unwrap_or(&best);
-    let mut latency_preference = crate::selection_latency::recommend(&order, &details, panel);
+    let screening = crate::selection_latency::recommend(&order, &details, panel);
+    let mut latency_preference = screening.preference;
     // Within an equal service tier prioritize() places the current primary first.
     let service_progress = panel == Panel::Services && proposed.id != settings.get("alt");
     let noise = app.yes
@@ -2307,16 +2827,29 @@ fn run_inner(
         })
         .collect();
     let mut accepted = false;
-    let mut validation_error = None;
+    let mut validation_error = no_comparison.then(|| {
+        "Ни одна альтернативная стратегия не прошла проверку надёжности. Прежний рейтинг сохранён."
+            .to_owned()
+    });
     let mut final_details = Vec::new();
     let mut final_checks = BTreeMap::new();
     let mut latency_rechecks = Vec::new();
+    let mut availability_checks = BTreeMap::new();
+    let mut decision_reason = None;
+    let names: BTreeMap<_, _> = all
+        .iter()
+        .map(|s| (s.id.clone(), s.display_name().to_owned()))
+        .collect();
     let mut retained_check = None;
-    let update_quick_history = updates_quick_history(arguments);
+    let update_quick_history = updates_quick_history(arguments) && !no_comparison;
     if update_quick_history {
         learning.observe(&sums, &strategy_quality, &hashes, Utc::now().timestamp());
+        if quick_screen.is_some() {
+            learning.note_screened(&candidates, &hashes);
+        }
     }
     let mut working_details = Vec::new();
+    let network_metrics;
     if !arguments.report_only && quality_ok {
         crate::selection_ui::heading(app, "Проверяю текущий рабочий режим перед применением…")?;
         let primary = settings.get("alt");
@@ -2331,8 +2864,7 @@ fn run_inner(
             &baseline(&table["0"]),
             &BTreeSet::new(),
         );
-        stop_trial(reference_engine)?;
-        let (working_reference, _) = reference_result?;
+        let (working_reference, _) = finish_trial(reference_engine, reference_result)?;
         working_details = probe_details(&working_reference);
         zapret_core::save_rank(snapshot.root(), &rank)?;
         zapret_core::save_cover(snapshot.root(), &cover, &result_context)?;
@@ -2364,8 +2896,7 @@ fn run_inner(
                 &baseline(&table["0"]),
                 &BTreeSet::new(),
             );
-            stop_trial(engine)?;
-            let (actual, _) = actual?;
+            let (actual, _) = finish_trial(engine, actual)?;
             // The retained command only needs to preserve its own working coverage.
             let expected = if retained {
                 final_reference(
@@ -2419,8 +2950,7 @@ fn run_inner(
                         }
                         Ok(rows)
                     })();
-                    stop_trial(trial)?;
-                    result
+                    finish_trial(trial, result)
                 },
             )?;
             context.assert_current()?;
@@ -2460,6 +2990,59 @@ fn run_inner(
                 arguments.full,
                 &details,
                 panel,
+                primary,
+                |id, check| {
+                    let clean = baseline(&table["0"]);
+                    let mut working =
+                        gains::improvements(&working_details, &check.details, &clean, panel);
+                    let regressions =
+                        gains::improvements(&check.details, &working_details, &clean, panel);
+                    if !regressions.is_empty() {
+                        working.clear();
+                    }
+                    let reference = details
+                        .get(primary)
+                        .map(Vec::as_slice)
+                        .unwrap_or(&working_details);
+                    let tested = gains::improvements(reference, &details[id], &clean, panel);
+                    let mut proof = gains::verify(
+                        &tested,
+                        &working,
+                        &targets,
+                        &clean,
+                        panel,
+                        |requests, previous| {
+                            let mut candidate_settings = settings.clone();
+                            candidate_settings.set("alt", id)?;
+                            let command = if previous {
+                                prepare_trial_inputs(snapshot.root(), &settings)?;
+                                original_command.clone()
+                            } else {
+                                prepare_trial_command(&context, &candidate_settings, id, true)?
+                            };
+                            let mut engine = Some(start_trial(
+                                snapshot.root(),
+                                &command,
+                                engine_budget(requests.len(), arguments, false)?,
+                            )?);
+                            let metadata = json!({"Schema":1,"RunId":run_id,"Stage":"availability-repeat","StrategyId":if previous{primary}else{id}});
+                            let result = measured(
+                                &context,
+                                requests,
+                                arguments,
+                                &mut engine,
+                                &metadata,
+                                &clean,
+                                &BTreeSet::new(),
+                            );
+                            Ok(probe_details(&finish_trial(engine, result)?.0))
+                        },
+                    )?;
+                    let confirmed = proof["confirmed"].as_array().is_some_and(|v| !v.is_empty());
+                    proof["regressions"] = json!(regressions);
+                    availability_checks.insert(id.to_owned(), proof);
+                    Ok(confirmed)
+                },
                 &mut validate,
             )?;
             latency_preference = decision.preference;
@@ -2467,9 +3050,11 @@ fn run_inner(
             latency_rechecks = decision.repeat_candidates;
             if let Some(recommended) = decision.recommended {
                 best = recommended;
+                decision_reason = gains::reason(&availability_checks, &best.id, primary, &names);
                 recommendation_status = "confirmed";
                 if best.id != settings.get("alt") {
                     let preview = json!({"best":best,"trial_best":trial_best,"rows":sums,"primary":settings.get("alt"),"final_checks":final_checks,"connection_selection":latency_preference,"timings":timings,
+                        "trial_service_scores":screening.service_scores,"trial_score_reference":proposed.id,"decision_reason":decision_reason,
                         "strategy_names":all.iter().map(|s|(&s.id,s.display_name())).collect::<BTreeMap<_,_>>()});
                     select = arguments.apply || crate::selection_ui::choose_primary(app, &preview)?;
                     if select {
@@ -2505,7 +3090,7 @@ fn run_inner(
         if checked.confirmed && best.id == selected {
             recommendation_status = "confirmed";
         }
-        context.assert_current()?;
+        context.check_current(true)?;
         snapshot.release_state_pins();
         let validation = if checked.confirmed {
             Ok(())
@@ -2518,8 +3103,25 @@ fn run_inner(
             ))
         };
         validation_error = accept_candidate(validation, || {
-            publish(app, &settings, &candidate, &rank, &cover, &history, &all)
+            publish(
+                app,
+                &settings,
+                &candidate,
+                &rank,
+                &cover,
+                &history,
+                &all,
+                || {
+                    interrupt::check()?;
+                    ensure!(
+                        game_snapshot(app)?.is_subset(&approved_games),
+                        "Во время сохранения запущена новая игра"
+                    );
+                    network_monitor.check(app, &journal, true)
+                },
+            )
         })?;
+        network_metrics = network_monitor.metrics();
         accepted = validation_error.is_none();
         if let Some(error) = &validation_error {
             crate::selection_ui::detail(
@@ -2530,9 +3132,12 @@ fn run_inner(
                 ),
             )?;
         }
-    } else if !arguments.report_only {
-        context.assert_current()?;
-        snapshot.release_state_pins();
+    } else {
+        context.check_current(true)?;
+        network_metrics = context.network_monitor.metrics();
+        if !arguments.report_only {
+            snapshot.release_state_pins();
+        }
     }
     let cache_error = if update_quick_history {
         learning
@@ -2564,15 +3169,29 @@ fn run_inner(
         "accepted":accepted,"quality_eligible":quality_ok,"strategy_quality":strategy_quality,"quality_reasons":quality_reasons,"averages":averages,"noise_margin":noise,"primary_changed":select&&accepted,"primary":primary,
         "skipped_ids":skipped,"rounds_measured":rounds_measured,"strategy_names":all.iter().map(|s|(&s.id,s.display_name())).collect::<BTreeMap<_,_>>(),"native_identity":native_hash,"context":result_context});
     report["latency_candidates"] = json!(latency_candidates);
+    if panel == Panel::Services {
+        report["trial_service_scores"] = json!(screening.service_scores);
+        report["trial_score_reference"] = json!(proposed.id);
+    }
     report["lighter_candidate"] = json!(lighter_candidate);
     report["next_quick_latency"] = json!(next_quick_latency);
     report["latency_rechecks"] = json!(latency_rechecks);
+    report["availability_checks"] = json!(availability_checks);
+    report["decision_reason"] = json!(decision_reason);
     report["family_selection"] = json!(family_selection);
+    report["quick_screen"] = json!(quick_screen);
     report["strategy_families"] = json!(families::catalog(&all));
     report["parallel"] = json!(arguments.parallel());
     report["retry_parallel"] = json!(arguments.retry_parallel());
-    report["endpoint_policy"] = json!("baseline-peer-per-round-live-dns-final-v1");
+    report["endpoint_policy"] = json!("verified-baseline-peer-live-dns-final-v2");
     report["timeout_ms"] = json!(arguments.timeout_ms);
+    report["network_monitor"] = network_metrics;
+    report["shared_controls"] = json!(shared_controls);
+    report["control_substitutions"] = json!(control_substitutions);
+    report["retry_batches"] =
+        json!({"sampled":sampled_batches.get(),"expanded":expanded_batches.get()});
+    report["failed_profiles"] = json!(*failed_profiles.borrow());
+    report["repeated_baseline_rounds"] = json!(repeated_baselines);
     Ok(report)
 }
 
@@ -2601,62 +3220,76 @@ fn publish(
     cover: &Coverage,
     history: &[u8],
     all: &[Strategy],
+    mut check: impl FnMut() -> Result<()>,
 ) -> Result<()> {
-    let names = [
-        "runtime/test-rank.txt",
-        "runtime/test-cover.txt",
-        "runtime/settings.ini",
-        "runtime/test-scores.txt",
-        "runtime/tested-strategies.txt",
-    ];
-    let backups: Vec<_> = names
-        .iter()
-        .map(|name| app.root.join(name))
-        .map(|path| {
-            let bytes = match fs::read(&path) {
-                Ok(bytes) => Some(bytes),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-                Err(error) => return Err(error.into()),
-            };
-            Ok((path, bytes))
-        })
-        .collect::<Result<_>>()?;
-    let result = (|| {
-        zapret_core::save_rank(&app.root, rank)?;
-        zapret_core::save_cover(
-            &app.root,
-            cover,
-            rank.context.as_ref().context("Контекст рейтинга")?,
-        )?;
-        if candidate != previous {
-            save_settings(&app.root, candidate)?;
-        }
-        atomic_write(&runtime_file(&app.root, "test-scores.txt")?, history)?;
-        let path = runtime_file(&app.root, "tested-strategies.txt")?;
-        let mut tested = zapret_core::list_lines(&path)?;
-        for row in &rank.rows {
-            let strategy = all
-                .iter()
-                .find(|strategy| strategy.id == row.id)
-                .context("Стратегия публикации отсутствует")?;
-            let line = format!("{}|{}", strategy.id, strategy.name);
-            if !tested.contains(&line) {
-                tested.push(line);
-            }
-        }
-        atomic_write(&path, format!("{}\r\n", tested.join("\r\n")).as_bytes())?;
-        Ok(())
-    })();
-    if result.is_err() {
-        for (path, bytes) in backups {
-            if let Some(bytes) = bytes {
-                atomic_write(&path, &bytes)?;
-            } else if path.exists() {
-                fs::remove_file(path)?;
-            }
+    let scope = rank.context.as_ref().context("Контекст рейтинга")?;
+    let tested_path = runtime_file(&app.root, "tested-strategies.txt")?;
+    let mut tested = zapret_core::list_lines(&tested_path)?;
+    for row in &rank.rows {
+        let strategy = all
+            .iter()
+            .find(|s| s.id == row.id)
+            .context("Стратегия публикации отсутствует")?;
+        let line = format!("{}|{}", strategy.id, strategy.name);
+        if !tested.contains(&line) {
+            tested.push(line);
         }
     }
-    result
+    let mut written = Vec::new();
+    let mut replace = |name: &str, write: &dyn Fn(&Path) -> Result<()>| -> Result<()> {
+        let path = runtime_file(&app.root, name)?;
+        let old = match fs::read(&path) {
+            Ok(bytes) => Some(bytes),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => return Err(e.into()),
+        };
+        write(&path)?;
+        written.push((path, old));
+        Ok(())
+    };
+    check()?;
+    ensure!(
+        read_settings(&app.root)? == *previous,
+        "Настройки изменились перед сохранением автоподбора"
+    );
+    let result = (|| {
+        replace("test-rank.txt", &|_| {
+            zapret_core::save_rank(&app.root, rank)
+        })?;
+        replace("test-cover.txt", &|_| {
+            zapret_core::save_cover(&app.root, cover, scope)
+        })?;
+        if candidate != previous {
+            replace("settings.ini", &|_| save_settings(&app.root, candidate))?;
+        }
+        replace("test-scores.txt", &|path| atomic_write(path, history))?;
+        replace("tested-strategies.txt", &|path| {
+            atomic_write(path, format!("{}\r\n", tested.join("\r\n")).as_bytes())
+        })?;
+        check()
+    })();
+    if let Err(error) = result {
+        let mut failures = Vec::new();
+        for (path, old) in written.into_iter().rev() {
+            let restored = match old {
+                Some(bytes) => atomic_write(&path, &bytes),
+                None => match fs::remove_file(&path) {
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                    r => r.map_err(Into::into),
+                },
+            };
+            if let Err(e) = restored {
+                failures.push(format!("{}: {e:#}", path.display()));
+            }
+        }
+        ensure!(
+            failures.is_empty(),
+            "{error:#}. Неполный откат автоподбора: {}",
+            failures.join(", ")
+        );
+        return Err(error);
+    }
+    Ok(())
 }
 
 fn comparison(
@@ -2762,8 +3395,7 @@ fn comparison(
                 .platform("process-metrics", json!({"identity":identity}))?;
             end["observed_monotonic_ms"] =
                 json!(zapret_platform::monotonic_ms()? - context.clock_origin);
-            stop_trial(engine)?;
-            let (probes, _) = result?;
+            let (probes, _) = finish_trial(engine, result)?;
             context.assert_current()?;
             let strategy_hash = all
                 .iter()
@@ -2776,7 +3408,7 @@ fn comparison(
                 "probes":probes,"resources":{"ready":ready,"warm":warm_metrics,"end":end}}));
         }
     }
-    context.assert_current()?;
+    context.check_current(true)?;
     let assessment = crate::comparison::assess(&rows, arguments.compare_blocks)?;
     let a_name = all
         .iter()
@@ -2808,6 +3440,7 @@ fn comparison(
 #[cfg(test)]
 mod tests {
     use super::*;
+    mod resilience;
 
     #[test]
     fn measurement_retries_unavailable_samples_and_reports_confirmed_changes() {
@@ -2986,7 +3619,16 @@ mod tests {
         assert_eq!(veto.details.len(), 2);
         let error = veto.error.unwrap();
         assert!(error.contains("Clean/adobe") && !error.contains("Discord/avatar"));
-        let round = endpoints::for_round(targets, &actual);
+        assert!(endpoints::for_round(targets, &actual)[0].peer.is_none());
+        let mut intermittent = observed(b, true);
+        intermittent.flaky = true;
+        intermittent.tries = 2;
+        assert!(
+            endpoints::for_round(targets, &[intermittent])[0]
+                .peer
+                .is_none()
+        );
+        let round = endpoints::for_round(targets, &[observed(b, true)]);
         let job = round[0].job(5000, false);
         assert_eq!(job.connect_ip, Some("192.0.2.130".parse().unwrap()));
         assert_eq!(job.url, target.url);
@@ -3733,6 +4375,97 @@ mod tests {
     }
 
     #[test]
+    fn explicit_connectivity_checks_take_priority_only_after_first_attempt_success() {
+        let targets = [
+            ("bing", "https://www.bing.com/"),
+            ("adobe", "https://www.adobe.com/"),
+            ("firefox", "https://detectportal.firefox.com/success.txt"),
+            ("windows", "http://www.msftconnecttest.com/connecttest.txt"),
+            ("steam", "https://steam.example/"),
+        ]
+        .map(|(name, url)| Target {
+            group: "Clean".into(),
+            name: name.into(),
+            url: url.into(),
+            post: false,
+            expected: None,
+            peer: None,
+        });
+        let mut observations = targets
+            .iter()
+            .map(|t| Row {
+                group: t.group.clone(),
+                name: t.name.clone(),
+                url: t.url.clone(),
+                ..row("OK")
+            })
+            .collect::<Vec<_>>();
+        let names = |rows: &[Row]| {
+            select_controls(&targets, rows)
+                .into_iter()
+                .map(|t| t.name)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            names(&observations),
+            ["windows", "firefox", "bing", "adobe"]
+        );
+        observations[3].tries = 2;
+        observations[2].flaky = true;
+        assert_eq!(names(&observations), ["bing", "adobe", "steam"]);
+    }
+
+    #[test]
+    fn baseline_cost_orders_queued_targets_once_without_reordering_equal_costs() {
+        let targets: Vec<_> = ["fast", "slow", "tie"]
+            .into_iter()
+            .map(|name| Target {
+                name: name.into(),
+                group: "Example".into(),
+                url: format!("https://{name}.test/"),
+                post: false,
+                expected: None,
+                peer: None,
+            })
+            .collect();
+        let base: Vec<_> = targets
+            .iter()
+            .zip([10., 500., 10.])
+            .map(|(t, ms)| Row {
+                name: t.name.clone(),
+                group: t.group.clone(),
+                url: t.url.clone(),
+                total_ms: ms,
+                ..row("OK")
+            })
+            .collect();
+        let names = |order: Vec<Target>| order.into_iter().map(|t| t.name).collect::<Vec<_>>();
+        assert_eq!(
+            names(trial_order(&targets, &base, 2)),
+            ["slow", "fast", "tie"]
+        );
+        assert_eq!(
+            names(trial_order(&targets, &base, 3)),
+            ["fast", "slow", "tie"]
+        );
+    }
+
+    #[test]
+    fn adjacent_controls_expire_on_age_or_any_network_event() {
+        let now = Instant::now();
+        let boundary = ControlBoundary {
+            strategy: "1".into(),
+            finished: now,
+            generation: 9,
+            rows: vec![],
+        };
+        assert!(boundary.current(now + Duration::from_secs(2), Some(9)));
+        assert!(!boundary.current(now + Duration::from_millis(2001), Some(9)));
+        assert!(!boundary.current(now, Some(10)));
+        assert!(!boundary.current(now, None));
+    }
+
+    #[test]
     fn control_assessment_rejects_missing_samples_and_invalid_tls_timings() {
         let target = Target {
             group: "Clean".into(),
@@ -3746,6 +4479,7 @@ mod tests {
             target.clone(),
             Target {
                 name: "second".into(),
+                url: "https://second.example.org/".into(),
                 ..target
             },
         ];

@@ -12,6 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 h3 = "0.0.8"
+png = "0.17"
 h3-quinn = "0.0.10"
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
@@ -27,6 +28,7 @@ futures-util = { version = "0.3", features = ["sink"] }
 tokio-tungstenite = "0.28"
 tempfile.workspace = true
 sha2.workspace = true
+zapret-core.workspace = true
 zapret-platform.workspace = true
 anyhow.workspace = true
 serde.workspace = true

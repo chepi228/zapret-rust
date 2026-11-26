@@ -2,7 +2,7 @@
 
 Windows x64 application in Rust. `bin/zapret-rust.exe` owns the menu, typed CLI, settings,
 composition, strategy tests, diagnostics, Windows control, updates and packaging.
-`zapret-rust.bat` starts it directly. The same binary is shipped as
+The root `zapret-rust.exe` forwards arguments to the controller in `bin`. The same binary is shipped as
 `bin/zapret-rust-recovery.exe` so an interrupted self-update can recover when the main
 executable has temporarily been renamed.
 
@@ -529,7 +529,7 @@ selection, history, rankings and coverage; other confirmed trials remain usable.
 The report retains all observations and explains exclusions. The chosen final
 combination must still pass replay, including ordinary sites, before publication.
 Accepted ranks and coverage retain the legacy scoped text formats and matching
-RunId. Manual selection and the full test include all 34 profiles. The quick
+RunId. Manual selection and the full test include all 36 profiles. The quick
 test uses a smaller candidate pool. A standalone `--skip` in `[game_tcp]` or
 `[game_udp]` excludes that section and its additional capture ports when the
 profile is primary, including during automatic rotation. Web and voice ports

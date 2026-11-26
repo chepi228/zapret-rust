@@ -1,7 +1,11 @@
 use crate::{diagnostic as d, http};
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
-use std::{net::IpAddr, path::Path, time::Duration};
+use std::{
+    net::{IpAddr, SocketAddr},
+    path::Path,
+    time::Duration,
+};
 use tokio::{
     net::TcpStream,
     task::JoinSet,
@@ -14,7 +18,10 @@ fn query_no_hosts(host: String, ipv6: bool) -> Result<Vec<String>> {
         net::{Ipv4Addr, Ipv6Addr},
         ptr::null_mut,
     };
-    use windows_sys::Win32::NetworkManagement::Dns::*;
+    use windows_sys::Win32::{
+        Foundation::{DNS_ERROR_RCODE_NAME_ERROR, DNS_INFO_NO_RECORDS},
+        NetworkManagement::Dns::*,
+    };
     let name: Vec<u16> = host.encode_utf16().chain(Some(0)).collect();
     let mut records = null_mut();
     // The list is returned by dnsapi and freed with its own allocator, never Rust's allocator.
@@ -39,6 +46,9 @@ fn query_no_hosts(host: String, ipv6: bool) -> Result<Vec<String>> {
         }
     }
     let _owner = Records(records);
+    if status == DNS_ERROR_RCODE_NAME_ERROR || status == DNS_INFO_NO_RECORDS as u32 {
+        return Ok(Vec::new());
+    }
     if status != 0 {
         bail!("Windows DNS query status {status}")
     }
@@ -46,10 +56,13 @@ fn query_no_hosts(host: String, ipv6: bool) -> Result<Vec<String>> {
     let mut count = 0;
     while !records.is_null() && count < 256 {
         let record = unsafe { &*records };
-        if record.wType == 1 {
+        // Only answer records (or system cache records without a section)
+        // describe this lookup. Additional records may be DNS server addresses.
+        let section = unsafe { record.Flags.DW } & 3;
+        if section < DnsSectionAuthority as u32 && !ipv6 && record.wType == 1 {
             values
                 .push(unsafe { Ipv4Addr::from(record.Data.A.IpAddress.to_ne_bytes()) }.to_string())
-        } else if record.wType == 28 {
+        } else if section < DnsSectionAuthority as u32 && ipv6 && record.wType == 28 {
             values.push(unsafe { Ipv6Addr::from(record.Data.AAAA.Ip6Address.IP6Byte) }.to_string())
         }
         records = record.pNext;
@@ -60,62 +73,55 @@ fn query_no_hosts(host: String, ipv6: bool) -> Result<Vec<String>> {
     }
     Ok(values)
 }
-async fn resolve_no_hosts(host: &str, timeout_ms: u64, a_only: bool) -> d::Dns {
+#[cfg(windows)]
+async fn system_family(host: &str, timeout_ms: u64, ipv6: bool) -> Result<Vec<String>> {
+    let host = host.to_owned();
+    timeout(
+        Duration::from_millis(timeout_ms),
+        tokio::task::spawn_blocking(move || query_no_hosts(host, ipv6)),
+    )
+    .await??
+}
+
+#[cfg(windows)]
+fn system_answers(v4: Result<Vec<String>>, v6: Result<Vec<String>>, elapsed_ms: f64) -> d::Dns {
+    let mut addresses = Vec::new();
+    let mut errors = Vec::new();
+    for (family, result) in [("A", v4), ("AAAA", v6)] {
+        match result {
+            Ok(mut values) => addresses.append(&mut values),
+            Err(error) => errors.push(format!("{family}: {error:#}")),
+        }
+    }
+    addresses.sort();
+    addresses.dedup();
+    let (state, reason) = if !addresses.is_empty() {
+        ("OK", "Resolved")
+    } else if errors.is_empty() {
+        ("FAIL", "NoAddresses")
+    } else {
+        ("UNKNOWN", "ResolveUnconfirmed")
+    };
+    d::Dns { state:state.into(), reason:reason.into(), addresses, error: errors.join("; "), elapsed_ms,
+        resolver:"Windows DNS API; NO_HOSTS_FILE|NO_NETBT (bounded caller; pending OS DNS may outlive deadline)".into() }
+}
+
+async fn resolve_no_hosts(host: &str, timeout_ms: u64) -> d::Dns {
     if host.parse::<IpAddr>().is_ok() {
         return d::resolve(host, timeout_ms).await;
     }
     #[cfg(windows)]
     {
         let started = Instant::now();
-        let text = host.to_owned();
-        let result = timeout(
-            Duration::from_millis(timeout_ms),
-            tokio::task::spawn_blocking(move || {
-                let v4 = query_no_hosts(text.clone(), false);
-                if a_only {
-                    return v4;
-                }
-                let v6 = query_no_hosts(text, true);
-                if v4.is_err() && v6.is_err() {
-                    return v4;
-                }
-                let mut values = v4.unwrap_or_default();
-                values.extend(v6.unwrap_or_default());
-                Ok::<_, anyhow::Error>(values)
-            }),
-        )
-        .await;
-        let (mut state, mut reason) = ("FAIL", "ResolveFailed");
-        let mut values = Vec::new();
-        let mut error = String::new();
-        match result {
-            Ok(Ok(Ok(v))) => {
-                values = v;
-                values.sort();
-                values.dedup();
-                state = if values.is_empty() { "FAIL" } else { "OK" };
-                reason = if values.is_empty() {
-                    "NoAddresses"
-                } else {
-                    "Resolved"
-                };
-            }
-            Ok(Ok(Err(e))) => error = format!("{e:#}"),
-            Ok(Err(e)) => error = e.to_string(),
-            Err(_) => {
-                state = "UNKNOWN";
-                reason = "Timeout";
-            }
-        }
-        d::Dns{state:state.into(),reason:reason.into(),addresses:values,error,elapsed_ms:started.elapsed().as_secs_f64()*1000.,resolver:"Windows DNS API; NO_HOSTS_FILE|NO_NETBT (bounded caller; pending OS DNS may outlive deadline)".into()}
+        let (v4, v6) = tokio::join!(
+            system_family(host, timeout_ms, false),
+            system_family(host, timeout_ms, true)
+        );
+        system_answers(v4, v6, started.elapsed().as_secs_f64() * 1000.)
     }
     #[cfg(not(windows))]
     {
         let mut row = d::resolve(host, timeout_ms).await;
-        if a_only {
-            row.addresses
-                .retain(|s| s.parse::<IpAddr>().is_ok_and(|ip| ip.is_ipv4()));
-        }
         row.resolver = "system resolver (hosts bypass unavailable on this platform)".into();
         row
     }
@@ -146,10 +152,12 @@ async fn tls_evidence(
     connector: &tokio_native_tls::TlsConnector,
 ) -> Vec<Value> {
     let mut pending = JoinSet::new();
-    for text in values.iter().take(16) {
-        let Ok(address) = text.parse::<IpAddr>() else {
-            continue;
-        };
+    let peers = values
+        .iter()
+        .filter_map(|s| s.parse::<IpAddr>().ok())
+        .map(|ip| SocketAddr::new(ip, 443));
+    for peer in zapret_core::connection_addresses(peers, 16) {
+        let address = peer.ip();
         let host = host.to_owned();
         let connector = connector.clone();
         pending.spawn(async move{let start=Instant::now();let mut tcp=false;let result=timeout(Duration::from_millis(timeout_ms),async{let stream=TcpStream::connect((address,443)).await?;tcp=true;stream.set_nodelay(true)?;let tls=connector.connect(&host,stream).await?;drop(tls);Ok::<(),anyhow::Error>(())}).await;
@@ -163,6 +171,130 @@ async fn tls_evidence(
     }
     rows
 }
+fn doh_answers(reply: &Value, ipv6: bool) -> Vec<String> {
+    if reply["Status"] != 0 {
+        return Vec::new();
+    }
+    let record_type = if ipv6 { 28 } else { 1 };
+    let mut addresses: Vec<_> = reply["Answer"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|rr| rr["type"] == record_type)
+        .filter_map(|rr| rr["data"].as_str()?.parse::<IpAddr>().ok())
+        .filter(|ip| ip.is_ipv6() == ipv6)
+        .map(|ip| ip.to_string())
+        .collect();
+    addresses.sort();
+    addresses.dedup();
+    addresses
+}
+
+struct DohServer {
+    url: url::Url,
+    bootstrap: Vec<SocketAddr>,
+}
+
+fn doh_servers(args: &Value) -> Result<Vec<DohServer>> {
+    if let Some(custom) = args["doh_urls"].as_array() {
+        if custom.len() > 4 {
+            bail!("at most four DoH endpoints")
+        }
+        return custom
+            .iter()
+            .map(|item| {
+                Ok(DohServer {
+                    url: http::checked_url(item.as_str().context("invalid DoH URL")?, false)?,
+                    bootstrap: Vec::new(),
+                })
+            })
+            .collect();
+    }
+    // Reach the resolver even if Windows DNS has no answer. TLS and HTTP
+    // still use its canonical hostname; redirects to another origin use DNS.
+    [
+        (
+            "https://cloudflare-dns.com/dns-query",
+            "1.1.1.1:443",
+            "[2606:4700:4700::1111]:443",
+        ),
+        (
+            "https://dns.google/resolve",
+            "8.8.8.8:443",
+            "[2001:4860:4860::8888]:443",
+        ),
+    ]
+    .into_iter()
+    .map(|(url, v4, v6)| {
+        Ok(DohServer {
+            url: http::checked_url(url, false)?,
+            bootstrap: vec![v4.parse()?, v6.parse()?],
+        })
+    })
+    .collect()
+}
+
+async fn doh_family(
+    host: &str,
+    servers: &[DohServer],
+    ipv6: bool,
+    budget: u64,
+    ca: Option<&Path>,
+) -> (Vec<String>, Vec<Value>) {
+    let kind = if ipv6 { "AAAA" } else { "A" };
+    let mut attempts = Vec::new();
+    for server in servers {
+        let mut url = server.url.clone();
+        url.query_pairs_mut()
+            .append_pair("name", host)
+            .append_pair("type", kind);
+        let started = Instant::now();
+        let mut attempt = json!({"url":url.as_str(),"query_type":kind,"state":"UNKNOWN"});
+        let mut addresses = Vec::new();
+        match http::fetch_accept(
+            url.as_str(),
+            65536,
+            budget,
+            ca,
+            "application/dns-json",
+            &server.bootstrap,
+        )
+        .await
+        {
+            Ok(bytes) => match serde_json::from_slice::<Value>(&bytes) {
+                Ok(reply) => {
+                    addresses = doh_answers(&reply, ipv6);
+                    attempt["dns_status"] = reply["Status"].clone();
+                    attempt["addresses"] = json!(addresses);
+                    if !addresses.is_empty() {
+                        attempt["state"] = json!("OK");
+                    }
+                }
+                Err(error) => {
+                    attempt["reason"] = json!("InvalidJson");
+                    attempt["error"] = json!(error.to_string());
+                }
+            },
+            Err(error) => {
+                attempt["reason"] = json!("RequestFailed");
+                attempt["error"] = json!(format!("{error:#}"));
+            }
+        }
+        attempt["elapsed_ms"] = json!(started.elapsed().as_secs_f64() * 1000.);
+        attempts.push(attempt);
+        if !addresses.is_empty() {
+            return (addresses, attempts);
+        }
+    }
+    (Vec::new(), attempts)
+}
+
+fn verified_missing_address(system: &d::Dns, tls: &[Value]) -> bool {
+    system.addresses.is_empty()
+        && system.reason == "NoAddresses"
+        && tls.iter().any(|row| row["certificate_validated"] == true)
+}
+
 async fn dns(root: &Path, args: &Value) -> Result<Value> {
     let explicit =
         args.get("host").is_some() || args.get("hostname").is_some() || args.get("hosts").is_some();
@@ -174,7 +306,12 @@ async fn dns(root: &Path, args: &Value) -> Result<Value> {
     } else if explicit {
         vec![d::host(args, "localhost")?]
     } else {
-        vec!["discord.com".into(), "x.com".into(), "rutracker.org".into()]
+        vec![
+            "discord.com".into(),
+            "x.com".into(),
+            "rutracker.org".into(),
+            "tr.rbxcdn.com".into(),
+        ]
     };
     if hosts.len() > 16 {
         bail!("DNS checks allow at most 16 hostnames")
@@ -182,23 +319,7 @@ async fn dns(root: &Path, args: &Value) -> Result<Value> {
     let compare = args["compare"].as_bool().unwrap_or(!explicit);
     let budget = d::duration_ms(args, 2000, 30000)?;
     let ca = d::ca_file(args)?;
-    let doh_urls = if let Some(values) = args["doh_urls"].as_array() {
-        values
-            .iter()
-            .map(|v| v.as_str().map(str::to_owned).context("invalid DoH URL"))
-            .collect::<Result<Vec<_>>>()?
-    } else {
-        vec![
-            "https://1.1.1.1/dns-query".into(),
-            "https://8.8.8.8/resolve".into(),
-        ]
-    };
-    if doh_urls.len() > 4 {
-        bail!("at most four DoH endpoints")
-    }
-    for url in &doh_urls {
-        http::checked_url(url, false)?;
-    }
+    let servers = doh_servers(args)?;
     let bypass_on = args["bypass_on"].as_bool().unwrap_or_else(|| {
         zapret_platform::command(root, "status", &json!({}))
             .ok()
@@ -210,7 +331,7 @@ async fn dns(root: &Path, args: &Value) -> Result<Value> {
     let mut checked = 0;
     for host in &hosts {
         let system = if args["no_hosts"].as_bool().unwrap_or(compare) {
-            resolve_no_hosts(host, budget, compare).await
+            resolve_no_hosts(host, budget).await
         } else {
             d::resolve(host, budget).await
         };
@@ -221,22 +342,14 @@ async fn dns(root: &Path, args: &Value) -> Result<Value> {
         let mut conclusion = "NotCompared";
         let mut comparable = false;
         if compare {
-            for base in &doh_urls {
-                let mut url = http::checked_url(base, false)?;
-                url.query_pairs_mut()
-                    .append_pair("name", host)
-                    .append_pair("type", "A");
-                let started = Instant::now();
-                match http::fetch_accept(url.as_str(),65536,budget,ca.as_deref(),"application/dns-json").await{
-                Ok(bytes)=>match serde_json::from_slice::<Value>(&bytes){
-                    Ok(value)=>{
-                        let answers=if value["Status"]==0{value["Answer"].as_array().map_or(&[][..],Vec::as_slice)}else{&[]};let mut values=Vec::new();for a in answers{if a["type"]==1{if let Some(address)=a["data"].as_str(){if let Ok(address)=address.parse::<std::net::Ipv4Addr>(){values.push(address.to_string());}}}}
-                        values.sort();values.dedup();doh_attempts.push(json!({"url":url.as_str(),"state":if values.is_empty(){"UNKNOWN"}else{"OK"},"dns_status":value["Status"],"addresses":values,"elapsed_ms":started.elapsed().as_secs_f64()*1000.}));
-                        if !values.is_empty(){doh_addresses=values;break}
-                    },Err(e)=>doh_attempts.push(json!({"url":url.as_str(),"state":"UNKNOWN","reason":"InvalidJson","error":e.to_string()}))
-                },Err(e)=>doh_attempts.push(json!({"url":url.as_str(),"state":"UNKNOWN","reason":"RequestFailed","error":format!("{e:#}")}))
-            }
-            }
+            let ((v4, a), (v6, aaaa)) = tokio::join!(
+                doh_family(host, &servers, false, budget, ca.as_deref()),
+                doh_family(host, &servers, true, budget, ca.as_deref())
+            );
+            doh_addresses.extend(v4);
+            doh_addresses.extend(v6);
+            doh_attempts.extend(a);
+            doh_attempts.extend(aaaa);
             if !system.addresses.is_empty() && !doh_addresses.is_empty() {
                 if system.addresses.iter().any(|s| doh_addresses.contains(s)) {
                     comparable = true;
@@ -266,6 +379,19 @@ async fn dns(root: &Path, args: &Value) -> Result<Value> {
                 } else {
                     conclusion = "DifferentAnswersUnconfirmed"
                 }
+            } else if system.reason == "NoAddresses" && !doh_addresses.is_empty() {
+                let public = doh_addresses
+                    .iter()
+                    .filter(|ip| zapret_core::is_public_ip(ip))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                doh_tls = tls_evidence(host, &public, budget.min(1500), &connector).await;
+                comparable = verified_missing_address(&system, &doh_tls);
+                conclusion = if comparable {
+                    "SuspiciousMissingAddress"
+                } else {
+                    "TlsUnconfirmed"
+                };
             } else {
                 conclusion = "InsufficientAddresses"
             }
@@ -371,4 +497,45 @@ pub(crate) fn run(root: &Path, kind: &str, args: &Value) -> Result<Value> {
             dns(root, args).await
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn doh_compares_only_records_of_the_requested_family() {
+        let reply = json!({"Status":0,"Answer":[
+            {"type":5,"data":"cdn.example"}, {"type":1,"data":"192.0.2.1"},
+            {"type":28,"data":"2001:db8::1"}, {"type":28,"data":"192.0.2.2"},
+            {"type":1,"data":"192.0.2.1"}]});
+        assert_eq!(doh_answers(&reply, false), ["192.0.2.1"]);
+        assert_eq!(doh_answers(&reply, true), ["2001:db8::1"]);
+        let cname = json!({"Status":0,"Answer":[{"type":5,"data":"cdn.example"}]});
+        assert!(doh_answers(&cname, false).is_empty());
+        assert!(doh_answers(&cname, true).is_empty());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_missing_system_answer_requires_both_families_and_alternative_tls_evidence() {
+        let empty = system_answers(Ok(vec![]), Ok(vec![]), 1.);
+        let verified = [json!({"certificate_validated":true})];
+        assert!(verified_missing_address(&empty, &verified));
+        assert!(!verified_missing_address(
+            &empty,
+            &[json!({"certificate_validated":false})]
+        ));
+        let timeout = system_answers(Err(anyhow::anyhow!("timed out")), Ok(vec![]), 1.);
+        assert_eq!(timeout.state, "UNKNOWN");
+        assert!(!verified_missing_address(&timeout, &verified));
+        let ipv6_only = system_answers(
+            Err(anyhow::anyhow!("timed out")),
+            Ok(vec!["2001:db8::1".into()]),
+            1.,
+        );
+        assert_eq!(ipv6_only.state, "OK");
+        assert_eq!(ipv6_only.addresses, ["2001:db8::1"]);
+        assert!(!verified_missing_address(&ipv6_only, &verified));
+    }
 }

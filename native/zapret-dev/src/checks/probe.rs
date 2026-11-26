@@ -108,386 +108,420 @@ pub(crate) fn run(
         .map(OsString::from)
         .collect::<Vec<_>>();
     let mut evidence = Evidence::default();
-    let result = (|| {
-        let temporary = tempfile::Builder::new()
-            .prefix("zapret-rust-probe-")
-            .tempdir()?;
-        let http = http::Fixture::new(false, None)?;
-        let base = http.url();
-        let mut cases = [
-            "small",
-            "large",
-            "chunked",
-            "chunked-short",
-            "truncated",
-            "empty",
-            "denied",
-            "redirect",
-            "interim",
-            "malformed",
-            "oversized",
-            "exact",
-        ]
-        .into_iter()
-        .map(|name| job(name, &base, &format!("/{name}")))
-        .collect::<Vec<_>>();
-        let mut post = job("post", &base, "/small");
-        post["post_bytes"] = json!(65536);
-        cases.push(post);
-        let mut timeout = job("timeout", &base, "/stall");
-        timeout["timeout_ms"] = json!(200);
-        cases.push(timeout);
-        let mut timeout = job("header-timeout", &base, "/headers-stall");
-        timeout["timeout_ms"] = json!(200);
-        cases.push(timeout);
-        let (rows, _) = invoke_jobs(&binary, &prefix, &cases, &[])?;
-        evidence
-            .observations
-            .insert("initial_probes".into(), json!(rows));
-        evidence
-            .observations
-            .insert("initial_fixture_errors".into(), json!(http.errors()));
-        evidence.check(
-            rows["small"]["body_complete"] == true && rows["small"]["body_bytes"] == 128,
-            "complete short response",
-        )?;
-        for name in ["large", "chunked", "exact"] {
-            let row = &rows[name];
+    let result =
+        (|| {
+            let temporary = tempfile::Builder::new()
+                .prefix("zapret-rust-probe-")
+                .tempdir()?;
+            let http = http::Fixture::new(false, None)?;
+            let base = http.url();
+            let mut cases = [
+                "small",
+                "large",
+                "chunked",
+                "chunked-short",
+                "truncated",
+                "empty",
+                "denied",
+                "redirect",
+                "interim",
+                "malformed",
+                "oversized",
+                "exact",
+            ]
+            .into_iter()
+            .map(|name| job(name, &base, &format!("/{name}")))
+            .collect::<Vec<_>>();
+            let mut post = job("post", &base, "/small");
+            post["post_bytes"] = json!(65536);
+            cases.push(post);
+            let mut timeout = job("timeout", &base, "/stall");
+            timeout["timeout_ms"] = json!(200);
+            cases.push(timeout);
+            let mut timeout = job("header-timeout", &base, "/headers-stall");
+            timeout["timeout_ms"] = json!(200);
+            cases.push(timeout);
+            let (rows, _) = invoke_jobs(&binary, &prefix, &cases, &[])?;
+            evidence
+                .observations
+                .insert("initial_probes".into(), json!(rows));
+            evidence
+                .observations
+                .insert("initial_fixture_errors".into(), json!(http.errors()));
             evidence.check(
-                row["termination"] == "BodyLimit"
-                    && row["body_bytes"] == 65536
-                    && row["target_reached"] == true
-                    && row["body_complete"] == false,
-                format!("{name} stops at body budget"),
+                rows["small"]["body_complete"] == true && rows["small"]["body_bytes"] == 128,
+                "complete short response",
             )?;
-        }
-        evidence.check(
-            rows["chunked-short"]["body_complete"] == true
-                && rows["chunked-short"]["body_bytes"] == 3,
-            "chunked trailers complete correctly",
-        )?;
-        evidence.check(
-            rows["truncated"]["termination"] == "TransferError"
-                && rows["truncated"]["body_bytes"] == 8192,
-            "premature EOF retains partial body",
-        )?;
-        evidence.check(
-            rows["empty"]["status_code"] == 204 && rows["empty"]["body_complete"] == true,
-            "empty HTTP response",
-        )?;
-        evidence.check(
-            rows["denied"]["status_code"] == 403 && rows["denied"]["body_complete"] == true,
-            "HTTP error remains explicit",
-        )?;
-        evidence.check(
-            rows["redirect"]["status_code"] == 302,
-            "redirect remains an observation",
-        )?;
-        evidence.check(
-            rows["interim"]["status_code"] == 200 && rows["interim"]["body_bytes"] == 128,
-            "interim response does not replace final status",
-        )?;
-        for name in ["malformed", "oversized"] {
-            evidence.check(
-                rows[name]["termination"] == "HttpFailure" && rows[name]["status_code"].is_null(),
-                format!("{name} headers fail"),
-            )?;
-        }
-        evidence.check(
-            rows["timeout"]["termination"] == "Timeout"
-                && rows["timeout"]["stage"] == "Body"
-                && rows["timeout"]["body_bytes"] == 8192,
-            "body timeout retains stage and bytes",
-        )?;
-        evidence.check(
-            rows["header-timeout"]["termination"] == "Timeout"
-                && rows["header-timeout"]["stage"] == "Http",
-            "header timeout retains completed TCP",
-        )?;
-        let post = http
-            .requests
-            .lock()
-            .unwrap()
-            .iter()
-            .find(|request| request["method"] == "POST")
-            .cloned()
-            .context("POST observed")?;
-        evidence.check(
-            post["post_bytes"] == 65536 && rows["post"]["body_complete"] == true,
-            "fixture receives full 64 KiB POST",
-        )?;
-        evidence.check(
-            post["headers"]["range"] == "bytes=0-65535",
-            "body budget is requested as Range",
-        )?;
-        evidence.check(
-            rows.values()
-                .all(|row| !row["tcp_ms"].is_null() && row["certificate_validated"] == false),
-            "HTTP retains TCP timing without TLS claims",
-        )?;
-        let mut one = job("one-byte", &base, "/large");
-        one["body_limit"] = json!(1);
-        let mut mib = job("one-mib", &base, "/large");
-        mib["body_limit"] = json!(1048576);
-        let (bounded, _) = invoke_jobs(&binary, &prefix, &[one, mib], &[])?;
-        evidence.check(
-            bounded["one-byte"]["body_bytes"] == 1
-                && bounded["one-mib"]["body_bytes"] == 1048576
-                && bounded
-                    .values()
-                    .all(|row| row["termination"] == "BodyLimit"),
-            "custom body budgets include supported boundaries",
-        )?;
-        evidence.check(
-            bounded
-                .values()
-                .all(|row| row["received_body_bytes"].as_u64() >= row["body_bytes"].as_u64())
-                && bounded["one-byte"]["received_body_bytes"]
-                    .as_u64()
-                    .is_some_and(|n| n > 1),
-            "decoded bytes expose buffering beyond accepted budget",
-        )?;
-        let mut pending = vec![job("active", &base, "/stall")];
-        pending.extend((0..5).map(|i| job(&format!("queued-{i}"), &base, "/small")));
-        let (deadline, metrics) = invoke_jobs(
-            &binary,
-            &prefix,
-            &pending,
-            &["--parallel", "1", "--deadline-ms", "100"],
-        )?;
-        evidence.check(
-            deadline
-                .values()
-                .all(|row| row["termination"] == "Deadline")
-                && deadline["active"]["body_bytes"] == 8192
-                && deadline
-                    .iter()
-                    .filter(|(id, _)| *id != "active")
-                    .all(|(_, row)| row["stage"] == "Queued")
-                && metrics["wall_ms"].as_f64().is_some_and(|ms| ms < 1500.),
-            "batch deadline includes queued jobs and preserves active progress",
-        )?;
-        let before = http.requests.lock().unwrap().len();
-        let duplicate = job("duplicate", &base, "/small");
-        let (invalid, _) = measure(
-            &binary,
-            &prefix,
-            Some(payload(&[duplicate.clone(), duplicate])),
-        )?;
-        evidence.check(
-            invalid.exit_code == 2
-                && invalid.stdout.is_empty()
-                && http.requests.lock().unwrap().len() == before,
-            "invalid batch is rejected before network activity",
-        )?;
-        for (field, value) in [
-            ("version", json!(2)),
-            ("body_limit", json!(0)),
-            ("timeout_ms", json!(60001)),
-            ("unexpected", json!(true)),
-            ("url", json!("file:///C:/Windows/win.ini")),
-            ("url", json!("http://user:pass@localhost/")),
-        ] {
-            let mut bad = job("bad", &base, "/small");
-            bad[field] = value;
-            let (invalid, _) = measure(&binary, &prefix, Some(payload(&[bad])))?;
-            evidence.check(
-                invalid.exit_code == 2 && invalid.stdout.is_empty(),
-                format!("reject invalid {field}"),
-            )?;
-        }
-        let reserved = TcpListener::bind("127.0.0.1:0")?;
-        let port = reserved.local_addr()?.port();
-        drop(reserved);
-        let (refused, _) = invoke_jobs(
-            &binary,
-            &prefix,
-            &[job("refused", &format!("http://127.0.0.1:{port}"), "/")],
-            &[],
-        )?;
-        evidence.check(
-            refused["refused"]["termination"] == "TcpFailure"
-                && refused["refused"]["stage"] == "Tcp",
-            "TCP refusal is separate from TLS",
-        )?;
-        let (dns, _) = invoke_jobs(
-            &binary,
-            &prefix,
-            &[job(
-                "dns",
-                &base.replace("127.0.0.1", "localhost"),
-                "/small",
-            )],
-            &[],
-        )?;
-        evidence.check(
-            dns["dns"]["body_complete"] == true
-                && dns["dns"]["dns_source"] == "system"
-                && dns["dns"]["resolved_addresses"]
-                    .as_array()
-                    .is_some_and(|a| !a.is_empty()),
-            "system DNS and address fallback reach localhost",
-        )?;
-        let (dns, _) = invoke_jobs(
-            &binary,
-            &prefix,
-            &[job(
-                "dns-failure",
-                &format!("http://{}.invalid", "a".repeat(64)),
-                "/",
-            )],
-            &[],
-        )?;
-        evidence.check(
-            dns["dns-failure"]["termination"] == "DnsFailure"
-                && dns["dns-failure"]["stage"] == "Dns"
-                && dns["dns-failure"]["tcp_attempts"]
-                    .as_array()
-                    .is_some_and(Vec::is_empty),
-            "DNS failure remains separate from TCP",
-        )?;
-        match http::Fixture::new(true, None) {
-            Ok(six) => {
-                let (rows, _) =
-                    invoke_jobs(&binary, &prefix, &[job("ipv6", &six.url(), "/small")], &[])?;
+            for name in ["large", "chunked", "exact"] {
+                let row = &rows[name];
                 evidence.check(
-                    rows["ipv6"]["body_complete"] == true
-                        && rows["ipv6"]["remote_address"]
-                            .as_str()
-                            .is_some_and(|s| s.starts_with("[::1]")),
-                    "IPv6 loopback",
+                    row["termination"] == "BodyLimit"
+                        && row["body_bytes"] == 65536
+                        && row["target_reached"] == true
+                        && row["body_complete"] == false,
+                    format!("{name} stops at body budget"),
                 )?;
             }
-            Err(error) => {
-                evidence
-                    .observations
-                    .insert("ipv6_skipped".into(), json!(error.to_string()));
+            evidence.check(
+                rows["chunked-short"]["body_complete"] == true
+                    && rows["chunked-short"]["body_bytes"] == 3,
+                "chunked trailers complete correctly",
+            )?;
+            evidence.check(
+                rows["truncated"]["termination"] == "TransferError"
+                    && rows["truncated"]["body_bytes"] == 8192,
+                "premature EOF retains partial body",
+            )?;
+            evidence.check(
+                rows["empty"]["status_code"] == 204 && rows["empty"]["body_complete"] == true,
+                "empty HTTP response",
+            )?;
+            evidence.check(
+                rows["denied"]["status_code"] == 403 && rows["denied"]["body_complete"] == true,
+                "HTTP error remains explicit",
+            )?;
+            evidence.check(
+                rows["redirect"]["status_code"] == 302,
+                "redirect remains an observation",
+            )?;
+            evidence.check(
+                rows["interim"]["status_code"] == 200 && rows["interim"]["body_bytes"] == 128,
+                "interim response does not replace final status",
+            )?;
+            for name in ["malformed", "oversized"] {
+                evidence.check(
+                    rows[name]["termination"] == "HttpFailure"
+                        && rows[name]["status_code"].is_null(),
+                    format!("{name} headers fail"),
+                )?;
             }
-        }
-        let (tls, pem) = http::tls()?;
-        let ca = temporary.path().join("cert.pem");
-        fs::write(&ca, pem)?;
-        let https = http::Fixture::new(false, Some(tls))?;
-        let base_tls = format!("https://localhost:{}", https.address.port());
-        let mut tls_job = job("tls", &base_tls, "/small");
-        tls_job["connect_ip"] = json!("127.0.0.1");
-        let (untrusted, _) = invoke_jobs(&binary, &prefix, &[tls_job.clone()], &[])?;
-        evidence.check(
-            untrusted["tls"]["termination"] == "TlsFailure"
-                && !untrusted["tls"]["tcp_ms"].is_null()
-                && untrusted["tls"]["certificate_validated"] == false,
-            "default trust rejects self-signed TLS",
-        )?;
-        let ca = ca.to_str().context("CA path")?;
-        let (trusted, _) = invoke_jobs(&binary, &prefix, &[tls_job], &["--ca-file", ca])?;
-        evidence
-            .observations
-            .insert("local_tls".into(), trusted["tls"].clone());
-        evidence.check(
-            trusted["tls"]["body_complete"] == true
-                && trusted["tls"]["certificate_validated"] == true
-                && !trusted["tls"]["tls_ms"].is_null()
-                && trusted["tls"]["trust_source"] == "SystemPlusExtraCa",
-            "process-local CA permits validated TLS",
-        )?;
-        evidence.check(
-            https
-                .names
+            evidence.check(
+                rows["timeout"]["termination"] == "Timeout"
+                    && rows["timeout"]["stage"] == "Body"
+                    && rows["timeout"]["body_bytes"] == 8192,
+                "body timeout retains stage and bytes",
+            )?;
+            evidence.check(
+                rows["header-timeout"]["termination"] == "Timeout"
+                    && rows["header-timeout"]["stage"] == "Http",
+                "header timeout retains completed TCP",
+            )?;
+            let post = http
+                .requests
                 .lock()
                 .unwrap()
                 .iter()
-                .any(|name| name == "localhost")
-                && https.requests.lock().unwrap().last().is_some_and(|row| {
-                    row["headers"]["host"] == format!("localhost:{}", https.address.port())
-                }),
-            "selected IP preserves original SNI and Host",
-        )?;
-        let mut mismatch = job(
-            "mismatch",
-            &base_tls.replace("localhost", "wrong.invalid"),
-            "/small",
-        );
-        mismatch["connect_ip"] = json!("127.0.0.1");
-        let (wrong, _) = invoke_jobs(&binary, &prefix, &[mismatch], &["--ca-file", ca])?;
-        evidence.check(
-            wrong["mismatch"]["termination"] == "TlsFailure"
-                && wrong["mismatch"]["certificate_validated"] == false,
-            "extra CA preserves hostname verification",
-        )?;
-        let mut stalled = job("tls-stall", &http.url().replace("http:", "https:"), "/");
-        stalled["timeout_ms"] = json!(150);
-        let (stalled, metrics) = invoke_jobs(&binary, &prefix, &[stalled], &[])?;
-        evidence.check(
-            stalled["tls-stall"]["stage"] == "Tls"
-                && stalled["tls-stall"]["termination"] == "Timeout"
-                && metrics["wall_ms"].as_f64().is_some_and(|n| n < 1500.),
-            "TLS timeout retains completed TCP",
-        )?;
-        // Preserve a captured 64 KiB payload byte for byte rather than silently
-        // substituting zeros. Check both the file and the default request body.
-        let captured = (0..65536).map(|i| (i % 251) as u8).collect::<Vec<_>>();
-        let post_file = temporary.path().join("post64k.bin");
-        fs::write(&post_file, &captured)?;
-        let mut post_job = job("captured", &base, "/small");
-        post_job["post_bytes"] = json!(65536);
-        invoke_jobs(
-            &binary,
-            &prefix,
-            &[post_job.clone()],
-            &["--post-file", post_file.to_str().unwrap()],
-        )?;
-        evidence.check(
-            http.requests
-                .lock()
-                .unwrap()
-                .last()
-                .is_some_and(|row| row["post_sha256"] == zapret_core::sha256(&captured))
-                && post["post_sha256"] == zapret_core::sha256(&vec![0; 65536]),
-            "captured POST bytes and default zero body are preserved",
-        )?;
-        fs::write(&post_file, [1, 2, 3])?;
-        let mut args = prefix.clone();
-        args.extend(["--post-file".into(), post_file.into_os_string()]);
-        let (bad, _) = measure(&binary, &args, Some(payload(&[post_job])))?;
-        evidence.check(
-            bad.exit_code == 2 && bad.stdout.is_empty(),
-            "invalid POST file is rejected before requests",
-        )?;
-        let benchmark = benchmark(
-            root,
-            &binary,
-            &prefix,
-            &http,
-            temporary.path(),
-            rounds,
-            compare_legacy,
-        )?;
-        evidence.observations.insert("benchmark".into(), benchmark);
-        let until = Instant::now() + Duration::from_secs(3);
-        while !http.idle() && Instant::now() < until {
-            thread::sleep(Duration::from_millis(10));
-        }
-        evidence.check(http.idle(), "all HTTP fixture connections close")?;
-        evidence.check(
-            http.errors().is_empty() && https.errors().is_empty(),
-            format!(
-                "fixture handlers have no unexpected errors: {:?}",
-                http.errors()
-            ),
-        )?;
-        evidence
-            .observations
-            .insert("binary_sha256".into(), json!(sha256_file(&binary)?));
-        evidence.observations.insert(
-            "cargo_lock_sha256".into(),
-            json!(sha256_file(&root.join("native/Cargo.lock"))?),
-        );
-        evidence.observations.insert(
-            "source_sha256".into(),
-            json!(hashes(&root.join("native/zapret-net/src"))?),
-        );
-        Ok(())
-    })();
+                .find(|request| request["method"] == "POST")
+                .cloned()
+                .context("POST observed")?;
+            evidence.check(
+                post["post_bytes"] == 65536 && rows["post"]["body_complete"] == true,
+                "fixture receives full 64 KiB POST",
+            )?;
+            evidence.check(
+                post["headers"]["range"] == "bytes=0-65535",
+                "body budget is requested as Range",
+            )?;
+            evidence.check(
+                rows.values()
+                    .all(|row| !row["tcp_ms"].is_null() && row["certificate_validated"] == false),
+                "HTTP retains TCP timing without TLS claims",
+            )?;
+            let mut one = job("one-byte", &base, "/large");
+            one["body_limit"] = json!(1);
+            let mut mib = job("one-mib", &base, "/large");
+            mib["body_limit"] = json!(1048576);
+            let (bounded, _) = invoke_jobs(&binary, &prefix, &[one, mib], &[])?;
+            evidence.check(
+                bounded["one-byte"]["body_bytes"] == 1
+                    && bounded["one-mib"]["body_bytes"] == 1048576
+                    && bounded
+                        .values()
+                        .all(|row| row["termination"] == "BodyLimit"),
+                "custom body budgets include supported boundaries",
+            )?;
+            evidence.check(
+                bounded
+                    .values()
+                    .all(|row| row["received_body_bytes"].as_u64() >= row["body_bytes"].as_u64())
+                    && bounded["one-byte"]["received_body_bytes"]
+                        .as_u64()
+                        .is_some_and(|n| n > 1),
+                "decoded bytes expose buffering beyond accepted budget",
+            )?;
+            let mut pending = vec![job("active", &base, "/stall")];
+            pending.extend((0..5).map(|i| job(&format!("queued-{i}"), &base, "/small")));
+            let (deadline, metrics) = invoke_jobs(
+                &binary,
+                &prefix,
+                &pending,
+                &["--parallel", "1", "--deadline-ms", "100"],
+            )?;
+            evidence.check(
+                deadline
+                    .values()
+                    .all(|row| row["termination"] == "Deadline")
+                    && deadline["active"]["body_bytes"] == 8192
+                    && deadline
+                        .iter()
+                        .filter(|(id, _)| *id != "active")
+                        .all(|(_, row)| row["stage"] == "Queued")
+                    && metrics["wall_ms"].as_f64().is_some_and(|ms| ms < 1500.),
+                "batch deadline includes queued jobs and preserves active progress",
+            )?;
+            let before = http.requests.lock().unwrap().len();
+            let duplicate = job("duplicate", &base, "/small");
+            let (invalid, _) = measure(
+                &binary,
+                &prefix,
+                Some(payload(&[duplicate.clone(), duplicate])),
+            )?;
+            evidence.check(
+                invalid.exit_code == 2
+                    && invalid.stdout.is_empty()
+                    && http.requests.lock().unwrap().len() == before,
+                "invalid batch is rejected before network activity",
+            )?;
+            for (field, value) in [
+                ("version", json!(2)),
+                ("body_limit", json!(0)),
+                ("timeout_ms", json!(60001)),
+                ("unexpected", json!(true)),
+                ("url", json!("file:///C:/Windows/win.ini")),
+                ("url", json!("http://user:pass@localhost/")),
+            ] {
+                let mut bad = job("bad", &base, "/small");
+                bad[field] = value;
+                let (invalid, _) = measure(&binary, &prefix, Some(payload(&[bad])))?;
+                evidence.check(
+                    invalid.exit_code == 2 && invalid.stdout.is_empty(),
+                    format!("reject invalid {field}"),
+                )?;
+            }
+            let reserved = TcpListener::bind("127.0.0.1:0")?;
+            let port = reserved.local_addr()?.port();
+            drop(reserved);
+            let (refused, _) = invoke_jobs(
+                &binary,
+                &prefix,
+                &[job("refused", &format!("http://127.0.0.1:{port}"), "/")],
+                &[],
+            )?;
+            evidence.check(
+                refused["refused"]["termination"] == "TcpFailure"
+                    && refused["refused"]["stage"] == "Tcp",
+                "TCP refusal is separate from TLS",
+            )?;
+            let (dns, _) = invoke_jobs(
+                &binary,
+                &prefix,
+                &[job(
+                    "dns",
+                    &base.replace("127.0.0.1", "localhost"),
+                    "/small",
+                )],
+                &[],
+            )?;
+            evidence.check(
+                dns["dns"]["body_complete"] == true
+                    && dns["dns"]["dns_source"] == "system"
+                    && dns["dns"]["resolved_addresses"]
+                        .as_array()
+                        .is_some_and(|a| !a.is_empty()),
+                "system DNS and address fallback reach localhost",
+            )?;
+            let (dns, _) = invoke_jobs(
+                &binary,
+                &prefix,
+                &[job(
+                    "dns-failure",
+                    &format!("http://{}.invalid", "a".repeat(64)),
+                    "/",
+                )],
+                &[],
+            )?;
+            evidence.check(
+                dns["dns-failure"]["termination"] == "DnsFailure"
+                    && dns["dns-failure"]["stage"] == "Dns"
+                    && dns["dns-failure"]["tcp_attempts"]
+                        .as_array()
+                        .is_some_and(Vec::is_empty),
+                "DNS failure remains separate from TCP",
+            )?;
+            match http::Fixture::new(true, None) {
+                Ok(six) => {
+                    let (rows, _) =
+                        invoke_jobs(&binary, &prefix, &[job("ipv6", &six.url(), "/small")], &[])?;
+                    evidence.check(
+                        rows["ipv6"]["body_complete"] == true
+                            && rows["ipv6"]["remote_address"]
+                                .as_str()
+                                .is_some_and(|s| s.starts_with("[::1]")),
+                        "IPv6 loopback",
+                    )?;
+                }
+                Err(error) => {
+                    evidence
+                        .observations
+                        .insert("ipv6_skipped".into(), json!(error.to_string()));
+                }
+            }
+            let (tls, pem) = http::tls()?;
+            let ca = temporary.path().join("cert.pem");
+            fs::write(&ca, pem)?;
+            let https = http::Fixture::new(false, Some(tls.clone()))?;
+            let base_tls = format!("https://localhost:{}", https.address.port());
+            let mut tls_job = job("tls", &base_tls, "/small");
+            tls_job["connect_ip"] = json!("127.0.0.1");
+            let (untrusted, _) = invoke_jobs(&binary, &prefix, &[tls_job.clone()], &[])?;
+            evidence.check(
+                untrusted["tls"]["termination"] == "TlsFailure"
+                    && !untrusted["tls"]["tcp_ms"].is_null()
+                    && untrusted["tls"]["certificate_validated"] == false,
+                "default trust rejects self-signed TLS",
+            )?;
+            let ca = ca.to_str().context("CA path")?;
+            let local = zapret_core::connection_addresses(
+                std::net::ToSocketAddrs::to_socket_addrs(&("localhost", 0))?,
+                2,
+            );
+            if let [first, second] = local.as_slice()
+                && first.is_ipv6() != second.is_ipv6()
+            {
+                let rejected = http::Fixture::at(*first, Some(http::tls()?.0))?;
+                let mut alt = *second;
+                alt.set_port(rejected.address.port());
+                let alternate = http::Fixture::at(alt, Some(tls))?;
+                let url = format!("https://localhost:{}", alt.port());
+                let (recovered, _) = invoke_jobs(
+                    &binary,
+                    &prefix,
+                    &[job("alternate", &url, "/small")],
+                    &["--ca-file", ca],
+                )?;
+                let row = &recovered["alternate"];
+                evidence.check(
+                row["body_complete"] == true
+                    && row["certificate_validated"] == true
+                    && row["remote_address"] == alt.to_string()
+                    && row["tcp_attempts"].as_array().is_some_and(|attempts| {
+                        attempts.iter().filter(|a| a["error"].is_null()).count() == 2
+                            && attempts.iter().filter(|a| a["tls_error"].is_string()).count() == 1
+                    })
+                    && rejected.requests.lock().unwrap().is_empty()
+                    && alternate.requests.lock().unwrap().len() == 1,
+                "dual-stack HTTPS retries TLS on the other address and sends one verified request",
+            )?;
+            }
+            let (trusted, _) = invoke_jobs(&binary, &prefix, &[tls_job], &["--ca-file", ca])?;
+            evidence
+                .observations
+                .insert("local_tls".into(), trusted["tls"].clone());
+            evidence.check(
+                trusted["tls"]["body_complete"] == true
+                    && trusted["tls"]["certificate_validated"] == true
+                    && !trusted["tls"]["tls_ms"].is_null()
+                    && trusted["tls"]["trust_source"] == "SystemPlusExtraCa",
+                "process-local CA permits validated TLS",
+            )?;
+            evidence.check(
+                https
+                    .names
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|name| name == "localhost")
+                    && https.requests.lock().unwrap().last().is_some_and(|row| {
+                        row["headers"]["host"] == format!("localhost:{}", https.address.port())
+                    }),
+                "selected IP preserves original SNI and Host",
+            )?;
+            let mut mismatch = job(
+                "mismatch",
+                &base_tls.replace("localhost", "wrong.invalid"),
+                "/small",
+            );
+            mismatch["connect_ip"] = json!("127.0.0.1");
+            let (wrong, _) = invoke_jobs(&binary, &prefix, &[mismatch], &["--ca-file", ca])?;
+            evidence.check(
+                wrong["mismatch"]["termination"] == "TlsFailure"
+                    && wrong["mismatch"]["certificate_validated"] == false,
+                "extra CA preserves hostname verification",
+            )?;
+            let mut stalled = job("tls-stall", &http.url().replace("http:", "https:"), "/");
+            stalled["timeout_ms"] = json!(150);
+            let (stalled, metrics) = invoke_jobs(&binary, &prefix, &[stalled], &[])?;
+            evidence.check(
+                stalled["tls-stall"]["stage"] == "Tls"
+                    && stalled["tls-stall"]["termination"] == "Timeout"
+                    && metrics["wall_ms"].as_f64().is_some_and(|n| n < 1500.),
+                "TLS timeout retains completed TCP",
+            )?;
+            // Preserve a captured 64 KiB payload byte for byte rather than silently
+            // substituting zeros. Check both the file and the default request body.
+            let captured = (0..65536).map(|i| (i % 251) as u8).collect::<Vec<_>>();
+            let post_file = temporary.path().join("post64k.bin");
+            fs::write(&post_file, &captured)?;
+            let mut post_job = job("captured", &base, "/small");
+            post_job["post_bytes"] = json!(65536);
+            invoke_jobs(
+                &binary,
+                &prefix,
+                &[post_job.clone()],
+                &["--post-file", post_file.to_str().unwrap()],
+            )?;
+            evidence.check(
+                http.requests
+                    .lock()
+                    .unwrap()
+                    .last()
+                    .is_some_and(|row| row["post_sha256"] == zapret_core::sha256(&captured))
+                    && post["post_sha256"] == zapret_core::sha256(&vec![0; 65536]),
+                "captured POST bytes and default zero body are preserved",
+            )?;
+            fs::write(&post_file, [1, 2, 3])?;
+            let mut args = prefix.clone();
+            args.extend(["--post-file".into(), post_file.into_os_string()]);
+            let (bad, _) = measure(&binary, &args, Some(payload(&[post_job])))?;
+            evidence.check(
+                bad.exit_code == 2 && bad.stdout.is_empty(),
+                "invalid POST file is rejected before requests",
+            )?;
+            let benchmark = benchmark(
+                root,
+                &binary,
+                &prefix,
+                &http,
+                temporary.path(),
+                rounds,
+                compare_legacy,
+            )?;
+            evidence.observations.insert("benchmark".into(), benchmark);
+            let until = Instant::now() + Duration::from_secs(3);
+            while !http.idle() && Instant::now() < until {
+                thread::sleep(Duration::from_millis(10));
+            }
+            evidence.check(http.idle(), "all HTTP fixture connections close")?;
+            evidence.check(
+                http.errors().is_empty() && https.errors().is_empty(),
+                format!(
+                    "fixture handlers have no unexpected errors: {:?}",
+                    http.errors()
+                ),
+            )?;
+            evidence
+                .observations
+                .insert("binary_sha256".into(), json!(sha256_file(&binary)?));
+            evidence.observations.insert(
+                "cargo_lock_sha256".into(),
+                json!(sha256_file(&root.join("native/Cargo.lock"))?),
+            );
+            evidence.observations.insert(
+                "source_sha256".into(),
+                json!(hashes(&root.join("native/zapret-net/src"))?),
+            );
+            Ok(())
+        })();
     evidence.save(output, None, &result)?;
     result
 }

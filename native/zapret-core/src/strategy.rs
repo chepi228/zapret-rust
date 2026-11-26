@@ -83,6 +83,8 @@ impl Strategy {
             ("71", "ALT11 STUN вторым") => "SOFT-STUN-2ND",
             ("75", "Мягкая для сайтов и Discord") => "SOFT-WEB",
             ("76", "Белая 02-05 с игровым TCP") => "WHITE-TCP-LITE",
+            ("77", "Мягкая с прямым UDP") => "SOFT-TCP",
+            ("78", "Белая 06 для сайтов и Discord") => "WHITE-06-WEB",
             _ => &self.name,
         }
     }
@@ -281,7 +283,7 @@ mod tests {
         let strategies = list_strategies(&root)?;
         let retired = crate::list_lines(&root.join("strategies/retired.txt"))?;
         let mut codes = BTreeSet::new();
-        assert_eq!(strategies.len(), 34);
+        assert_eq!(strategies.len(), 36);
         for (index, strategy) in strategies.iter().enumerate() {
             assert!(!retired.contains(&format!("alt{}.txt", strategy.id)));
             let code = strategy.display_name();

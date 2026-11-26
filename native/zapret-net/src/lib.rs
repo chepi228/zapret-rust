@@ -9,6 +9,7 @@ mod latency;
 mod probe;
 mod protocol;
 mod provider;
+mod roblox;
 mod stun;
 mod tcp;
 mod tracker;
@@ -18,7 +19,7 @@ mod winhttp;
 
 use anyhow::{Context, Result, bail};
 pub use diagnostic::diagnostics;
-pub use http::{download, fetch};
+pub use http::{download, fetch, fetch_with_accept};
 pub use latency::{LatencyOutcome, LatencySample, LatencyStore, LatencyStream, LatencySummary};
 pub use protocol::{Job, MAX_BODY_LIMIT, Observation, ProbeMode, Stage, TcpAttempt, Termination};
 use std::{
@@ -30,6 +31,8 @@ use std::{
 pub use stun::assess_voice;
 use tokio::{sync::watch, task::JoinSet, time::Instant};
 pub use tracker::enrich_tracker;
+#[cfg(windows)]
+pub use winhttp::fetch_via_windows;
 
 #[derive(Clone, Debug)]
 pub struct BatchOptions {

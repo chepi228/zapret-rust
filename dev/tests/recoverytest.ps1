@@ -102,8 +102,9 @@ if (-not (Restore-InterruptedUpdate $Destination)) { exit 1 }
     $refused = $false; try { Resolve-UpdateFilePath $dst 'redirect/a.txt' | Out-Null } catch { $refused = $true }
     Check 'reparse points cannot redirect update writes' $refused
     [IO.Directory]::Delete($junction)
-    $bat = [IO.File]::ReadAllText((Join-Path $Pkg 'zapret-rust.bat'))
-    if($bat.Contains('bin\zapret-rust.exe')) {
+    $publicExe = Test-Path -LiteralPath (Join-Path $Pkg 'zapret-rust.exe')
+    $bat = if($publicExe){''}else{[IO.File]::ReadAllText((Join-Path $Pkg 'zapret-rust.bat'))}
+    if($publicExe -or $bat.Contains('bin\zapret-rust.exe')) {
         $menu=[IO.File]::ReadAllText((Join-Path $Pkg 'native/zapret/src/menu.rs'))
         Check 'native launcher delegates recovery to the native menu before input' ($bat -notmatch '(?i)powershell|tools\\menu\.ps1' -and $menu.IndexOf('maintenance::recover_start(app)?') -ge 0 -and $menu.IndexOf('maintenance::recover_start(app)?') -lt $menu.IndexOf('loop {'))
     }else{

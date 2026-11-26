@@ -18,13 +18,15 @@ pub(crate) fn publish(root: &Path, target: &Path) -> Result<()> {
     fs::create_dir_all(&backups)?;
     let backups = backups.canonicalize()?;
     let release = target.join("release");
+    let root = bin.parent().context("Find package root")?;
     let images = [
-        ("zapret-worker.exe", "zapret-rust-worker.exe"),
-        ("zapret.exe", "zapret-rust-recovery.exe"),
-        ("zapret.exe", "zapret-rust.exe"),
+        ("zapret-launcher.exe", "zapret-rust.exe", root),
+        ("zapret-worker.exe", "zapret-rust-worker.exe", bin.as_path()),
+        ("zapret.exe", "zapret-rust-recovery.exe", bin.as_path()),
+        ("zapret.exe", "zapret-rust.exe", bin.as_path()),
     ]
     .into_iter()
-    .map(|(source, name)| Image::stage(&release.join(source), name, &bin, &backups))
+    .map(|(source, name, parent)| Image::stage(&release.join(source), name, parent, &backups))
     .collect::<Result<Vec<_>>>()?;
 
     // Stage the whole set before any publication and replace the entry point last.
@@ -227,6 +229,7 @@ mod tests {
         fs::create_dir_all(&bin)?;
         fs::create_dir_all(target.join("release"))?;
         fs::write(target.join("release/zapret.exe"), b"new controller")?;
+        fs::write(target.join("release/zapret-launcher.exe"), b"new launcher")?;
         fs::write(target.join("release/zapret-worker.exe"), b"new worker")?;
         let controller = bin.join("zapret-rust.exe");
         let worker = bin.join("zapret-rust-worker.exe");
@@ -244,6 +247,7 @@ mod tests {
         assert_eq!(fs::read(&controller)?, b"old controller");
         assert_eq!(fs::read(&worker)?, b"old worker");
         assert_eq!(fs::read(&recovery)?, b"old recovery");
+        assert!(!root.path().join("zapret-rust.exe").exists());
         assert_eq!(fs::read_dir(&bin)?.count(), 3);
         assert_eq!(
             fs::read_dir(target.join("previous-controllers"))?.count(),
@@ -255,6 +259,10 @@ mod tests {
         assert_eq!(fs::read(&controller)?, b"new controller");
         assert_eq!(fs::read(&worker)?, b"new worker");
         assert_eq!(fs::read(&recovery)?, b"new controller");
+        assert_eq!(
+            fs::read(root.path().join("zapret-rust.exe"))?,
+            b"new launcher"
+        );
         Ok(())
     }
 }

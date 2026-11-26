@@ -1,0 +1,30 @@
+# name: Мягкая с прямым UDP
+# desc: Правила SOFT-WEB для сайтов по TCP. QUIC, голос Discord по UDP и дополнительные игровые порты проходят напрямую.
+# since: 1.2
+[quic]
+--skip
+[discord_udp]
+--skip
+[discord_media]
+--out-range=-d10
+--payload=tls_client_hello
+--lua-desync=fake:blob=tls_google:tcp_ts=-600000:tcp_ts_up:fool=ts_or_md5:repeats=4:tls_mod=rnd,dupsid
+--lua-desync=multisplit:pos=1
+[google]
+--out-range=-d10
+--payload=tls_client_hello
+--lua-desync=fake:blob=tls_google:tcp_ts=-600000:tcp_ts_up:fool=ts_or_md5:repeats=4:ip_id=zero:tls_mod=rnd,dupsid
+--lua-desync=multisplit:pos=1:ip_id=zero
+[general]
+--out-range=-d10
+--payload=tls_client_hello
+--lua-desync=fake:blob=stun2:tcp_ts=-600000:tcp_ts_up:fool=ts_or_md5:repeats=4
+--lua-desync=fake:blob=tls_sferum:tcp_ts=-600000:tcp_ts_up:fool=ts_or_md5:repeats=4:tls_mod=rnd,dupsid
+--lua-desync=multisplit:pos=1
+--payload=http_req
+--lua-desync=fake:blob=tls_sferum:tcp_ts=-600000:tcp_ts_up:fool=ts_or_md5:repeats=4
+--lua-desync=multisplit:pos=1
+[game_tcp]
+--skip
+[game_udp]
+--skip

@@ -45,11 +45,13 @@ fn code_paths(root: &Path) -> Result<Vec<PathBuf>> {
             inventory(&path, 0, &mut paths)?;
         }
     }
-    let launcher = root.join("zapret-rust.bat");
-    if launcher.exists() {
-        no_reparse(&launcher)?;
-        ensure!(launcher.is_file(), "Package launcher is not a file");
-        paths.push(launcher);
+    for name in ["zapret-rust.exe", "zapret-rust.bat"] {
+        let launcher = root.join(name);
+        if launcher.exists() {
+            no_reparse(&launcher)?;
+            ensure!(launcher.is_file(), "Package launcher is not a file");
+            paths.push(launcher);
+        }
     }
     Ok(paths)
 }
@@ -130,9 +132,11 @@ mod tests {
         }
         std::fs::write(root.path().join("bin/zapret-rust.exe"), b"fixture").unwrap();
         std::fs::write(root.path().join("zapret-rust.bat"), b"fixture").unwrap();
+        std::fs::write(root.path().join("zapret-rust.exe"), b"fixture").unwrap();
         let paths = code_paths(root.path()).unwrap();
         assert!(paths.contains(&root.path().join("bin/zapret-rust.exe")));
         assert!(paths.contains(&root.path().join("zapret-rust.bat")));
+        assert!(paths.contains(&root.path().join("zapret-rust.exe")));
         assert!(
             !paths
                 .iter()

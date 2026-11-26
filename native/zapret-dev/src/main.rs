@@ -99,7 +99,7 @@ enum Action {
         #[arg(long)]
         output: PathBuf,
     },
-    /// Exercise read-only BAT/menu routes in a private TEMP package.
+    /// Exercise the public EXE and read-only menu routes in a private TEMP package.
     CheckMenu {
         archive: PathBuf,
         #[arg(long)]

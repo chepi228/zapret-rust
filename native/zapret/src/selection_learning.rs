@@ -28,6 +28,8 @@ pub struct Cache {
     context: String,
     generation: u64,
     entries: BTreeMap<String, Entry>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    screened: BTreeMap<String, u64>,
 }
 
 pub struct Plan {
@@ -63,6 +65,7 @@ fn read_history(root: &Path) -> Vec<Cache> {
     contexts.retain(|cache| {
         cache.schema == 1
             && cache.entries.len() <= 512
+            && cache.screened.len() <= 512
             && cache.entries.values().all(|entry| entry.samples.len() <= 3)
     });
     contexts
@@ -75,6 +78,7 @@ impl Cache {
             context: context.into(),
             generation: 0,
             entries: BTreeMap::new(),
+            screened: BTreeMap::new(),
         }
     }
     pub fn load(root: &Path, context: &str) -> Self {
@@ -139,6 +143,12 @@ impl Cache {
             }
         }
     }
+    pub fn note_screened(&mut self, pool: &[Strategy], hashes: &BTreeMap<String, String>) {
+        self.screened.retain(|id, _| hashes.contains_key(id));
+        for s in pool {
+            self.screened.insert(s.id.clone(), self.generation);
+        }
+    }
     pub fn plan(
         &self,
         pool: &[Strategy],
@@ -197,11 +207,11 @@ impl Cache {
         }
         let mut pool = pool.to_vec();
         let Some((_, leader)) = known.first() else {
-            return Self::bounded(pool, Vec::new(), primary, &known, latency_candidates);
+            return self.bounded(pool, Vec::new(), primary, &known, latency_candidates);
         };
         let best = leader.samples.last().unwrap();
         if best.ok / (best.total as f64) < 0.65 {
-            return Self::bounded(pool, Vec::new(), primary, &known, latency_candidates);
+            return self.bounded(pool, Vec::new(), primary, &known, latency_candidates);
         }
         let mut deferred = Vec::new();
         pool.retain(|strategy| {
@@ -251,10 +261,11 @@ impl Cache {
                 true
             }
         });
-        Self::bounded(pool, deferred, primary, &known, latency_candidates)
+        self.bounded(pool, deferred, primary, &known, latency_candidates)
     }
 
     fn bounded(
+        &self,
         pool: Vec<Strategy>,
         deferred: Vec<String>,
         primary: &str,
@@ -293,6 +304,7 @@ impl Cache {
             for group in [
                 "YouTube",
                 "Discord",
+                "Roblox",
                 "NBA2K",
                 "QUIC",
                 "CDN",
@@ -361,7 +373,15 @@ impl Cache {
                     .min()
                     .unwrap_or(0);
                 (
-                    generations.get(strategy.id.as_str()).copied().unwrap_or(0),
+                    generations
+                        .get(strategy.id.as_str())
+                        .copied()
+                        .unwrap_or(0)
+                        .max(
+                            self.screened
+                                .get(&strategy.id)
+                                .map_or(0, |g| g.saturating_add(1)),
+                        ),
                     methods.contains(families[&strategy.id].0.as_str()),
                     represented
                         .get(families[&strategy.id].1.as_str())
@@ -446,6 +466,31 @@ fn section_distance(a: &Strategy, b: &Strategy) -> usize {
 mod tests {
     use super::*;
     const NOW: i64 = 2_000_000_000;
+    #[test]
+    fn short_only_profiles_rotate_without_becoming_ranked_samples() {
+        let pool: Vec<_> = (1..=30)
+            .map(|n| Strategy {
+                id: n.to_string(),
+                ..Default::default()
+            })
+            .collect();
+        let hashes = pool
+            .iter()
+            .map(|s| (s.id.clone(), "file".to_owned()))
+            .collect();
+        let mut cache = Cache::new("fixture");
+        let first = cache.plan(&pool, "1", false, &hashes, NOW, &[]);
+        cache.observe(&[], &BTreeMap::new(), &hashes, NOW);
+        cache.note_screened(&first.strategies, &hashes);
+        let second = cache.plan(&pool, "1", false, &hashes, NOW, &[]);
+        assert!(
+            first
+                .queued
+                .iter()
+                .all(|id| second.strategies.iter().any(|s| s.id == *id))
+        );
+        assert!(cache.entries.is_empty());
+    }
     #[test]
     fn fresh_latency_candidates_get_two_existing_slots_and_the_cold_pick_stays_near_primary() {
         let mut all: Vec<_> = (1..=30)

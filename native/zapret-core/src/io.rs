@@ -106,7 +106,10 @@ pub fn read_bounded(path: &Path, max_bytes: u64) -> Result<Vec<u8>> {
 }
 
 pub fn read_text(path: &Path, max_bytes: u64) -> Result<String> {
-    let bytes = read_bounded(path, max_bytes)?;
+    decode_text(read_bounded(path, max_bytes)?)
+}
+
+pub fn decode_text(bytes: Vec<u8>) -> Result<String> {
     if bytes.starts_with(&[0xff, 0xfe]) {
         ensure!((bytes.len() - 2) % 2 == 0, "Invalid UTF-16 text");
         let units: Vec<u16> = bytes[2..]

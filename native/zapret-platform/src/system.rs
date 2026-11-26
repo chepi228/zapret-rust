@@ -348,7 +348,8 @@ pub(crate) fn adapters() -> Result<Value> {
             while !p.is_null() {
                 let x = &*p;
                 if let Some(ip) = sock(x.Address.lpSockaddr) {
-                    addresses.push(json!({"address":ip,"prefix_length":x.OnLinkPrefixLength}));
+                    addresses.push(json!({"address":ip,"prefix_length":x.OnLinkPrefixLength,
+                        "dhcp":x.SuffixOrigin == IpSuffixOriginDhcp || x.PrefixOrigin == IpPrefixOriginDhcp}));
                 }
                 p = x.Next;
             }
@@ -518,6 +519,10 @@ pub fn configured_proxy_server() -> Result<Option<String>> {
 }
 
 pub(crate) fn proxy() -> Result<Value> {
+    read_proxy(true)
+}
+
+fn read_proxy(include_listeners: bool) -> Result<Value> {
     unsafe {
         let mut config: WINHTTP_CURRENT_USER_IE_PROXY_CONFIG = zeroed();
         let known = WinHttpGetIEProxyConfigForCurrentUser(&mut config) != 0
@@ -535,16 +540,19 @@ pub(crate) fn proxy() -> Result<Value> {
                 GlobalFree(p.cast());
             }
         }
-        let ports = tcp_table()
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|r| {
-                r["state"] == 2
-                    && r["local_address"]
-                        .as_str()
-                        .is_some_and(|x| x.starts_with("127."))
-            })
-            .collect::<Vec<_>>();
+        let ports = if include_listeners {
+            tcp_table().unwrap_or_default()
+        } else {
+            Vec::new()
+        }
+        .into_iter()
+        .filter(|r| {
+            r["state"] == 2
+                && r["local_address"]
+                    .as_str()
+                    .is_some_and(|x| x.starts_with("127."))
+        })
+        .collect::<Vec<_>>();
         Ok(
             json!({"known":known,"auto_detect":data["auto_detect"],"proxy":redact(&proxy),"pac":redact(&pac),"bypass":bypass,"environment_names":data["environment"].as_object().unwrap().keys().collect::<Vec<_>>(),"configuration_hash":hash(serde_json::to_string(&data)?.as_bytes()),"loopback_listeners":ports}),
         )
@@ -555,20 +563,66 @@ pub(crate) fn proxy() -> Result<Value> {
 fn network_key_parts(data: &Value) -> Value {
     let mut interfaces = Vec::new();
     let mut resolvers = Vec::new();
+    let identified_profile = data["profiles"].as_array().is_some_and(|profiles| {
+        profiles
+            .iter()
+            .any(|profile| profile["id"].as_str().is_some_and(|id| !id.is_empty()))
+    });
     for row in data["adapters"].as_array().into_iter().flatten() {
         if row["up"] != true || row["if_type"] == IF_TYPE_SOFTWARE_LOOPBACK {
             continue;
         }
         let mut addresses = std::collections::BTreeSet::new();
+        let ipv4_gateway = row["gateways"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|value| {
+                value
+                    .as_str()
+                    .and_then(|s| s.parse::<Ipv4Addr>().ok())
+                    .is_some_and(|ip| !ip.is_unspecified())
+            });
+        let has_routed_ipv4 = ipv4_gateway
+            && row["addresses"].as_array().is_some_and(|entries| {
+                entries.iter().any(|entry| {
+                    entry["address"]
+                        .as_str()
+                        .and_then(|s| s.parse::<Ipv4Addr>().ok())
+                        .is_some_and(|ip| {
+                            !ip.is_link_local()
+                                && !ip.is_unspecified()
+                                && !ip.is_loopback()
+                                && !ip.is_multicast()
+                                && !ip.is_broadcast()
+                        })
+                })
+            });
         for entry in row["addresses"].as_array().into_iter().flatten() {
             let Some(ip) = entry["address"].as_str() else {
                 continue;
             };
             let cidr = format!("{ip}/{}", entry["prefix_length"]);
-            let address = match ip.parse::<Ipv6Addr>() {
-                Ok(v6) if v6.is_unicast_link_local() => continue,
-                Ok(_) => zapret_core::normalize_ip_network(&cidr).unwrap_or(cidr),
-                Err(_) => cidr,
+            let address = match ip.parse::<IpAddr>() {
+                Ok(IpAddr::V6(v6)) if v6.is_unicast_link_local() => continue,
+                // A second Windows link-local address cannot be used to reach
+                // Internet targets through this adapter's routed IPv4 address.
+                Ok(IpAddr::V4(v4)) if v4.is_link_local() && has_routed_ipv4 => continue,
+                Ok(IpAddr::V6(_)) => zapret_core::normalize_ip_network(&cidr).unwrap_or(cidr),
+                // A LAN lease may change while the Windows profile, gateway,
+                // DNS and routed subnet still identify exactly the same path.
+                Ok(IpAddr::V4(v4))
+                    if entry["dhcp"] == true
+                        && identified_profile
+                        && ipv4_gateway
+                        && entry["prefix_length"]
+                            .as_u64()
+                            .is_some_and(|prefix| (1..32).contains(&prefix))
+                        && (v4.is_private() || matches!(v4.octets(), [100, 64..=127, _, _])) =>
+                {
+                    zapret_core::normalize_ip_network(&cidr).unwrap_or(cidr)
+                }
+                _ => cidr,
             };
             addresses.insert(address);
         }
@@ -621,9 +675,13 @@ fn network_key_parts(data: &Value) -> Value {
 }
 
 pub(crate) fn network(root: &Path) -> Result<Value> {
+    network_snapshot(root, false)
+}
+
+pub(crate) fn network_snapshot(root: &Path, identity_only: bool) -> Result<Value> {
     let adapter = adapters();
     let routes = routes();
-    let proxy = proxy();
+    let proxy = read_proxy(!identity_only);
     let profiles = network_profiles();
     let unavailable: Vec<_> = [
         ("interfaces", adapter.is_ok()),
@@ -639,6 +697,19 @@ pub(crate) fn network(root: &Path) -> Result<Value> {
     let data = json!({"adapters":adapter.unwrap_or(json!([])),"routes":routes.unwrap_or(json!([])),"profiles":profiles.unwrap_or(json!([])),"proxy_configuration_hash":proxy.as_ref().ok().map(|p|p["configuration_hash"].clone())});
     let parts = network_key_parts(&data);
     let key = hash(serde_json::to_string(&parts)?.as_bytes());
+    if identity_only {
+        let gateways: std::collections::BTreeSet<_> = data["routes"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|row| row["prefix_length"] == 0)
+            .map(|row| json!([row["interface_index"], row["next_hop"]]).to_string())
+            .collect();
+        return Ok(
+            json!({"known":known,"key_parts":parts,"unavailable":unavailable,
+            "key":if known {key} else {String::new()}, "gateway_hash":hash(serde_json::to_string(&gateways)?.as_bytes())}),
+        );
+    }
     let settings_hash = read_limited(&root.join("runtime/settings.ini"), 1024 * 1024)
         .ok()
         .map(|b| hash(&b));
@@ -685,6 +756,28 @@ mod tests {
     }
 
     #[test]
+    fn secondary_ipv4_link_local_churn_keeps_the_routed_connection_identity() {
+        let mut network = network_sample();
+        network["adapters"][0]["gateways"] = json!(["192.168.4.1"]);
+        network["adapters"][0]["addresses"] = json!([{"address":"192.168.4.8","prefix_length":24}]);
+        let routed = network_key_parts(&network);
+        let alias = json!({"address":"169.254.10.9","prefix_length":16});
+        network["adapters"][0]["addresses"]
+            .as_array_mut()
+            .unwrap()
+            .push(alias.clone());
+        assert_eq!(network_key_parts(&network), routed);
+        network["adapters"][0]["addresses"] = json!([alias]);
+        let fallback = network_key_parts(&network);
+        assert_ne!(
+            fallback, routed,
+            "loss of routable IPv4 must stop a measurement"
+        );
+        network["adapters"][0]["addresses"][0]["address"] = json!("169.254.10.42");
+        assert_ne!(network_key_parts(&network), fallback);
+    }
+
+    #[test]
     fn genuine_path_and_configuration_changes_remain_visible() {
         let sample = network_sample();
         let before = network_key_parts(&sample);
@@ -708,6 +801,41 @@ mod tests {
             let mut changed = sample.clone();
             *changed.pointer_mut(pointer).unwrap() = replacement;
             assert_ne!(before[part], network_key_parts(&changed)[part], "{pointer}");
+        }
+    }
+    #[test]
+    fn private_dhcp_renewal_keeps_the_context_only_on_the_same_identified_subnet() {
+        for (first, renewed, other, gateway) in [
+            (
+                "192.168.43.7",
+                "192.168.43.9",
+                "192.168.44.7",
+                "192.168.43.1",
+            ),
+            ("100.92.1.7", "100.92.1.9", "100.92.2.7", "100.92.1.1"),
+        ] {
+            let mut network = network_sample();
+            network["adapters"][0]["gateways"] = json!([gateway]);
+            network["adapters"][0]["addresses"] =
+                json!([{"address":first,"prefix_length":24,"dhcp":true}]);
+            let original = network_key_parts(&network);
+            network["adapters"][0]["addresses"][0]["address"] = json!(renewed);
+            assert_eq!(original, network_key_parts(&network));
+            network["adapters"][0]["addresses"][0]["address"] = json!(other);
+            assert_ne!(original, network_key_parts(&network));
+            for (path, replacement) in [
+                ("/adapters/0/addresses/0/dhcp", json!(false)),
+                ("/adapters/0/addresses/0/prefix_length", json!(32)),
+                ("/adapters/0/gateways", json!([])),
+                ("/profiles", json!([])),
+            ] {
+                let mut changed = network.clone();
+                *changed.pointer_mut(path).unwrap() = replacement;
+                changed["adapters"][0]["addresses"][0]["address"] = json!(first);
+                let before = network_key_parts(&changed);
+                changed["adapters"][0]["addresses"][0]["address"] = json!(renewed);
+                assert_ne!(before, network_key_parts(&changed), "{path}");
+            }
         }
     }
     #[test]

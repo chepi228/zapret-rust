@@ -17,6 +17,7 @@ tools/rust-ring-next/
 __pycache__/
 
 # Local native build outputs
+/zapret-rust.exe
 /bin/zapret-rust.exe
 /bin/zapret-rust-recovery.exe
 /bin/zapret-rust-worker.exe

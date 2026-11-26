@@ -21,6 +21,7 @@ impl Context {
 pub fn for_action(action: &Action) -> Context {
     let operation = match action {
         Action::Menu | Action::MenuPreview { .. } => "menu",
+        Action::FirstRun => "first-run",
         Action::Status => "status",
         Action::Start => "start",
         Action::Stop => "stop",
@@ -348,7 +349,48 @@ fn service_status(value: &Value) -> String {
     .into()
 }
 
+pub(crate) fn telegram_media_text(value: &Value) -> String {
+    let describe = |row: &Value| match row["state"].as_str() {
+        Some("ok") => row["bytes"].as_u64().map_or_else(
+            || "есть ответ DC".to_owned(),
+            |bytes| format!("скачано {bytes} байт, WebP проверен"),
+        ),
+        Some("failed") => format!("сбой — {}", row["error"].as_str().unwrap_or("нет ответа")),
+        _ => row["reason"]
+            .as_str()
+            .unwrap_or("проверка недоступна")
+            .to_owned(),
+    };
+    let mut lines = vec![format!("Мост Telegram — {}", describe(&value["bridge"]))];
+    if let Some(routes) = value["media_routes"].as_array() {
+        for row in routes {
+            let latency = row["elapsed_ms"]
+                .as_u64()
+                .map(|ms| format!(" за {ms} мс"))
+                .unwrap_or_default();
+            lines.push(format!(
+                "Медиа-DC Telegram {} — {}{latency}",
+                row["dc"],
+                describe(row)
+            ));
+        }
+    } else {
+        lines.push(format!(
+            "Медиа-DC Telegram — {}",
+            describe(&value["media_route"])
+        ));
+    }
+    lines.push(format!(
+        "Тестовый файл Telegram — {}",
+        describe(&value["file"])
+    ));
+    lines.join("\n")
+}
+
 fn telegram(value: &Value, operation: &str) -> String {
+    if operation == "telegram-media" {
+        return telegram_media_text(value);
+    }
     if value["ownership_error"].is_string() {
         return "Состояние и владелец моста Telegram не подтверждено.".into();
     }

@@ -89,9 +89,20 @@ pub fn run(app: &App) -> Result<()> {
             app.run_platform("legacy-migrate",json!({"game_approved":true}))?;
         }else{eprintln!("Прежняя регистрация сохранена. Управление обходом доступно после подтверждённого переноса.");}
     }
-    maintenance::start_background_maintenance(app);
+    let setup = maintenance::first_run::run(app, |message| eprintln!("{message}"));
+    let already_prepared = setup.as_ref().is_ok_and(|v| v["already_complete"] == true);
+    let mut setup_notice = match setup {
+        Ok(value) if !already_prepared => value["text"].as_str().map(str::to_owned),
+        Ok(_) => None,
+        Err(error) => Some(format!("Первая настройка отложена. {error:#}")),
+    };
+    crate::interrupt::action_completed();
+    maintenance::start_background_maintenance(app, already_prepared);
     loop {
         main_frame(&MenuView::load(app)?, Viewport::current()).show()?;
+        if let Some(text) = setup_notice.take() {
+            println!("{text}");
+        }
         let Some(choice) = input("Выбор")? else {
             return Ok(());
         };
@@ -252,7 +263,7 @@ fn main_frame(view: &MenuView, viewport: Viewport) -> Frame {
         frame.item(
             8,
             if compact {
-                "Инструменты"
+                "Инструменты · T — запись NBA City"
             } else {
                 "Инструменты: трекер, пинг, отчёты"
             },
@@ -260,7 +271,7 @@ fn main_frame(view: &MenuView, viewport: Viewport) -> Frame {
         );
         frame.item(9, "Уведомления", Tone::Text);
         if !compact {
-            frame.row("", Tone::Text);
+            frame.item("T", "Записать вход в NBA City (2 мин)", Tone::Secondary);
         }
         frame.item(0, "Выйти из меню", Tone::Secondary);
         frame
@@ -273,7 +284,7 @@ fn main_frame(view: &MenuView, viewport: Viewport) -> Frame {
     }
 }
 
-fn settings_frame(view: &MenuView, viewport: Viewport, tune: &str) -> Frame {
+fn settings_frame(view: &MenuView, viewport: Viewport, tune: &str, lists: &str) -> Frame {
     let saved = &view.settings;
     let mut frame = view.header(viewport, "Настройки", viewport.rows < 28);
     frame.row("  ПОДКЛЮЧЕНИЕ", Tone::Secondary);
@@ -308,7 +319,7 @@ fn settings_frame(view: &MenuView, viewport: Viewport, tune: &str) -> Frame {
     for (key, text) in [
         (6, format!("Автозапуск: {}", view.startup())),
         (7, format!("Автонастройка по расписанию: {tune}")),
-        (8, "Обновить списки".into()),
+        (8, format!("Обновить списки ({lists})")),
         (9, format!("Обновить zapret-rust: у вас {VERSION}")),
         (
             10,
@@ -418,7 +429,7 @@ pub fn preview_frame(screen: &str, width: Option<usize>, height: Option<usize>) 
     }
     let view = preview_view();
     match screen {
-        "settings" => settings_frame(&view, viewport, "выкл"),
+        "settings" => settings_frame(&view, viewport, "выкл", "локальные копии"),
         "tools" => tools_frame(&view, viewport),
         "test" => test_frame(viewport),
         "notifications" => notices_frame(viewport, &json!({"notices":[]})),
@@ -490,13 +501,12 @@ fn shortcut(app: &App, key: &str) -> Option<Result<Outcome>> {
     let name = shortcut_name(key)?;
     Some((|| match name {
         "check" => pc_check(app).map(|_| Outcome::Displayed),
-        "tracker" => action(
-            app,
-            Action::Track {
-                process: "NBA2K*".into(),
-                seconds: 60,
-            },
-        ),
+        "tracker" => {
+            println!("Зайдите в City сейчас. Запись NBA 2K займёт две минуты.");
+            let report = maintenance::track_city(app)?;
+            println!("{}", report);
+            Ok(Outcome::Displayed)
+        }
         "service" => show_platform(app, "service-autostart", &app.toggle_startup()?),
         "autotune" => task_toggle(app, "autotune"),
         "autolist" => autolist(app),
@@ -672,7 +682,13 @@ fn settings(app: &App) -> Result<()> {
         } else {
             "выкл"
         };
-        settings_frame(&view, Viewport::current(), tune).show()?;
+        settings_frame(
+            &view,
+            Viewport::current(),
+            tune,
+            &maintenance::first_run::lists_status(&app.root),
+        )
+        .show()?;
         let saved = view.settings;
         let Some(choice) = input("Выбор")? else {
             return Ok(());
@@ -1041,7 +1057,12 @@ fn voice_dialog(app: &App) -> Result<Outcome> {
 fn telegram(app: &App) -> Result<Outcome> {
     choices(
         "Мост Telegram",
-        &["Включить и открыть Telegram", "Остановить", "Изменить порт"],
+        &[
+            "Включить и открыть Telegram",
+            "Остановить",
+            "Изменить порт",
+            "Проверить мост и загрузку медиа",
+        ],
     )?;
     app.run_platform("telegram-status", json!({}))?;
     let action = match input("Выбор")?.unwrap_or_default().as_str() {
@@ -1051,6 +1072,10 @@ fn telegram(app: &App) -> Result<Outcome> {
         },
         "2" => Action::Telegram {
             action: "stop".into(),
+            port: None,
+        },
+        "4" => Action::Telegram {
+            action: "media".into(),
             port: None,
         },
         "3" => {
@@ -1121,6 +1146,7 @@ mod tests {
         assert!(text.contains(&format!("zapret-rust v{}", crate::VERSION)));
         assert!(!text.contains("Rust"));
         assert!(text.contains("Состояние обхода не подтверждено"));
+        assert!(text.contains("T — запись NBA City"));
         for key in [1, 2, 3, 4, 5, 6, 7, 8, 9, 0] {
             assert!(
                 text.contains(&format!(" {key:>2}  ")),
@@ -1178,7 +1204,8 @@ mod tests {
             rows: 30,
         };
         let view = preview_view();
-        let settings = settings_frame(&view, viewport, "выкл").plain();
+        let settings = settings_frame(&view, viewport, "выкл", "локальные копии").plain();
+        assert!(settings.contains("локальные копии"));
         let tools = tools_frame(&view, viewport).plain();
         for (text, count) in [(&settings, 11), (&tools, 12)] {
             for key in 0..=count {

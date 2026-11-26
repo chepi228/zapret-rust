@@ -1,5 +1,5 @@
 //! Direct HTTP/3 HEAD fallback with system certificate verification.
-use crate::{connection::connection_order, http};
+use crate::http;
 use anyhow::{Context, Result, ensure};
 use futures_util::{StreamExt, stream};
 use hyper::{Request, Response, body::Bytes, header};
@@ -16,7 +16,6 @@ use std::{
     time::Duration,
 };
 use tokio::{
-    net::lookup_host,
     sync::oneshot,
     time::{Instant, timeout, timeout_at},
 };
@@ -86,11 +85,9 @@ fn client_config(ca_file: Option<&Path>) -> Result<quinn::ClientConfig> {
 async fn addresses(url: &Url) -> Result<Vec<SocketAddr>> {
     let host = http::hostname(url);
     let port = url.port_or_known_default().context("URL port")?;
-    Ok(lookup_host((host.as_str(), port))
+    crate::connection::resolve_addresses(&host, port)
         .await
-        .context("DNS lookup failed")?
-        .take(16)
-        .collect())
+        .context("DNS lookup failed")
 }
 
 async fn connect(
@@ -99,11 +96,10 @@ async fn connect(
     addresses: &[SocketAddr],
 ) -> Result<Connection> {
     let host = http::hostname(url);
-    let addresses = connection_order(addresses);
     let alternatives = addresses.len().saturating_sub(2);
     // Try the preferred address first. A second attempt can run alongside it
     // after a short delay, so an unavailable address family cannot block HEAD.
-    let attempts = stream::iter(addresses.into_iter().enumerate())
+    let attempts = stream::iter(addresses.iter().copied().enumerate())
         .map(|(index, address)| {
             let host = &host;
             async move {
@@ -130,13 +126,15 @@ async fn connect(
     while let Some(attempt) = attempts.next().await {
         match attempt {
             Ok(connection) => return Ok(connection),
-            Err(cause) if matches!(failure(&cause), "TlsFailure" | "ProtocolMismatch") => {
+            Err(cause) if failure(&cause) == "TlsFailure" => {
                 return Err(cause);
             }
             Err(cause)
-                if error
-                    .as_ref()
-                    .is_none_or(|previous| failure(previous) == "Timeout") =>
+                if error.as_ref().is_none_or(|previous| {
+                    failure(previous) == "Timeout"
+                        || (failure(&cause) == "ProtocolMismatch"
+                            && failure(previous) != "ProtocolMismatch")
+                }) =>
             {
                 error = Some(cause);
             }
@@ -371,6 +369,15 @@ mod tests {
                 "ProtocolMismatch",
                 "{wrong_protocol:#}"
             );
+            let config = client_config(Some(&ca))?;
+            let alternate = head(
+                &url("localhost", "/"),
+                &config,
+                &[h2_server.local_addr()?, server.local_addr()?],
+            )
+            .await?;
+            assert_eq!(alternate.remote, server.local_addr()?);
+            assert_eq!(alternate.headers.status(), 200);
             let redirect = request(url("localhost", "/redirect"), 5000, Some(&ca)).await?;
             assert_eq!(
                 (

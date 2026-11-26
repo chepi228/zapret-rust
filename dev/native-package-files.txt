@@ -85,6 +85,8 @@ strategies/alt70.txt
 strategies/alt71.txt
 strategies/alt75.txt
 strategies/alt76.txt
+strategies/alt77.txt
+strategies/alt78.txt
 strategies/alt8.txt
 strategies/retired.txt
 licenses/THIRD-PARTY-NOTICES.md
@@ -93,4 +95,4 @@ tools/targets.txt
 tools/upstream.txt
 tools/rust-ring.json
 windivert/quic_initial_ietf.txt
-zapret-rust.bat
+zapret-rust.exe

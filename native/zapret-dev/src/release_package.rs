@@ -36,7 +36,8 @@ pub(super) fn from_candidate(
             continue;
         }
         // The controller generates its recovery image and the default user lists.
-        if name == controller
+        if name == "zapret-rust.exe"
+            || name == controller
             || name == worker
             || matches!(
                 name,
@@ -57,6 +58,7 @@ pub(super) fn from_candidate(
         copy(copied, stage, name)?;
     }
     if skip_compile {
+        copy(build.root, stage, "zapret-rust.exe")?;
         copy(build.root, stage, controller)?;
         copy(build.root, stage, worker)?;
     } else {

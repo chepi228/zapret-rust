@@ -3,7 +3,6 @@
 
 # Language statistics focus on the native Rust implementation.
 # Entry scripts keep their existing behavior and language highlighting.
-/zapret-rust.bat -linguist-detectable
 /linux/install.sh -linguist-detectable
 
 # Development scripts and test fixtures remain available in the repository.

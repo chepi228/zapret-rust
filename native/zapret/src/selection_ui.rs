@@ -47,12 +47,22 @@ pub fn primary_frame(report: &Value, viewport: Viewport) -> Frame {
         &format!(" Сейчас сохранена: {}", name(report, primary)),
         Tone::Text,
     );
+    if let Some(reason) = report["decision_reason"].as_str() {
+        frame.row(reason, Tone::Text);
+    }
     if let Some(reason) = speed_reason(report) {
         frame.row(&reason, Tone::Good);
     }
+    explain_service_score(&mut frame, report);
     frame.separator("РЕЗУЛЬТАТЫ");
-    let mut rows: Vec<_> = report["rows"].as_array().into_iter().flatten().collect();
-    rows.sort_by_key(|row| row["id"].as_str() != Some(best));
+    let rows = display_order(
+        report,
+        report["rows"]
+            .as_array()
+            .map(Vec::as_slice)
+            .unwrap_or_default(),
+        best,
+    );
     for row in rows.into_iter().take(3) {
         let id = row["id"].as_str().unwrap_or("");
         let (label, tone) = final_status(report, id);
@@ -61,10 +71,7 @@ pub fn primary_frame(report: &Value, viewport: Viewport) -> Frame {
             &format!(
                 " {label}: {} · балл {}",
                 name(report, id),
-                row["score"]
-                    .as_f64()
-                    .map(points)
-                    .unwrap_or_else(|| "—".into())
+                displayed_score(report, row)
             ),
             tone,
         );
@@ -169,9 +176,125 @@ fn family_of<'a>(report: &'a Value, id: &str) -> Option<&'a str> {
         })
 }
 
+fn relative_points(points: f64) -> String {
+    format!("{points:+.2}").replace('.', ",")
+}
+
+fn has_service_scores(report: &Value) -> bool {
+    report["trial_service_scores"]
+        .as_object()
+        .is_some_and(|scores| !scores.is_empty())
+}
+
+fn displayed_score(report: &Value, row: &Value) -> String {
+    if has_service_scores(report) {
+        let id = row["id"].as_str().unwrap_or("");
+        return report["trial_service_scores"][id]
+            .as_f64()
+            .map(relative_points)
+            .unwrap_or_else(|| "—".into());
+    }
+    row["score"]
+        .as_f64()
+        .map(points)
+        .unwrap_or_else(|| "—".into())
+}
+
+fn display_order<'a>(report: &Value, rows: &'a [Value], best: &str) -> Vec<&'a Value> {
+    let mut sorted: Vec<_> = rows.iter().collect();
+    let score = |id: &str| {
+        report["trial_service_scores"][id]
+            .as_f64()
+            .unwrap_or(f64::NEG_INFINITY)
+    };
+    sorted.sort_by(|a, b| {
+        let a = a["id"].as_str().unwrap_or("");
+        let b = b["id"].as_str().unwrap_or("");
+        (a != best)
+            .cmp(&(b != best))
+            .then_with(|| score(b).total_cmp(&score(a)))
+    });
+    sorted
+}
+
+fn explain_service_score(frame: &mut Frame, report: &Value) {
+    if !has_service_scores(report) {
+        return;
+    }
+    let anchor = report["trial_score_reference"].as_str().unwrap_or("");
+    frame.row(
+        &format!(" Пробный балл относительно {} (0).", name(report, anchor)),
+        Tone::Secondary,
+    );
+    let p = &report["connection_selection"];
+    let Some(candidate) = p["candidate"].as_str() else {
+        let scores = report["trial_service_scores"].as_object().unwrap();
+        if scores.len() == 1 {
+            frame.row(
+                " Сопоставимый балл есть только у опорного профиля.",
+                Tone::Secondary,
+            );
+        } else if scores.values().all(|v| v.as_f64().is_none_or(|s| s <= 0.)) {
+            frame.row(
+                " В пробном замере никто не опередил опорный профиль.",
+                Tone::Secondary,
+            );
+        }
+        return;
+    };
+    let reference = p["reference"].as_str().unwrap_or(anchor);
+    frame.row(
+        &format!(
+            " {} против {} · порог +{} в каждом из двух финалов.",
+            name(report, candidate),
+            name(report, reference),
+            crate::selection_latency::MIN_WORKING_POINTS
+        ),
+        Tone::Text,
+    );
+    for (key, label) in [("working", "Первый финал"), ("repeat", "Повтор")] {
+        if let Ok(pair) =
+            serde_json::from_value::<crate::selection_latency::Comparison>(p[key].clone())
+            && let Some(score) = &pair.service_score
+        {
+            frame.row(
+                &format!(
+                    " {label} {} балла · {} адресов.",
+                    relative_points(score.points),
+                    pair.targets
+                ),
+                Tone::Text,
+            );
+            if let Some(reason) = pair.service_rejection() {
+                frame.row(&format!(" {reason}"), Tone::Warning);
+            }
+        }
+    }
+    if let Some(points) = p["repeatable_points"].as_f64() {
+        frame.row(
+            &format!(
+                " Повторяемый выигрыш по сервисам {} · порог +{}.",
+                relative_points(points),
+                crate::selection_latency::MIN_WORKING_POINTS
+            ),
+            if points >= crate::selection_latency::MIN_WORKING_POINTS {
+                Tone::Text
+            } else {
+                Tone::Warning
+            },
+        );
+    }
+    if p["confirmed"] != true && report["report_only"] != true && report["choice"] != "kept" {
+        frame.row(
+            " Преимущество в двух финалах не подтверждено.",
+            Tone::Secondary,
+        );
+    }
+}
+
 fn speed_reason(report: &Value) -> Option<String> {
     let selection = &report["connection_selection"];
-    if selection["confirmed"] != true {
+    if selection["confirmed"] != true || selection["trial"]["service_score"].is_object() {
         return None;
     }
     let working = &selection["working"];
@@ -215,7 +338,13 @@ fn full_request_policy(report: &Value) -> bool {
 fn service_policy(report: &Value) -> bool {
     matches!(
         report["selection_policy"].as_str(),
-        Some("service-availability-then-paired-latency-v4" | crate::selection_latency::POLICY)
+        Some(
+            "service-availability-then-paired-latency-v4"
+                | "service-availability-then-paired-latency-v5"
+                | "service-availability-then-group-score-v6"
+                | "confirmed-service-availability-then-group-score-v7"
+                | crate::selection_latency::POLICY
+        )
     )
 }
 
@@ -422,6 +551,11 @@ fn compact_result(
         ("НЕ ПРИМЕНЕНО", Tone::Bad)
     };
     frame.row(&format!(" {status}: {}", name(report, primary)), tone);
+    network_summary(&mut frame, report);
+    media_summary(&mut frame, report);
+    if let Some(reason) = report["decision_reason"].as_str() {
+        frame.row(reason, Tone::Text);
+    }
     if let Some(family) = family_of(report, primary) {
         frame.row(
             &format!(" Семейство текущей стратегии — {family}."),
@@ -540,21 +674,25 @@ fn compact_result(
     if let Some(reason) = speed_reason(report) {
         frame.row(&reason, Tone::Good);
     }
+    let stages = quick_stages(report, rows.len());
+    if let Some(summary) = &stages {
+        frame.row(summary, Tone::Text);
+    }
     if let Some(ms) = report["elapsed_ms"].as_f64() {
         let seconds = (ms / 1000.).round() as u64;
+        let label = if stages.is_some() {
+            " Время проверки".into()
+        } else {
+            format!(" Проверено стратегий — {}", rows.len())
+        };
         frame.row(
-            &format!(
-                " Проверено: {} стратегий за {} мин {:02} с.",
-                rows.len(),
-                seconds / 60,
-                seconds % 60
-            ),
+            &format!("{label} · {} мин {:02} с.", seconds / 60, seconds % 60),
             Tone::Secondary,
         );
     }
     frame.separator("ЛУЧШИЕ ИЗ ПРОВЕРЕННЫХ");
-    let mut ordered: Vec<_> = rows.iter().collect();
-    ordered.sort_by_key(|row| row["id"].as_str() != Some(best));
+    explain_service_score(&mut frame, report);
+    let ordered = display_order(report, rows, best);
     for row in ordered.into_iter().take(3) {
         let id = row["id"].as_str().unwrap_or("");
         let (flag, tone) = final_status(report, id);
@@ -562,10 +700,7 @@ fn compact_result(
             &format!(
                 " {} · {} · {}{}{}",
                 name(report, id),
-                row["score"]
-                    .as_f64()
-                    .map(points)
-                    .unwrap_or_else(|| "—".into()),
+                displayed_score(report, row),
                 flag,
                 connection_timing(report, id)
                     .map(|(tcp, tls)| format!(" · TCP {tcp:.0} / TLS {tls:.0} мс"))
@@ -674,7 +809,9 @@ fn ranking_frame(
             "Автоподбор завершён"
         },
     );
-    frame.row(&format!(" Проверено стратегий: {}", rows.len()), Tone::Text);
+    let summary = quick_stages(report, rows.len())
+        .unwrap_or_else(|| format!(" Проверено стратегий: {}", rows.len()));
+    frame.row(&summary, Tone::Text);
     if let Some(ms) = report["elapsed_ms"].as_f64() {
         frame.row(
             &format!(" Время проверки: {} с", points(ms / 1000.)),
@@ -682,6 +819,11 @@ fn ranking_frame(
         );
     }
     let has_counts = report["availability"].is_object();
+    network_summary(&mut frame, report);
+    media_summary(&mut frame, report);
+    if let Some(reason) = report["decision_reason"].as_str() {
+        frame.row(reason, Tone::Text);
+    }
     let has_timing = report["timings"]
         .as_object()
         .is_some_and(|map| !map.is_empty());
@@ -708,10 +850,11 @@ fn ranking_frame(
         }),
         Tone::Secondary,
     );
-    let mut display: Vec<_> = rows.iter().collect();
-    if service_policy(report) {
-        display.sort_by_key(|r| r["id"].as_str() != Some(best));
-    }
+    let display = if service_policy(report) {
+        display_order(report, rows, best)
+    } else {
+        rows.iter().collect()
+    };
     for row in display.into_iter().take(shown) {
         let id = row["id"].as_str().unwrap_or("");
         let unconfirmed = report["strategy_quality"][id] == false;
@@ -726,10 +869,7 @@ fn ranking_frame(
             name(report, id)
         };
         let name = label(&display_name, name_width);
-        let score = row["score"]
-            .as_f64()
-            .map(points)
-            .unwrap_or_else(|| "—".into());
+        let score = displayed_score(report, row);
         let mut text = if has_counts {
             let counts = &report["availability"][id];
             let responses = counts["ok"]
@@ -849,6 +989,7 @@ fn ranking_frame(
             );
         }
     }
+    explain_service_score(&mut frame, report);
     if let Some(checks) = report["final_checks"].as_object() {
         for (id, check) in checks
             .iter()
@@ -978,6 +1119,100 @@ fn ranking_frame(
     frame
 }
 
+fn quick_stages(report: &Value, full_count: usize) -> Option<String> {
+    let stage = &report["quick_screen"];
+    let screened = stage["screened"].as_u64()?;
+    let targets = stage["targets"].as_array()?.len();
+    Some(format!(
+        " Короткий этап — профилей {screened}, адресов {targets}. Полный этап — {full_count}."
+    ))
+}
+
+fn network_summary(frame: &mut Frame, report: &Value) {
+    if let Some(sampled) = report["retry_batches"]["sampled"]
+        .as_u64()
+        .filter(|n| *n > 0)
+    {
+        let expanded = report["retry_batches"]["expanded"].as_u64().unwrap_or(0);
+        frame.row(
+            &format!(" Серии с массовыми ошибками: {sampled}. Расширенных повторов: {expanded}."),
+            Tone::Secondary,
+        );
+    }
+    if report["repeated_baseline_rounds"]
+        .as_array()
+        .is_some_and(|rounds| !rounds.is_empty())
+    {
+        frame.row(
+            " Исходный замер повторён из-за недоступности контрольных серверов.",
+            Tone::Secondary,
+        );
+    }
+    if let Some(failed) = report["failed_profiles"]
+        .as_object()
+        .filter(|rows| !rows.is_empty())
+    {
+        let labels = failed
+            .keys()
+            .map(|id| format!("ALT{id}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        frame.row(
+            &format!(
+                " Движок завершился во время проверки {labels}. Эти профили исключены из выбора."
+            ),
+            Tone::Warning,
+        );
+    }
+    if let Some(reason) = report["later_interruption"].as_str() {
+        frame.row(
+            &format!(" Более поздний подбор прервался. {reason}"),
+            Tone::Warning,
+        );
+    } else if report["network_recovery"]["restarted"] == true {
+        frame.row(
+            " После восстановления подключения все замеры выполнены заново.",
+            Tone::Text,
+        );
+    }
+}
+
+fn media_summary(frame: &mut Frame, report: &Value) {
+    if !report["telegram_media"].is_object() {
+        return;
+    }
+    for (group, target, label) in [
+        ("Discord", "media_file", "Медиа Discord"),
+        ("Roblox", "game_icon", "Иконка Roblox"),
+    ] {
+        if let Some(r) = report["final_details"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|r| r["group"] == group && r["name"] == target)
+        {
+            if r["state"] == "OK" {
+                frame.row(
+                    &format!(" {label} — {} байт, файл проверен.", r["body_bytes"]),
+                    Tone::Good,
+                );
+            } else {
+                frame.row(
+                    &format!(
+                        " {label} — сбой (HTTP {}, {}).",
+                        r["code"].as_str().unwrap_or("000"),
+                        r["termination"].as_str().unwrap_or("")
+                    ),
+                    Tone::Warning,
+                );
+            }
+        }
+    }
+    for line in crate::presentation::telegram_media_text(&report["telegram_media"]).lines() {
+        frame.row(&format!(" {line}"), Tone::Text);
+    }
+}
+
 pub fn result_text(report: &Value) -> Option<String> {
     let mut complete = report.clone();
     complete["presentation"] = Value::String("detailed".into());
@@ -989,6 +1224,29 @@ pub fn result_text(report: &Value) -> Option<String> {
         },
     )
     .map(Frame::plain)?;
+    if let Some(failed) = report["failed_profiles"].as_object() {
+        for (id, reason) in failed {
+            if let Some(reason) = reason.as_str() {
+                text.push_str(&format!("\r\nALT{id} — {reason}\r\n"));
+            }
+        }
+    }
+    if report["network_monitor"].is_object() {
+        let m = &report["network_monitor"];
+        text.push_str(&format!("\r\nСостояние сети Windows: чтений {}, повторных вызовов пропущено {}, суммарно {:.0} мс.\r\n",
+            m["reads"],m["cached_checks"],m["read_ms"].as_f64().unwrap_or(0.)));
+    }
+    if let Some(boundaries) = report["shared_controls"].as_array() {
+        let saved: u64 = boundaries
+            .iter()
+            .filter_map(|b| b["requests_saved"].as_u64())
+            .sum();
+        text.push_str(&format!(
+            "Общие контрольные замеры между профилями {}. Сэкономлено запросов {}.\r\n",
+            boundaries.len(),
+            saved
+        ));
+    }
     if let Some(families) = report["strategy_families"].as_object() {
         text.push_str("\r\n\r\nСемейства установленных стратегий\r\n");
         for (family, ids) in families {
@@ -1248,7 +1506,7 @@ pub fn run_summary(
     } else if !state.qualified {
         " · нестабильно"
     } else if state.leader {
-        " · лидер по баллу"
+        " · лидер по доступности"
     } else {
         ""
     };
@@ -1498,6 +1756,37 @@ mod tests {
         );
         data["connection_selection"]["confirmed"] = json!(false);
         assert!(speed_reason(&data).is_none());
+    }
+
+    #[test]
+    fn scoring_table_keeps_missing_evidence_distinct_from_the_reference_and_zero_gain() {
+        let report =
+            json!({"trial_score_reference":"31","trial_service_scores":{"31":0.,"52":-4.49}});
+        let rows = [
+            json!({"id":"other","score":60.}),
+            json!({"id":"52","score":57.}),
+            json!({"id":"31","score":56.}),
+        ];
+        let sorted = display_order(&report, &rows, "31");
+        assert_eq!(
+            sorted
+                .iter()
+                .map(|r| displayed_score(&report, r))
+                .collect::<Vec<_>>(),
+            ["+0,00", "-4,49", "—"]
+        );
+        let mut frame = Frame::new(
+            Viewport {
+                columns: 90,
+                rows: 24,
+            },
+            "Тест",
+        );
+        explain_service_score(&mut frame, &report);
+        assert!(frame.plain().contains("никто не опередил"));
+        let old = json!({"selection_policy":"service-availability-then-paired-latency-v5"});
+        assert!(service_policy(&old));
+        assert_eq!(displayed_score(&old, &rows[0]), "60");
     }
 
     #[test]

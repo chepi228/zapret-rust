@@ -21,7 +21,7 @@ use hyper_util::rt::TokioIo;
 use sha2::{Digest, Sha256};
 use tokio::{
     io::{AsyncRead, AsyncWrite},
-    net::{TcpStream, lookup_host},
+    net::TcpStream,
     sync::watch,
     task::JoinHandle,
     time::{Instant, timeout_at},
@@ -104,6 +104,23 @@ async fn execute(
     post_body: Option<&[u8]>,
     ca_file: Option<PathBuf>,
 ) -> Result<Termination, ProbeError> {
+    let media_target;
+    let target = if target.job.mode == ProbeMode::RobloxIcon {
+        row.stage = Stage::Http;
+        let start = Instant::now();
+        let url = crate::roblox::resolve(&target.url, connector)
+            .await
+            .map_err(|e| (Termination::HttpFailure, format!("Roblox API: {e:#}")))?;
+        row.media_url = Some(url.to_string());
+        row.media_lookup_ms = Some(elapsed_ms(start));
+        media_target = Target {
+            job: target.job.clone(),
+            url,
+        };
+        &media_target
+    } else {
+        target
+    };
     let host = match target.url.host().expect("validated URL") {
         Host::Domain(name) => name.to_owned(),
         Host::Ipv4(address) => address.to_string(),
@@ -123,11 +140,9 @@ async fn execute(
         {
             row.dns_source = "IP literal".into();
         }
-        lookup_host((host.as_str(), port))
+        crate::connection::resolve_addresses(&host, port)
             .await
             .map_err(|error| (Termination::DnsFailure, error.to_string()))?
-            .take(16)
-            .collect()
     };
     row.dns_ms = Some(elapsed_ms(start));
     row.resolved_addresses = addresses.iter().map(ToString::to_string).collect();
@@ -160,21 +175,31 @@ async fn execute(
         return Ok(Termination::Complete);
     }
     row.stage = Stage::Tcp;
-    let start = Instant::now();
-    let stream = connect(&addresses, row).await?;
-    row.tcp_ms = Some(elapsed_ms(start));
-    row.remote_address = stream.peer_addr().ok().map(|address| address.to_string());
     if target.url.scheme() == "https" {
-        row.stage = Stage::Tls;
-        let start = Instant::now();
-        let tls = connector
-            .connect(&host, stream)
-            .await
-            .map_err(|error| (Termination::TlsFailure, error.to_string()))?;
-        row.tls_ms = Some(elapsed_ms(start));
+        let (tls, tls_ms) = crate::tcp::connect_tls(
+            &addresses,
+            &mut row.tcp_attempts,
+            &host,
+            connector,
+            |connected| {
+                row.stage = if connected.is_some() {
+                    Stage::Tls
+                } else {
+                    Stage::Tcp
+                };
+                row.tcp_ms = connected.map(|(_, ms)| ms);
+                row.remote_address = connected.map(|(peer, _)| peer.to_string());
+            },
+        )
+        .await?;
+        row.tls_ms = Some(tls_ms);
         row.certificate_validated = true;
         exchange(tls, target, row, provided, post_body).await
     } else {
+        let start = Instant::now();
+        let stream = connect(&addresses, row).await?;
+        row.tcp_ms = Some(elapsed_ms(start));
+        row.remote_address = stream.peer_addr().ok().map(|address| address.to_string());
         exchange(stream, target, row, provided, post_body).await
     }
 }
@@ -233,7 +258,8 @@ where
         .header("connection", "close")
         .header("accept", "*/*")
         .header("user-agent", "zapret-rust-probe/0.1.0");
-    let request = if target.job.mode == ProbeMode::FullGet {
+    let full = matches!(target.job.mode, ProbeMode::FullGet | ProbeMode::RobloxIcon);
+    let request = if full {
         request.header("accept-encoding", "identity")
     } else {
         request.header("range", format!("bytes=0-{}", target.job.body_limit - 1))
@@ -255,7 +281,8 @@ where
     row.status_code = Some(response.status().as_u16());
     row.stage = Stage::Body;
     let mut body = response.into_body();
-    let mut digest = (target.job.mode == ProbeMode::FullGet).then(Sha256::new);
+    let mut digest = full.then(Sha256::new);
+    let mut image = (target.job.mode == ProbeMode::RobloxIcon).then(Vec::new);
     while let Some(frame) = body.frame().await {
         let frame = frame.map_err(|error| (Termination::TransferError, error.to_string()))?;
         if let Some(data) = frame.data_ref() {
@@ -269,7 +296,14 @@ where
             if let Some(hash) = &mut digest {
                 hash.update(data);
             }
+            if let Some(bytes) = &mut image {
+                bytes.extend_from_slice(data);
+            }
         }
+    }
+    if let Some(bytes) = image {
+        crate::roblox::validate(&bytes)
+            .map_err(|e| (Termination::TransferError, format!("Roblox PNG: {e:#}")))?;
     }
     row.body_sha256 = digest.map(|hash| format!("{:x}", hash.finalize()));
     row.body_complete = true;
@@ -349,6 +383,7 @@ mod tests {
         let active = Arc::new(AtomicUsize::new(0));
         let mut row = connection_row();
         let start = Instant::now();
+        let addresses = zapret_core::connection_addresses(addresses, 16);
         let connected = connect_with(&addresses, &mut row, |address| {
             let active = active.clone();
             async move {
@@ -383,6 +418,29 @@ mod tests {
                 .unwrap()
                 .contains("cancelled")
         );
+    }
+
+    #[tokio::test]
+    async fn a_slow_preferred_connection_survives_while_other_addresses_are_tried() {
+        let addresses = [1, 2, 3].map(|port| SocketAddr::from(([127, 0, 0, 1], port)));
+        let mut row = connection_row();
+        let result = timeout(
+            Duration::from_secs(4),
+            connect_with(&addresses, &mut row, |address| async move {
+                if address.port() == 1 {
+                    tokio::time::sleep(Duration::from_millis(1300)).await;
+                    Ok(address)
+                } else {
+                    Err(std::io::Error::from(std::io::ErrorKind::ConnectionRefused))
+                }
+            }),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(result, addresses[0]);
+        assert_eq!(row.tcp_attempts.len(), 3);
+        assert!(row.tcp_attempts[0].error.is_none());
     }
 
     #[tokio::test]

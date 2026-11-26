@@ -17,7 +17,7 @@ use std::{
     time::Duration,
 };
 use tokio::{
-    net::{TcpStream, lookup_host},
+    net::TcpStream,
     time::{Instant, timeout, timeout_at},
 };
 use tokio_tungstenite::{
@@ -329,13 +329,19 @@ async fn http2(target: &Target, timeout_ms: u64, ca_file: Option<&Path>) -> Resu
             let host = http::hostname(&current);
             let port = current.port_or_known_default().context("HTTP port")?;
             phase = "DNS";
-            let addresses: Vec<_> = lookup_host((host.as_str(), port)).await?.take(16).collect();
+            let addresses = crate::connection::resolve_addresses(&host, port).await?;
             phase = "TCP";
-            let stream = crate::tcp::connect(&addresses, &mut Vec::new())
-                .await
-                .map_err(anyhow::Error::msg)?;
-            phase = "TLS";
-            let stream = connector.connect(&host, stream).await?;
+            let (stream, _) = crate::tcp::connect_tls(
+                &addresses,
+                &mut Vec::new(),
+                &host,
+                &connector,
+                |connected| {
+                    phase = if connected.is_some() { "TLS" } else { "TCP" };
+                },
+            )
+            .await
+            .map_err(|(_, error)| anyhow::Error::msg(error))?;
             let protocol = stream.get_ref().negotiated_alpn()?;
             if protocol.as_deref() != Some(b"h2") {
                 return Ok(false);

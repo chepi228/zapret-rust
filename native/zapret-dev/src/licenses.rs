@@ -64,7 +64,17 @@ pub(crate) fn generate(metadata: &[u8], sysroot: &Path, output: &Path) -> Result
     let mut seen_notices = HashSet::new();
     let mut notices = String::new();
     for package in &packages {
-        let files = notice_files(package)?;
+        // The GNU import library is published without its workspace notices.
+        let owner = if package.name == "winapi-x86_64-pc-windows-gnu" && package.version == "0.4.0"
+        {
+            packages
+                .iter()
+                .find(|p| p.name == "winapi" && p.version == "0.3.9")
+                .context("Missing winapi workspace license source")?
+        } else {
+            package
+        };
+        let files = notice_files(owner)?;
         ensure!(
             !files.is_empty(),
             "No notices found for {} {}",
@@ -177,6 +187,25 @@ fn notice_files(package: &Package) -> Result<Vec<PathBuf>> {
         }
     }
     files.sort();
+    // Published grammers crates share the workspace licenses. Version 0.12.0
+    // (including tl-parser 2.0.0) omitted both texts from its crate archives.
+    if files.is_empty()
+        && ((package.version == "0.12.0"
+            && matches!(
+                package.name.as_str(),
+                "grammers-crypto"
+                    | "grammers-mtproto"
+                    | "grammers-mtsender"
+                    | "grammers-session"
+                    | "grammers-tl-gen"
+                    | "grammers-tl-types"
+            ))
+            || (package.name == "grammers-tl-parser" && package.version == "2.0.0"))
+    {
+        let upstream =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../dev/upstream-licenses/grammers");
+        files.extend(["LICENSE-APACHE", "LICENSE-MIT"].map(|n| upstream.join(n)));
+    }
     if let Some(path) = &package.license_file {
         let path = directory.join(path);
         if !files.contains(&path) {

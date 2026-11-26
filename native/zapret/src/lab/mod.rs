@@ -114,8 +114,13 @@ fn targets(root: &Path) -> Result<Vec<Target>> {
         root.join("tools/dpi-suite.json")
     };
     let mut targets = selection::read_targets_with_suite(root, &suite)?;
-    // The laboratory capture filter only includes TCP.
-    targets.retain(|t| t.probe_mode() != zapret_net::ProbeMode::Http3Head);
+    // The lab pins one TCP peer per target. The icon API and its CDN use separate peers.
+    targets.retain(|t| {
+        !matches!(
+            t.probe_mode(),
+            zapret_net::ProbeMode::Http3Head | zapret_net::ProbeMode::RobloxIcon
+        )
+    });
     ensure!(!targets.is_empty(), "Для лаборатории нужны TCP-адреса");
     Ok(targets)
 }

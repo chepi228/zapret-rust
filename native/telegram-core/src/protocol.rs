@@ -55,7 +55,7 @@ pub(crate) fn authenticate(
         encrypt: secret_cipher(&reverse, secret),
     })
 }
-fn secret_cipher(prekey_iv: &[u8], secret: &[u8; 16]) -> AesCtr {
+pub(crate) fn secret_cipher(prekey_iv: &[u8], secret: &[u8; 16]) -> AesCtr {
     let mut hash = Sha256::new();
     hash.update(&prekey_iv[..32]);
     hash.update(secret);
