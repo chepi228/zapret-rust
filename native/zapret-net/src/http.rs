@@ -241,13 +241,13 @@ mod tests {
         let serve = async move {
             let (mut client, _) = first.accept().await.unwrap();
             let mut buffer = [0; 4096];
-            client.read(&mut buffer).await.unwrap();
+            assert!(client.read(&mut buffer).await.unwrap() > 0);
             let response = format!(
                 "HTTP/1.1 302 Found\r\nLocation: http://{redirect}/answer\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
             );
             client.write_all(response.as_bytes()).await.unwrap();
             let (mut other, _) = next.accept().await.unwrap();
-            other.read(&mut buffer).await.unwrap();
+            assert!(other.read(&mut buffer).await.unwrap() > 0);
             other
                 .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
                 .await
