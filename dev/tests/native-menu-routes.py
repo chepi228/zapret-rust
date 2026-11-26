@@ -111,7 +111,10 @@ def exercise(menu, root, results):
     menu.expect(CHOICE, "ГЛАВНАЯ")
     assert expected("first-run") in menu.events(0)
     results.append("Первый запуск · подготовка до ввода")
-    leaf("Главная T · запись входа в NBA City", "T", expected("track", process="NBA2K*", seconds=120), required="Файл для передачи")
+    start = menu.cursor
+    menu.send("T", PAUSE, "Нет такого пункта меню")
+    confirm_events("Главная T · клавиша больше не запускает запись", start)
+    menu.send("", CHOICE, "ГЛАВНАЯ")
     leaf("Главная 1 · запуск", "1", expected("start"), next_screen="Обход запущен")
     leaf("Главная 1 · перезапуск", "1", expected("restart"), next_screen="Обход запущен")
     leaf("Главная 2 · остановка", "2", expected("stop-all"), next_screen="Обход остановлен")

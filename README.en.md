@@ -13,7 +13,7 @@
 
 If GitHub Raw is unreachable, the program also tries the GitHub API and your Windows proxy settings. During an outage it uses the bundled lists or the last successful update. Open **7 → 8** to see when the lists were updated or retry immediately. With usable local lists, the next automatic attempt is on a menu launch at least ten minutes after the failed first update.
 
-To move from a release with a BAT launcher, extract this ZIP into a separate folder. To carry over settings and custom lists, close both menus and copy `runtime\settings.ini` and your `lists\*-user.txt` files. To record an NBA 2K disconnect, open the game, press **T** in the zapret-rust menu and enter the City. The two-minute recording is saved to `runtime\track-last.json`.
+To move from a release with a BAT launcher, extract this ZIP into a separate folder. To carry over settings and custom lists, close both menus and copy `runtime\settings.ini` and your `lists\*-user.txt` files.
 
 ## How it compares with Flowseal
 

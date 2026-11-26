@@ -302,10 +302,6 @@ mod maintenance {
         }
     }
     pub fn start_background_maintenance(_: &App, _: bool) {}
-    pub fn track_city(_: &App) -> Result<String> {
-        event("track", json!({"process":"NBA2K*","seconds":120}));
-        Ok("Файл для передачи — runtime\\track-last.json".into())
-    }
     pub fn notices(_: &App) -> Result<Value> {
         event("notices", json!({}));
         Ok(json!({"notices":[{"text":"Тестовое уведомление"}]}))

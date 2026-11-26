@@ -260,19 +260,8 @@ fn main_frame(view: &MenuView, viewport: Viewport) -> Frame {
             frame.separator("");
         }
         frame.item(7, "Настройки", Tone::Text);
-        frame.item(
-            8,
-            if compact {
-                "Инструменты · T — запись NBA City"
-            } else {
-                "Инструменты: трекер, пинг, отчёты"
-            },
-            Tone::Text,
-        );
+        frame.item(8, "Инструменты", Tone::Text);
         frame.item(9, "Уведомления", Tone::Text);
-        if !compact {
-            frame.item("T", "Записать вход в NBA City (2 мин)", Tone::Secondary);
-        }
         frame.item(0, "Выйти из меню", Tone::Secondary);
         frame
     };
@@ -484,7 +473,6 @@ fn pc_check(app: &App) -> Result<()> {
 fn shortcut_name(key: &str) -> Option<&'static str> {
     match key.to_uppercase().as_str() {
         "C" | "С" | "H" | "Р" => Some("check"),
-        "T" | "Е" => Some("tracker"),
         "S" | "Ы" => Some("service"),
         "U" | "Г" => Some("autotune"),
         "A" | "Ф" => Some("autolist"),
@@ -501,12 +489,6 @@ fn shortcut(app: &App, key: &str) -> Option<Result<Outcome>> {
     let name = shortcut_name(key)?;
     Some((|| match name {
         "check" => pc_check(app).map(|_| Outcome::Displayed),
-        "tracker" => {
-            println!("Зайдите в City сейчас. Запись NBA 2K займёт две минуты.");
-            let report = maintenance::track_city(app)?;
-            println!("{}", report);
-            Ok(Outcome::Displayed)
-        }
         "service" => show_platform(app, "service-autostart", &app.toggle_startup()?),
         "autotune" => task_toggle(app, "autotune"),
         "autolist" => autolist(app),
@@ -1146,7 +1128,7 @@ mod tests {
         assert!(text.contains(&format!("zapret-rust v{}", crate::VERSION)));
         assert!(!text.contains("Rust"));
         assert!(text.contains("Состояние обхода не подтверждено"));
-        assert!(text.contains("T — запись NBA City"));
+        assert!(!text.contains("NBA City"));
         for key in [1, 2, 3, 4, 5, 6, 7, 8, 9, 0] {
             assert!(
                 text.contains(&format!(" {key:>2}  ")),
@@ -1256,7 +1238,6 @@ mod tests {
         for (left, right) in [
             ("c", "с"),
             ("h", "р"),
-            ("t", "е"),
             ("s", "ы"),
             ("u", "г"),
             ("a", "ф"),
@@ -1269,6 +1250,8 @@ mod tests {
             assert_eq!(super::shortcut_name(left), super::shortcut_name(right));
             assert!(super::shortcut_name(left).is_some());
         }
+        assert!(super::shortcut_name("t").is_none());
+        assert!(super::shortcut_name("е").is_none());
         assert!(super::shortcut_name("123").is_none());
     }
     #[test]

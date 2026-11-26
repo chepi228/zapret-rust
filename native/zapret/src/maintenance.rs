@@ -917,92 +917,6 @@ pub fn track(app: &App, process: &str, seconds: u64, voice: bool) -> Result<Valu
     track_game_connections(app, process, seconds, voice, true)
 }
 
-pub fn track_city(app: &App) -> Result<String> {
-    crate::ensure_controller_current()?;
-    let before = city_engine_state(app);
-    let mut capture = track_game_connections(app, "NBA2K*", 120, false, false)?;
-    let path = runtime_file(&app.root, "track-last.json")?;
-    capture["city"] = json!({"before":before,"after":city_engine_state(app)});
-    atomic_write(&path, &serde_json::to_vec_pretty(&capture)?)?;
-    Ok(format!(
-        "{}\nФайл для передачи — {}",
-        city_summary(&capture),
-        path.display()
-    ))
-}
-
-fn city_engine_state(app: &App) -> Value {
-    let state = observation_result(app.platform("status", json!({})));
-    let conflicts = observation_result(app.platform("conflicts", json!({})));
-    json!({"running":state["running"],"ownership_known":state["ownership_known"],
-        "processes":state["processes"],"foreign_bypass_count":conflicts["foreign_bypass"].as_array().map(Vec::len),
-        "foreign_service":conflicts["foreign_service"]})
-}
-
-fn city_summary(capture: &Value) -> String {
-    let mut lines = vec![
-        match capture["status"].as_str() {
-            Some("Captured") => "Запись NBA City завершена.",
-            Some("Partial") => "Запись NBA City неполная.",
-            _ => "Не удалось записать соединения NBA City.",
-        }
-        .to_owned(),
-    ];
-    let flows = capture["flows"]
-        .as_array()
-        .map(Vec::as_slice)
-        .unwrap_or_default();
-    if flows.is_empty() {
-        lines.push(
-            "Соединений NBA 2K в записи нет. Откройте игру и нажмите T перед входом в City.".into(),
-        );
-    } else {
-        for protocol in ["tcp", "udp"] {
-            let mut sent = 0;
-            let mut received = 0;
-            let mut ports = BTreeSet::new();
-            for flow in flows.iter().filter(|row| row["protocol"] == protocol) {
-                sent += flow["out"].as_u64().unwrap_or(0);
-                received += flow["in"].as_u64().unwrap_or(0);
-                if let Some(port) = flow["port"].as_u64() {
-                    ports.insert(port);
-                }
-            }
-            let label = protocol.to_uppercase();
-            if ports.is_empty() {
-                lines.push(format!("{label} — событий в записи нет."));
-            } else {
-                let shown = ports
-                    .iter()
-                    .take(8)
-                    .map(u64::to_string)
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                let more = if ports.len() > 8 {
-                    " и другие"
-                } else {
-                    ""
-                };
-                lines.push(format!(
-                    "{label} — исходящих событий {sent}, входящих {received}. Порты {shown}{more}."
-                ));
-            }
-        }
-    }
-    let after = &capture["city"]["after"];
-    if after["foreign_bypass_count"]
-        .as_u64()
-        .is_some_and(|n| n > 0)
-        || after["foreign_service"] == true
-    {
-        lines.push("В конце записи обнаружен другой обход или его служба.".into());
-    }
-    if after["running"] == false && after["ownership_known"] == true {
-        lines.push("В конце записи обход этой установки остановлен.".into());
-    }
-    lines.join("\n")
-}
-
 fn track_game_connections(
     app: &App,
     process: &str,
@@ -2688,24 +2602,6 @@ pub fn uninstall(app: &App) -> Result<Value> {
 mod tests {
     use super::*;
     use std::cell::{Cell, RefCell};
-
-    #[test]
-    fn city_summary_counts_observed_directions_and_does_not_guess_a_disconnect() {
-        let capture = json!({"status":"Partial","flows":[
-            {"protocol":"tcp","port":20895,"out":6,"in":1},{"protocol":"tcp","port":443,"out":2,"in":3}],
-            "city":{"after":{"foreign_bypass_count":1,"ownership_known":true,"running":false}}});
-        let text = city_summary(&capture);
-        for expected in [
-            "неполная",
-            "исходящих событий 8, входящих 4",
-            "443, 20895",
-            "UDP — событий в записи нет",
-            "другой обход",
-            "установки остановлен",
-        ] {
-            assert!(text.contains(expected), "{text}");
-        }
-    }
 
     #[test]
     fn scanner_never_applies_partial_or_changed_observations() {
