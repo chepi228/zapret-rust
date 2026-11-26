@@ -197,6 +197,7 @@ pub(super) fn finalists(
         .collect()
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn screen(
     context: &RunContext<'_>,
     settings: &Settings,

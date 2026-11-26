@@ -1582,6 +1582,7 @@ fn trial_order(targets: &[Target], baseline: &[Row], parallel: usize) -> Vec<Tar
     order
 }
 
+#[allow(clippy::too_many_arguments)]
 fn measure_profile(
     context: &RunContext<'_>,
     settings: &Settings,
@@ -3212,6 +3213,7 @@ fn collect_round_summaries(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn publish(
     app: &App,
     previous: &Settings,

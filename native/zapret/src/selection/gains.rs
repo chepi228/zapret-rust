@@ -153,7 +153,12 @@ mod tests {
         flaky["tries"] = json!(2);
         flaky["flaky"] = json!(true);
         let clean = BTreeMap::new();
-        let gains = improvements(&[flaky.clone()], &[good.clone()], &clean, Panel::Services);
+        let gains = improvements(
+            std::slice::from_ref(&flaky),
+            std::slice::from_ref(&good),
+            &clean,
+            Panel::Services,
+        );
         let targets = [target];
         let tied = verify(
             &gains,

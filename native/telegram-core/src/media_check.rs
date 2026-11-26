@@ -80,7 +80,7 @@ impl Transport for BridgeTransport {
         self.decrypted = buffer.len();
         let header = buffer.get(..4).ok_or(Error::MissingBytes)?;
         let n = i32::from_le_bytes(header.try_into().unwrap());
-        if n < 4 || n > 1024 * 1024 || n % 4 != 0 {
+        if !(4..=1024 * 1024).contains(&n) || n % 4 != 0 {
             return Err(Error::BadLen { got: n });
         }
         let end = 4 + n as usize;
