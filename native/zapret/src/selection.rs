@@ -32,6 +32,8 @@ pub(crate) use network_monitor::last_interruption;
 mod quick;
 mod retries;
 mod startup;
+#[cfg(test)]
+mod trial_fixture;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct ExpectedResponse {

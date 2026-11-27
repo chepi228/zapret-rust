@@ -288,11 +288,10 @@ fn retries_keep_one_real_peer_and_clock_instead_of_component_minima() {
 }
 
 fn exited_child() -> OwnedChild {
-    let shell = PathBuf::from(std::env::var_os("SystemRoot").unwrap())
-        .join("System32/WindowsPowerShell/v1.0/powershell.exe");
-    let args = ["-NoProfile", "-NonInteractive", "-Command", "exit 19"].map(OsString::from);
-    let child = OwnedChild::spawn(&shell, &args, &RunOptions::default()).unwrap();
-    child.wait_for_exit(Duration::from_secs(5)).unwrap();
+    let mut child = trial_fixture::spawn("exit-19", RunOptions::default()).unwrap();
+    while child.is_running().unwrap() {
+        child.wait_for_exit(Duration::from_millis(50)).unwrap();
+    }
     child
 }
 

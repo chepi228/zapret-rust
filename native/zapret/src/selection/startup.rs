@@ -89,34 +89,21 @@ pub(super) fn wait(child: &mut OwnedChild, signal: Option<&Signal>) -> Result<bo
 
 #[cfg(test)]
 mod tests {
+    use super::super::trial_fixture;
     use super::*;
-    use std::{ffi::OsString, path::PathBuf};
 
-    fn fixture(script: &str) -> Result<bool> {
+    fn fixture(behavior: &str) -> Result<bool> {
         let mut options = RunOptions::default();
         let signal = Signal::for_child(&mut options).expect("create a private test semaphore");
-        let shell = PathBuf::from(std::env::var_os("SystemRoot").unwrap())
-            .join("System32/WindowsPowerShell/v1.0/powershell.exe");
-        let args = ["-NoProfile", "-NonInteractive", "-Command", script].map(OsString::from);
-        let mut child = OwnedChild::spawn(&shell, &args, &options)?;
-        // Start the trial in the announced state. PowerShell startup on CI can
-        // exceed the legacy engine grace period before the script executes.
-        let posted = unsafe {
-            windows_sys::Win32::System::Threading::ReleaseSemaphore(
-                signal.0.as_raw_handle(),
-                1,
-                ptr::null_mut(),
-            )
-        };
-        ensure!(posted != 0, "Could not announce fixture initialization");
+        // Announce startup before the selector begins its legacy grace period.
+        trial_fixture::post(&signal.0)?;
+        let mut child = trial_fixture::spawn(behavior, options)?;
         wait(&mut child, Some(&signal))
     }
 
     #[test]
     fn initialization_alone_does_not_start_measurements() {
-        assert!(!fixture("Start-Sleep -Milliseconds 2300; exit 3").unwrap());
-        assert!(fixture(
-            "$s=[Threading.Semaphore]::OpenExisting($env:ZAPRET_TRIAL_STARTUP); $null=$s.Release(); Start-Sleep -Seconds 20"
-        ).unwrap());
+        assert!(!fixture("exit-before-ready").unwrap());
+        assert!(fixture("ready").unwrap());
     }
 }
