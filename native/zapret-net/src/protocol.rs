@@ -5,6 +5,7 @@ use url::Url;
 
 pub const MAX_INPUT: u64 = 1_048_576;
 pub const MAX_BODY_LIMIT: usize = 1_048_576;
+pub use zapret_core::{EPIC_JWKS_URL, JWKS_MAX_BYTES};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -12,6 +13,7 @@ pub enum ProbeMode {
     #[default]
     Range,
     FullGet,
+    Jwks,
     RobloxIcon,
     Http3Head,
 }
@@ -87,7 +89,12 @@ pub fn read_jobs(reader: impl Read) -> Result<Vec<Target>, String> {
             job.method
                 .as_deref()
                 .unwrap_or(if job.post_bytes == 0 { "GET" } else { "POST" });
-        if (matches!(job.mode, ProbeMode::FullGet | ProbeMode::RobloxIcon) && method != "GET")
+        if (matches!(
+            job.mode,
+            ProbeMode::FullGet | ProbeMode::Jwks | ProbeMode::RobloxIcon
+        ) && method != "GET")
+            || (job.mode == ProbeMode::Jwks
+                && (url.scheme() != "https" || job.body_limit > JWKS_MAX_BYTES + 1))
             || (job.mode == ProbeMode::RobloxIcon
                 && (crate::roblox::universe(&url).is_none() || job.connect_ip.is_some()))
             || (job.mode == ProbeMode::Http3Head && (url.scheme() != "https" || method != "HEAD"))

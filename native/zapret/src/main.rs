@@ -532,6 +532,17 @@ impl App {
             Action::Autotune { force } => maintenance::autotune(self, force),
             Action::ConnectionCheck(arguments) => self.network("connection", arguments),
             Action::Webcheck(arguments) => self.network("webcheck", arguments),
+            Action::YoutubeCheck => {
+                let result = zapret_net::diagnostics(
+                    &self.root,
+                    "webcheck",
+                    &json!({
+                        "url": "https://www.youtube.com/watch?v=jNQXAC9IVRw",
+                        "modes": ["BrowserPlayback"], "visits": 1, "timeout_ms": 30000
+                    }),
+                )?;
+                diagnostic_report::publish(&self.root, "youtube", result)
+            }
             Action::Voicecheck(arguments) => self.network("voice", arguments),
             Action::Latency(arguments) => self.network("latency", arguments),
             Action::ProviderCheck(arguments) => provider_report::run(self, &arguments),

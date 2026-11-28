@@ -1,4 +1,5 @@
 use anyhow::{Context, Result, bail};
+use futures_util::{StreamExt, stream::FuturesUnordered};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
@@ -193,11 +194,9 @@ pub(crate) async fn resolve(host: &str, timeout_ms: u64) -> Dns {
         .await
         {
             Ok(Ok(values)) => {
-                let mut seen = HashSet::new();
-                row.addresses = values
+                row.addresses = zapret_core::connection_addresses(values, 64)
+                    .into_iter()
                     .map(|s| s.ip().to_string())
-                    .filter(|s| seen.insert(s.clone()))
-                    .take(64)
                     .collect();
                 row.state = if row.addresses.is_empty() {
                     "FAIL"
@@ -254,6 +253,55 @@ pub(crate) fn select_addresses(values: &[String]) -> Vec<IpAddr> {
     }
     result
 }
+
+/// Probe the selected DNS answers under one deadline. Keep the preferred
+/// peer's observation if none confirm the protocol.
+pub(crate) async fn first_confirmed<T, F: Future<Output = T>>(
+    peers: &[IpAddr],
+    budget_ms: u64,
+    probe: impl Fn(IpAddr, u64) -> F,
+    confirmed: impl Fn(&T) -> bool,
+) -> Option<T> {
+    let mut next = 0;
+    let mut pending = FuturesUnordered::new();
+    let mut primary = None;
+    let mut launch_at = Instant::now();
+    let deadline = launch_at + Duration::from_millis(budget_ms);
+    let stagger = Duration::from_millis((budget_ms / (peers.len() as u64 + 1)).min(150));
+    loop {
+        let now = Instant::now();
+        if now >= deadline && next > 0 {
+            next = peers.len();
+        }
+        if (pending.is_empty() || now >= launch_at)
+            && let Some(&address) = peers.get(next)
+        {
+            let index = next;
+            next += 1;
+            let remaining = deadline.saturating_duration_since(now).as_millis() as u64;
+            let request = probe(address, remaining.max(1));
+            pending.push(async move { (index, request.await) });
+            launch_at = Instant::now() + stagger;
+        }
+        if pending.is_empty() {
+            return primary;
+        }
+        tokio::select! {
+            biased;
+            Some((index, row)) = pending.next() => {
+                if confirmed(&row) {
+                    return Some(row);
+                }
+                if index == 0 {
+                    primary = Some(row);
+                }
+                launch_at = Instant::now();
+            }
+            _ = tokio::time::sleep_until(launch_at), if next < peers.len() => {}
+        }
+    }
+}
+
 pub(crate) fn host(args: &Value, default: &str) -> Result<String> {
     let value = args
         .get("host")
@@ -294,5 +342,41 @@ pub fn diagnostics(root: &Path, kind: &str, args: &Value) -> Result<Value> {
         "webcheck" | "web" | "browser" => crate::web::run(root, args),
         "provider" | "provider-check" | "ipinfo" => crate::provider::run(root, args),
         _ => bail!("unknown network diagnostic {kind}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::RefCell;
+
+    #[tokio::test]
+    async fn diagnostic_fallback_keeps_the_preferred_result_and_one_round_budget() {
+        let peers = ["::1", "127.0.0.1", "127.0.0.2"].map(|s| s.parse::<IpAddr>().unwrap());
+        for usable in [Some(peers[0]), Some(peers[2]), None] {
+            let calls = RefCell::new(Vec::new());
+            let result = first_confirmed(
+                &peers,
+                500,
+                |ip, ms| {
+                    calls.borrow_mut().push((ip, ms));
+                    std::future::ready(ip)
+                },
+                |ip| Some(*ip) == usable,
+            )
+            .await;
+            assert_eq!(result, usable.or(Some(peers[0])));
+            let calls = calls.into_inner();
+            assert_eq!(
+                calls.len(),
+                if usable == Some(peers[0]) {
+                    1
+                } else {
+                    peers.len()
+                }
+            );
+            assert!(calls.iter().all(|&(_, ms)| (1..=500).contains(&ms)));
+            assert!(calls.windows(2).all(|pair| pair[0].1 >= pair[1].1));
+        }
     }
 }

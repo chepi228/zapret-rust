@@ -26,8 +26,21 @@ pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(8);
 pub(crate) const WRITE_TIMEOUT: Duration = Duration::from_secs(20);
 
 pub(crate) async fn open_tcp(host: &str, port: u16, buffer: usize) -> Result<TcpStream> {
+    open_upstream(host, port, buffer, |stream| std::future::ready(Ok(stream))).await
+}
+
+async fn open_upstream<T, Fut>(
+    host: &str,
+    port: u16,
+    buffer: usize,
+    negotiate: impl Fn(TcpStream) -> Fut,
+) -> Result<T>
+where
+    Fut: std::future::Future<Output = Result<T>>,
+{
     timeout(CONNECT_TIMEOUT, async {
         let addresses = tokio::net::lookup_host((host, port)).await?;
+        let negotiate = &negotiate;
         connect_addresses_with(addresses, |address| async move {
             let socket = if address.is_ipv4() {
                 TcpSocket::new_v4()?
@@ -38,13 +51,13 @@ pub(crate) async fn open_tcp(host: &str, port: u16, buffer: usize) -> Result<Tcp
             socket.set_recv_buffer_size(buffer as u32)?;
             let stream = socket.connect(address).await?;
             stream.set_nodelay(true)?;
-            Ok(stream)
+            negotiate(stream).await.map_err(std::io::Error::other)
         })
         .await
         .map_err(anyhow::Error::from)
     })
     .await
-    .context("upstream TCP connection timed out")?
+    .context("upstream connection timed out")?
 }
 
 async fn connect_addresses_with<T, F, Fut>(
@@ -101,30 +114,43 @@ where
         }
     }
 }
-pub(crate) async fn tls(stream: TcpStream, host: &str, h2: bool) -> Result<Box<dyn Io>> {
+pub(crate) async fn open_tls(
+    connect_host: &str,
+    port: u16,
+    buffer: usize,
+    host: &str,
+    h2: bool,
+) -> Result<Box<dyn Io>> {
     let mut builder = native_tls::TlsConnector::builder();
     builder.request_alpns(if h2 { &["h2"] } else { &["http/1.1"] });
     // Native TLS uses Schannel and the Windows certificate store. Never disable
     // chain or hostname checks, including when connecting to a redirected IP.
     let connector = tokio_native_tls::TlsConnector::from(builder.build()?);
-    let stream = timeout(CONNECT_TIMEOUT, connector.connect(host, stream))
-        .await
-        .context("upstream TLS timed out")??;
-    if h2 {
-        ensure!(
-            stream.get_ref().negotiated_alpn()?.as_deref() == Some(b"h2"),
-            "upstream did not negotiate HTTP/2"
-        );
-    }
-    Ok(Box::new(stream))
+    open_upstream(connect_host, port, buffer, |stream| async {
+        let stream = connector.connect(host, stream).await?;
+        if h2 {
+            ensure!(
+                stream.get_ref().negotiated_alpn()?.as_deref() == Some(b"h2"),
+                "upstream did not negotiate HTTP/2"
+            );
+        }
+        Ok(Box::new(stream) as Box<dyn Io>)
+    })
+    .await
 }
 pub(crate) async fn connect_ws(endpoint: &WsEndpoint, buffer: usize) -> Result<Ws> {
     timeout(CONNECT_TIMEOUT, async {
-        let stream = open_tcp(&endpoint.connect_host, endpoint.port, buffer).await?;
         let stream: Box<dyn Io> = if endpoint.secure {
-            tls(stream, &endpoint.host, false).await?
+            open_tls(
+                &endpoint.connect_host,
+                endpoint.port,
+                buffer,
+                &endpoint.host,
+                false,
+            )
+            .await?
         } else {
-            Box::new(stream)
+            Box::new(open_tcp(&endpoint.connect_host, endpoint.port, buffer).await?)
         };
         let scheme = if endpoint.secure { "wss" } else { "ws" };
         let mut request =
@@ -296,6 +322,53 @@ pub(crate) mod tests {
         .await;
         assert!(result.is_err());
         assert_eq!(active.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn secure_websocket_and_h2_try_the_other_family_during_a_stalled_handshake() {
+        let peers = zapret_core::connection_addresses(
+            tokio::net::lookup_host(("localhost", 0)).await.unwrap(),
+            2,
+        );
+        let [preferred, alternate] = peers.as_slice() else {
+            return;
+        };
+        let first = TcpListener::bind(preferred).await.unwrap();
+        let port = first.local_addr().unwrap().port();
+        let second = TcpListener::bind(SocketAddr::new(alternate.ip(), port))
+            .await
+            .unwrap();
+        let endpoint = WsEndpoint {
+            connect_host: "localhost".into(),
+            port,
+            host: "telegram.test".into(),
+            path: "/".into(),
+            secure: true,
+        };
+        for h2 in [false, true] {
+            let client = async {
+                if h2 {
+                    open_tls("localhost", port, 65536, &endpoint.host, true)
+                        .await
+                        .map(drop)
+                } else {
+                    connect_ws(&endpoint, 65536).await.map(drop)
+                }
+            };
+            let servers = async {
+                let (mut preferred, _) = first.accept().await.unwrap();
+                assert_eq!(preferred.read_u8().await.unwrap(), 22);
+                let (mut alternate, _) = second.accept().await.unwrap();
+                assert_eq!(alternate.read_u8().await.unwrap(), 22);
+                // Neither server presents a certificate. Both setups must fail.
+            };
+            let (result, _) = timeout(Duration::from_secs(4), async {
+                tokio::join!(client, servers)
+            })
+            .await
+            .unwrap();
+            assert!(result.is_err());
+        }
     }
 
     #[test]

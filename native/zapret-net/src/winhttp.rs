@@ -156,6 +156,26 @@ pub fn fetch_via_windows(
     timeout_ms: u64,
     accept: &str,
 ) -> Result<Vec<u8>> {
+    windows_download(url, max_bytes, timeout_ms, accept, 0)
+}
+
+/// GitHub release assets redirect to an expiring HTTPS location on the CDN.
+pub fn fetch_release_via_windows(
+    url: &str,
+    max_bytes: usize,
+    timeout_ms: u64,
+    accept: &str,
+) -> Result<Vec<u8>> {
+    windows_download(url, max_bytes, timeout_ms, accept, MAX_REDIRECTS)
+}
+
+fn windows_download(
+    url: &str,
+    max_bytes: usize,
+    timeout_ms: u64,
+    accept: &str,
+    redirects: usize,
+) -> Result<Vec<u8>> {
     ensure!(
         (1..=http::MAX_DOWNLOAD).contains(&max_bytes) && (1..=300_000).contains(&timeout_ms),
         "Invalid download limits"
@@ -170,28 +190,32 @@ pub fn fetch_via_windows(
     // WinHTTP can finish a synchronous PAC lookup after its phase timeout.
     // The worker owns only request handles and memory; it never publishes files.
     std::thread::Builder::new()
-        .name("list-winhttp".into())
+        .name("download-winhttp".into())
         .spawn(move || {
-            let _ = send.send(system_download(url, max_bytes, deadline, &accept));
+            let _ = send.send(system_download(
+                url, max_bytes, deadline, &accept, redirects,
+            ));
         })?;
     receive
         .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
         .context("Windows download did not complete before its deadline")?
 }
 
+fn remaining_ms(deadline: std::time::Instant) -> Result<i32> {
+    let ms = deadline
+        .saturating_duration_since(std::time::Instant::now())
+        .as_millis() as i32;
+    ensure!(ms > 0, "Windows download deadline expired");
+    Ok(ms)
+}
+
 fn system_download(
-    url: Url,
+    mut url: Url,
     limit: usize,
     deadline: std::time::Instant,
     accept: &str,
+    redirects: usize,
 ) -> Result<Vec<u8>> {
-    let remaining = || -> Result<i32> {
-        let ms = deadline
-            .saturating_duration_since(std::time::Instant::now())
-            .as_millis() as i32;
-        ensure!(ms > 0, "Windows download deadline expired");
-        Ok(ms)
-    };
     let session = Handle::new(
         unsafe {
             WinHttpOpen(
@@ -204,16 +228,36 @@ fn system_download(
         },
         "WinHttpOpen",
     )?;
-    let ms = remaining()?;
-    check(
-        unsafe { WinHttpSetTimeouts(session.0, ms, ms, ms, ms) },
-        "WinHttpSetTimeouts",
-    )?;
-    let connection = connection(
-        &session,
-        &wide(&http::hostname(&url)),
-        url.port_or_known_default().context("URL port")?,
-    )?;
+    for hop in 0..=redirects {
+        let ms = remaining_ms(deadline)?;
+        check(
+            unsafe { WinHttpSetTimeouts(session.0, ms, ms, ms, ms) },
+            "WinHttpSetTimeouts",
+        )?;
+        let connection = connection(
+            &session,
+            &wide(&http::hostname(&url)),
+            url.port_or_known_default().context("URL port")?,
+        )?;
+        let request = download_request(&connection, &url, accept, deadline)?;
+        let status = status_code(&request)?;
+        if matches!(status, 301 | 302 | 303 | 307 | 308) {
+            ensure!(hop < redirects, "HTTP {status}: redirect limit exceeded");
+            url = http::download_redirect(&url, &location(&request)?)?;
+            continue;
+        }
+        ensure!(status == 200, "HTTP status {status}");
+        return download_body(&request, limit, deadline);
+    }
+    unreachable!("redirect limit checked on last response")
+}
+
+fn download_request(
+    connection: &Handle,
+    url: &Url,
+    accept: &str,
+    deadline: std::time::Instant,
+) -> Result<Handle> {
     let path = wide(&url[Position::BeforePath..]);
     let secure = if url.scheme() == "https" {
         WINHTTP_FLAG_SECURE
@@ -240,7 +284,7 @@ fn system_download(
     )?;
     request.option(WINHTTP_OPTION_MAX_RESPONSE_HEADER_SIZE, MAX_HEADER_BYTES)?;
     let header = wide(&format!("Accept: {accept}\r\n"));
-    remaining()?;
+    remaining_ms(deadline)?;
     check(
         unsafe {
             WinHttpSendRequest(
@@ -255,13 +299,15 @@ fn system_download(
         },
         "WinHttpSendRequest",
     )?;
-    remaining()?;
+    remaining_ms(deadline)?;
     check(
         unsafe { WinHttpReceiveResponse(request.0, null_mut()) },
         "WinHttpReceiveResponse",
     )?;
-    let status = status_code(&request)?;
-    ensure!(status == 200, "HTTP status {status}");
+    Ok(request)
+}
+
+fn download_body(request: &Handle, limit: usize, deadline: std::time::Instant) -> Result<Vec<u8>> {
     let mut declared = 0u32;
     let mut size = size_of_val(&declared) as u32;
     let queried = unsafe {
@@ -291,7 +337,7 @@ fn system_download(
     let mut bytes = Vec::new();
     let mut block = [0u8; 16 * 1024];
     loop {
-        remaining()?;
+        remaining_ms(deadline)?;
         let mut received = 0;
         check(
             unsafe {

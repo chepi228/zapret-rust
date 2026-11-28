@@ -417,6 +417,52 @@ async fn dns(root: &Path, args: &Value) -> Result<Value> {
         json!({"schema":1,"kind":"Dns","rows":rows,"suspect":suspect,"checked":checked,"total":hosts.len(),"comparison_requested":compare,"cause":"NotEstablished","bypass_observed":bypass_on}),
     )
 }
+async fn family_paths(
+    url: &url::Url,
+    dns: &d::Dns,
+    timeout_ms: u64,
+    connector: &tokio_native_tls::TlsConnector,
+    cancel: &tokio::sync::watch::Receiver<bool>,
+    extra_ca: bool,
+) -> (Value, Value) {
+    let addresses = d::select_addresses(&dns.addresses);
+    let family = |ipv6: bool| {
+        let peers: Vec<_> = addresses
+            .iter()
+            .copied()
+            .filter(|ip| ip.is_ipv6() == ipv6)
+            .collect();
+        async move {
+            let probe = |address, remaining| {
+                crate::connection::one(
+                    url.clone(),
+                    address,
+                    1,
+                    remaining,
+                    connector.clone(),
+                    cancel.clone(),
+                    extra_ca,
+                )
+            };
+            let Some(row) = d::first_confirmed(&peers, timeout_ms, probe, |row| {
+                row.headers_complete || row.reason == "Cancelled"
+            })
+            .await
+            else {
+                let reason = if dns.state == "OK" {
+                    "NoAddress"
+                } else {
+                    "DnsUnconfirmed"
+                };
+                return json!({"ok":false, "ms":null, "reason":reason});
+            };
+            let ms = row.tcp_ms.zip(row.tls_ms).map(|(tcp, tls)| tcp + tls);
+            json!({"ok":row.headers_complete, "ms":ms, "observation":row})
+        }
+    };
+    tokio::join!(family(false), family(true))
+}
+
 async fn ipv6(root: &Path, args: &Value) -> Result<Value> {
     let custom = args.get("url").is_some()
         || args["urls"].as_array().is_some_and(|v| !v.is_empty())
@@ -456,20 +502,36 @@ async fn ipv6(root: &Path, args: &Value) -> Result<Value> {
         let connector = connector.clone();
         let cancel = cancel.clone();
         let extra_ca = ca.is_some();
-        pending.spawn(async move{
-        let url=http::checked_url(&target.url,false)?;let started=Instant::now();let dns=d::resolve(&http::hostname(&url),timeout_ms.min(2000)).await;let addresses=d::select_addresses(&dns.addresses);
-        let mut families=vec![json!({"ok":false,"ms":null,"reason":if dns.state=="OK"{"NoAddress"}else{"DnsUnconfirmed"}});2];
-        let mut requests=JoinSet::new();let remaining=timeout_ms.saturating_sub(started.elapsed().as_millis()as u64).max(1);
-        for (index,ipv6) in [false,true].into_iter().enumerate(){
-            if let Some(&address)=addresses.iter().find(|a|a.is_ipv6()==ipv6){
-                let url=url.clone();let connector=connector.clone();let cancel=cancel.clone();
-                requests.spawn(async move{let row=crate::connection::one(url,address,1,remaining,connector,cancel,extra_ca).await;let ok=row.headers_complete&&(200..=599).contains(&row.status_code);let tls_ms=row.tcp_ms.zip(row.tls_ms).map(|(a,b)|a+b);(index,json!({"ok":ok,"ms":tls_ms,"observation":row}))});
-            }
-        }
-        while let Some(result)=requests.join_next().await{let(index,value)=result?;families[index]=value;}
-        let v4=&families[0];let v6=&families[1];let verdict=if v6["reason"]=="NoAddress"{"none"}else if v6["reason"]=="DnsUnconfirmed"{"unknown"}else if v4["ok"]!=true&&v6["ok"]!=true{"down"}else if v6["ok"]!=true{"broken"}else if v4["ok"]==true&&v6["ms"].as_f64().zip(v4["ms"].as_f64()).is_some_and(|(a,b)|a>2.*b+300.){"slow"}else{"ok"};
-        Ok::<_,anyhow::Error>(json!({"name":target.name,"host":http::hostname(&url),"url":target.url,"dns":dns,"v4":v4,"v6":v6,"verdict":verdict}))
-    });
+        pending.spawn(async move {
+            let url = http::checked_url(&target.url, false)?;
+            let started = Instant::now();
+            let host = http::hostname(&url);
+            let dns = d::resolve(&host, timeout_ms.min(2000)).await;
+            let remaining = timeout_ms
+                .saturating_sub(started.elapsed().as_millis() as u64)
+                .max(1);
+            let (v4, v6) = family_paths(&url, &dns, remaining, &connector, &cancel, extra_ca).await;
+            let verdict = if v6["reason"] == "NoAddress" {
+                "none"
+            } else if v6["reason"] == "DnsUnconfirmed" || *cancel.borrow() {
+                "unknown"
+            } else if v6["ok"] != true && v4["ok"] != true {
+                "down"
+            } else if v6["ok"] != true {
+                "broken"
+            } else if v4["ok"] == true
+                && v6["ms"]
+                    .as_f64()
+                    .zip(v4["ms"].as_f64())
+                    .is_some_and(|(six, four)| six > 2. * four + 300.)
+            {
+                "slow"
+            } else {
+                "ok"
+            };
+            Ok::<_, anyhow::Error>(json!({"name":target.name,"host":host,"url":target.url,
+                "dns":dns,"v4":v4,"v6":v6,"verdict":verdict}))
+        });
     }
     let mut rows = Vec::new();
     while let Some(row) = pending.join_next().await {
@@ -502,6 +564,40 @@ pub(crate) fn run(root: &Path, kind: &str, args: &Value) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn family_paths_reach_the_second_address_after_incomplete_headers() -> Result<()> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+        let first = TcpListener::bind("127.0.0.1:0").await?;
+        let port = first.local_addr()?.port();
+        let second = TcpListener::bind(("127.0.0.2", port)).await?;
+        let serve = |listener: TcpListener, response: &'static [u8]| async move {
+            let (mut socket, _) = listener.accept().await?;
+            let mut request = [0; 2048];
+            let n = socket.read(&mut request).await?;
+            assert!(request[..n].starts_with(b"HEAD / "));
+            socket.write_all(response).await
+        };
+        let primary = tokio::spawn(serve(first, b"HTTP/1.1 200 OK\r\n"));
+        let backup = tokio::spawn(serve(
+            second,
+            b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n",
+        ));
+        let url = url::Url::parse(&format!("http://localhost:{port}"))?;
+        let mut dns = d::resolve("127.0.0.1", 1000).await;
+        dns.addresses.push("127.0.0.2".into());
+        let connector = crate::tls_connector(None, &["http/1.1"])?;
+        let (_sender, cancel) = tokio::sync::watch::channel(false);
+        let (v4, v6) = family_paths(&url, &dns, 2000, &connector, &cancel, false).await;
+        assert_eq!(v4["ok"], true, "{v4}");
+        assert_eq!(v4["observation"]["address"], "127.0.0.2");
+        assert_eq!(v4["observation"]["status_code"], 403);
+        assert_eq!(v6["reason"], "NoAddress");
+        primary.await??;
+        backup.await??;
+        Ok(())
+    }
 
     #[test]
     fn doh_compares_only_records_of_the_requested_family() {

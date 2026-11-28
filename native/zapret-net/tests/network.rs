@@ -58,6 +58,26 @@ fn head_has_no_response_body_and_preserves_http_status() {
     assert!(server.join().unwrap().starts_with(b"HEAD / HTTP/1.1"));
 }
 #[test]
+#[cfg(windows)]
+fn release_download_via_windows_follows_a_cdn_redirect_and_rechecks_the_size_limit() {
+    for limit in [3, 2] {
+        let (cdn, content) = fixture(b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nzip");
+        let (entry, redirect) = fixture(format!(
+            "HTTP/1.1 302 Found\r\nLocation: {cdn}\r\nContent-Length: 0\r\n\r\n"
+        ));
+        let result =
+            zapret_net::fetch_release_via_windows(&entry, limit, 2000, "application/octet-stream");
+        if limit == 3 {
+            assert_eq!(result.unwrap(), b"zip");
+        } else {
+            assert!(result.is_err());
+        }
+        assert!(content.join().unwrap().starts_with(b"GET / "));
+        assert!(redirect.join().unwrap().starts_with(b"GET / "));
+    }
+}
+
+#[test]
 fn fetch_rejects_truncated_response() {
     let (url, server) = fixture(b"HTTP/1.1 200 OK\r\nContent-Length: 9\r\n\r\nabc");
     assert!(zapret_net::fetch(&url, 128, 1000).is_err());
@@ -219,6 +239,42 @@ fn stun_rejects_mismatched_transaction_before_validating_response() {
     server.join().unwrap();
 }
 #[test]
+fn stun_uses_the_other_localhost_family_when_the_first_is_silent() {
+    use std::net::{ToSocketAddrs, UdpSocket};
+    let peers = zapret_core::connection_addresses(("localhost", 0).to_socket_addrs().unwrap(), 2);
+    let [first, second] = peers.as_slice() else {
+        return;
+    };
+    let silent = UdpSocket::bind(first).unwrap();
+    let port = silent.local_addr().unwrap().port();
+    let socket = UdpSocket::bind((second.ip(), port)).unwrap();
+    socket
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .unwrap();
+    let server = thread::spawn(move || {
+        let mut packet = [0; 20];
+        let (size, peer) = socket.recv_from(&mut packet).unwrap();
+        assert_eq!(size, packet.len());
+        let mut reply = packet.to_vec();
+        reply[..4].copy_from_slice(&[1, 1, 0, 12]);
+        reply.extend_from_slice(&[0, 32, 0, 8, 0, 1, 0x21, 0x13, 0x5e, 0x12, 0xa4, 0x43]);
+        socket.send_to(&reply, peer).unwrap();
+    });
+    let result = zapret_net::diagnostics(
+        std::path::Path::new("."),
+        "stun",
+        &json!({"host":"localhost","port":port,"attempts":1,"timeout_ms":900}),
+    )
+    .unwrap();
+    let rows = result["control"].as_array().unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["response_validated"], true, "{}", rows[0]);
+    assert_eq!(rows[0]["address"], second.ip().to_string());
+    assert_eq!(result["assessment"]["traffic"], "CaptureUnknown");
+    server.join().unwrap();
+}
+
+#[test]
 fn native_web_head_reports_http_status_separately_from_protocol_confirmation() {
     let (url, server) = fixture(b"HTTP/1.1 403 Denied\r\nContent-Length: 100\r\n\r\n");
     let result = zapret_net::diagnostics(
@@ -240,6 +296,36 @@ fn unavailable_browser_is_explicit_evidence() {
         assert_eq!(row["protocol_confirmed"], false);
         assert_eq!(row["complete"], false);
     }
+}
+
+#[test]
+fn web_http1_reaches_the_other_localhost_family_and_reports_its_status() {
+    use std::net::ToSocketAddrs;
+    let peers = zapret_core::connection_addresses(("localhost", 0).to_socket_addrs().unwrap(), 2);
+    let [_, alternate] = peers.as_slice() else {
+        return;
+    };
+    let listener = TcpListener::bind(alternate).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = thread::spawn(move || {
+        let (mut client, _) = listener.accept().unwrap();
+        let mut request = [0; 2048];
+        let count = client.read(&mut request).unwrap();
+        assert!(request[..count].starts_with(b"HEAD / "));
+        client
+            .write_all(b"HTTP/1.1 204 No Content\r\n\r\n")
+            .unwrap();
+    });
+    let report = zapret_net::diagnostics(
+        std::path::Path::new("."),
+        "webcheck",
+        &json!({"url":format!("http://localhost:{port}/"),"modes":["Http1"],
+                "timeout_ms":2000,"browser_path":"","curl_path":""}),
+    )
+    .unwrap();
+    assert_eq!(report["rows"][0]["status_code"], 204);
+    assert_eq!(report["rows"][0]["protocol_confirmed"], true);
+    server.join().unwrap();
 }
 #[test]
 #[cfg(windows)]

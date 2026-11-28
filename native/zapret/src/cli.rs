@@ -87,6 +87,8 @@ pub enum Action {
     },
     ConnectionCheck(NetworkArgs),
     Webcheck(NetworkArgs),
+    /// Play a public YouTube video and measure presented frames.
+    YoutubeCheck,
     Voicecheck(NetworkArgs),
     Latency(NetworkArgs),
     /// Полный подбор в режиме отчёта с сохранением основной стратегии.

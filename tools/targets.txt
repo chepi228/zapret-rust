@@ -1,6 +1,7 @@
 # Адреса сервисов для автоподбора (пункт 3). Формат: Группа.Имя = https://адрес
 # Для адреса без дополнительных полей достаточно HTTP-ответа с завершённой передачей или достигнутым лимитом.
 # Замерзание 16-20 КБ проверяется отдельно по набору хостингов из tools\dpi-suite.json (как в тесте Flowseal).
+# JWKS загружает открытые ключи HTTPS-сервиса и проверяет наличие ключа подписи.
 Discord.main      = https://discord.com/
 Discord.gateway   = https://gateway.discord.gg/
 Discord.cdn       = https://cdn.discordapp.com/
@@ -18,7 +19,7 @@ NBA2K.sso         = https://sso.api.2kcoretech.online/
 NBA2K.cloud       = https://clouddata.api.2kcoretech.online/
 EAC.download      = https://download-alt.easyanticheat.net/
 EAC.modules       = https://modules-cdn.eac-prod.on.epicgames.com/
-EAC.epic_api      = https://api.epicgames.dev/
+EAC.epic_api      JWKS 200 32..65536 = https://api.epicgames.dev/epic/oauth/v2/.well-known/jwks.json
 # Незаблокированные сайты на разных CDN: обход не должен им вредить. Для каждой стратегии сравниваются
 # с прогоном без обхода: перестал открываться или TLS медленнее больше чем на 0,5 с - это вред.
 # bing/akamai/adobe/sony - те серверы Akamai, которым ALT11/ALT12 с ложным началом (seqovl) ломают TLS.
@@ -50,6 +51,7 @@ YouTube.thumbnail    GET 200 4096..65536   = https://i.ytimg.com/vi/jNQXAC9IVRw/
 YouTube.connectivity GET 204 0             = https://connectivitycheck.gstatic.com/generate_204
 SoundCloud.oembed    GET 200 128..16384    = https://soundcloud.com/oembed?format=json&url=https%3A%2F%2Fsoundcloud.com%2Fforss%2Fflickermood
 NBA2K.store_image    GET 200 91315 2c073e9176cd934933b5914534017ffe89607b91a4966fea392291026b0eb7f5 = https://nba-cdn3.2ksports.com/2k27/store/image/35/swags_hoodies_512x512_8_17.jHvTERq0BSA_g4D-lgVoiA
+NBA2K.apparel_image  GET 200 305259 43dbb8a826b34b4c8952c6c8176d88e6c8b56d8534015368e0f49c943bd7fc9d = https://nba-cdn3.2ksports.com/2k27/store/image/25/season3baddiecroptophoodie_logo_1024x1024_11_19.v9CQ-37VpnxV5WcV7FRpuw
 CDN.github_raw       GET 200 13 03ba204e50d126e4674c005e04d82e84c21366780af1f43bd54a37816b6ab340 = https://raw.githubusercontent.com/octocat/Hello-World/7fd1a60b01f91b314f59955a4e4d4e80d8edf11d/README
 CDN.cloudflare       GET 200 32768         = https://speed.cloudflare.com/__down?bytes=32768
 CDN.cloudflare_text  GET 200 256..16384    = https://www.cloudflare.com/robots.txt

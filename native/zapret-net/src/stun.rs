@@ -1,5 +1,5 @@
 use crate::diagnostic as d;
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::{
@@ -322,30 +322,37 @@ pub(crate) fn run(root: &Path, kind: &str, args: &Value) -> Result<Value> {
     assess_voice(&json!({}), &json!([]), audio, "Unknown")?;
     let before = d::context(root);
     let started = d::now();
-    let (dns, controls) = crate::runtime(async {
+    let (dns, controls, cancelled) = crate::runtime(async {
         let cancel = d::cancellation();
         let dns = d::resolve(&host, 2000).await;
         let addresses = d::select_addresses(&dns.addresses);
         let mut rows = Vec::new();
-        if let Some(&address) = addresses.first() {
-            for attempt in 1..=attempts {
-                rows.push(
-                    one(
-                        SocketAddr::new(address, port),
-                        attempt,
-                        timeout_ms,
-                        cancel.clone(),
-                    )
-                    .await,
-                );
+        for attempt in 1..=attempts {
+            let probe = |address, remaining| {
+                one(
+                    SocketAddr::new(address, port),
+                    attempt,
+                    remaining,
+                    cancel.clone(),
+                )
+            };
+            let Some(row) = d::first_confirmed(&addresses, timeout_ms, probe, |row| {
+                row.response_validated || row.reason == "Cancelled"
+            })
+            .await
+            else {
+                break;
+            };
+            let cancelled = row.reason == "Cancelled";
+            rows.push(row);
+            if cancelled {
+                break;
             }
         }
-        Ok((dns, rows))
+        let cancelled = *cancel.borrow() || rows.iter().any(|row| row.reason == "Cancelled");
+        Ok((dns, rows, cancelled))
     })?;
     let control = serde_json::to_value(controls)?;
-    let cancelled = control
-        .as_array()
-        .is_some_and(|v| v.iter().any(|r| r["reason"] == "Cancelled"));
     let capture = if cancelled {
         json!({"status":"NotStarted","reason":"Cancelled","truncated":false,"flows":[]})
     } else if kind != "voice" || args["control_only"] == true {
@@ -356,7 +363,7 @@ pub(crate) fn run(root: &Path, kind: &str, args: &Value) -> Result<Value> {
     let after = d::context(root);
     let state = d::context_state(&before, &after);
     let assessment = assess_voice(&capture, &control, audio, state)?;
-    let result = json!({"schema":1,"kind":"DiscordVoice","started_utc_ms":started,"finished_utc_ms":d::now(),"audio_observation":audio,"audio_reported_utc_ms":if audio=="Unknown"{None}else{Some(d::now())},"control_dns":dns,"control":control,"capture":capture,"assessment":assessment,"context_before":before,"context_after":after,"connection_state":state,"completion":if control.as_array().context("STUN rows")?.iter().any(|r|r["reason"]=="Cancelled"){"Interrupted"}else{"Completed"}});
+    let result = json!({"schema":1,"kind":"DiscordVoice","started_utc_ms":started,"finished_utc_ms":d::now(),"audio_observation":audio,"audio_reported_utc_ms":if audio=="Unknown"{None}else{Some(d::now())},"control_dns":dns,"control":control,"capture":capture,"assessment":assessment,"context_before":before,"context_after":after,"connection_state":state,"completion":if cancelled{"Interrupted"}else{"Completed"}});
     Ok(result)
 }
 #[cfg(test)]

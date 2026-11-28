@@ -21,7 +21,11 @@ use anyhow::{Context, Result, bail};
 pub use diagnostic::diagnostics;
 pub use http::{download, fetch, fetch_with_accept};
 pub use latency::{LatencyOutcome, LatencySample, LatencyStore, LatencyStream, LatencySummary};
-pub use protocol::{Job, MAX_BODY_LIMIT, Observation, ProbeMode, Stage, TcpAttempt, Termination};
+pub use probe::validate_jwks;
+pub use protocol::{
+    EPIC_JWKS_URL, JWKS_MAX_BYTES, Job, MAX_BODY_LIMIT, Observation, ProbeMode, Stage, TcpAttempt,
+    Termination,
+};
 use std::{
     collections::VecDeque,
     io::{Read, Write},
@@ -32,7 +36,7 @@ pub use stun::assess_voice;
 use tokio::{sync::watch, task::JoinSet, time::Instant};
 pub use tracker::enrich_tracker;
 #[cfg(windows)]
-pub use winhttp::fetch_via_windows;
+pub use winhttp::{fetch_release_via_windows, fetch_via_windows};
 
 #[derive(Clone, Debug)]
 pub struct BatchOptions {

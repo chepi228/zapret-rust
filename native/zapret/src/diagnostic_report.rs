@@ -43,10 +43,45 @@ fn observed(value: &Value) -> &'static str {
     }
 }
 
+fn playback_result(row: &Value) -> String {
+    let sample = &row["playback"];
+    let verdict = match row["reason"].as_str() {
+        Some("PlaybackObserved") if row["state"] == "OK" && row["complete"] == true => {
+            "видео воспроизводится"
+        }
+        Some("InteractionRequired") => "страница требует действия пользователя",
+        Some("PlayerUnavailable") => "YouTube сообщил, что ролик недоступен",
+        Some("UnexpectedVideo") => "браузер открыл другую страницу или другой ролик",
+        Some("MediaError") => "браузер сообщил об ошибке воспроизведения",
+        Some("NoVideo") => "браузер не обнаружил проигрыватель с тестовым роликом",
+        Some("Unavailable") => "браузер для проверки не найден",
+        Some("Timeout") => "истекло время ожидания страницы или проигрывателя",
+        Some("HttpStatus") => "страница вернула ошибку HTTP",
+        _ => "воспроизведение не подтверждено",
+    };
+    let mut result = verdict.to_owned();
+    if let (Some(ms), Some(frames), Some(stalls)) = (
+        sample["played_ms"].as_u64(),
+        sample["presented_frames"].as_u64(),
+        sample["stalls"].as_u64(),
+    ) && (ms > 0 || frames > 0 || stalls > 0)
+    {
+        result.push_str(&format!(
+            " · {:.1} с · показано кадров {frames} · пауз от 1 с {stalls}",
+            ms as f64 / 1000.0
+        ));
+    }
+    if row["cleanup_complete"] == false {
+        result.push_str(" · временный профиль браузера не удалось полностью закрыть");
+    }
+    result
+}
+
 pub fn render(kind: &str, value: &Value) -> String {
     let title = match kind {
         "connection" => "DNS, TCP, TLS и HTTP",
         "web" => "Браузер и HTTP",
+        "youtube" => "Воспроизведение YouTube",
         "voice" => "Discord Voice",
         "latency" => "Задержка подключения",
         "provider" => "Провайдер",
@@ -74,9 +109,13 @@ pub fn render(kind: &str, value: &Value) -> String {
             ));
         }
     }
-    if kind == "web" {
+    if matches!(kind, "web" | "youtube") {
         if let Some(rows) = value["rows"].as_array() {
             for row in rows {
+                if row["mode"] == "BrowserPlayback" {
+                    lines.push(format!("{} · {}", target_label(row), playback_result(row)));
+                    continue;
+                }
                 let mode = match row["mode"].as_str() {
                     Some("Http1") => "HTTP/1.1",
                     Some("Http2") => "HTTP/2",
@@ -215,7 +254,15 @@ fn restore(path: &Path, bytes: Option<Vec<u8>>) -> Result<()> {
 
 pub fn publish(root: &Path, kind: &str, mut value: Value) -> Result<Value> {
     ensure!(
-        ["connection", "web", "voice", "provider", "latency"].contains(&kind),
+        [
+            "connection",
+            "web",
+            "youtube",
+            "voice",
+            "provider",
+            "latency"
+        ]
+        .contains(&kind),
         "Неизвестный вид отчёта"
     );
     ensure!(value.is_object(), "Отчёт должен быть объектом");
@@ -295,6 +342,27 @@ fn publication_lease(root: &Path, kind: &str) -> Result<File> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn video_report_distinguishes_measured_frames_from_a_loaded_page() {
+        let mut row = json!({"mode":"BrowserPlayback","url":"https://www.youtube.com/watch",
+            "state":"OK","reason":"PlaybackObserved","complete":true,"cleanup_complete":true,
+            "playback":{"played_ms":5230,"presented_frames":42,"stalls":1}});
+        let confirmed = render("youtube", &json!({"rows":[row]}));
+        assert!(
+            confirmed.contains("5.2 с")
+                && confirmed.contains("кадров 42")
+                && confirmed.contains("пауз от 1 с 1")
+        );
+        row["state"] = json!("UNKNOWN");
+        row["reason"] = json!("InteractionRequired");
+        row["complete"] = json!(false);
+        row["playback"] = Value::Null;
+        let blocked = render("youtube", &json!({"rows":[row]}));
+        assert!(
+            blocked.contains("действия пользователя") && !blocked.contains("видео воспроизводится")
+        );
+    }
 
     #[test]
     fn failed_or_unavailable_diagnostics_are_readable_without_positive_inference() {

@@ -72,10 +72,12 @@ pub async fn run_probe(
     let request_deadline = start + Duration::from_millis(target.job.timeout_ms);
     let provided = Arc::new(AtomicUsize::new(0));
     let cutoff = deadline.min(request_deadline);
+    let quic_tls_error =
+        (target.job.mode == ProbeMode::Http3Head).then(|| crate::http3::PeerTlsError::new(None));
     let outcome = tokio::select! {
         biased;
         _ = cancellation.changed() => Termination::Cancelled,
-        result = timeout_at(cutoff, execute(&target, &connector, &mut row, provided.clone(), post_body.as_deref(), ca_file)) => {
+        result = timeout_at(cutoff, execute(&target, &connector, &mut row, provided.clone(), post_body.as_deref(), ca_file, quic_tls_error.clone())) => {
             match result {
                 Ok(Ok(termination)) => termination,
                 Ok(Err((termination, error))) => {
@@ -83,6 +85,10 @@ pub async fn run_probe(
                     termination
                 }
                 Err(_) if deadline <= request_deadline => Termination::Deadline,
+                Err(_) if let Some(error) = quic_tls_error.and_then(|e| e.borrow().clone()) => {
+                    row.error = Some(format!("QUIC/HTTP3: {error}"));
+                    Termination::TlsFailure
+                }
                 Err(_) => Termination::Timeout,
             }
         }
@@ -103,6 +109,7 @@ async fn execute(
     provided: Arc<AtomicUsize>,
     post_body: Option<&[u8]>,
     ca_file: Option<PathBuf>,
+    quic_tls_error: Option<crate::http3::PeerTlsError>,
 ) -> Result<Termination, ProbeError> {
     let media_target;
     let target = if target.job.mode == ProbeMode::RobloxIcon {
@@ -153,18 +160,19 @@ async fn execute(
         ));
     }
 
-    if target.job.mode == ProbeMode::Http3Head {
+    if let Some(peer_tls_error) = quic_tls_error {
         row.stage = Stage::Tls;
-        let response = crate::http3::probe_head(target.url.clone(), addresses, ca_file)
-            .await
-            .map_err(|error| {
-                let cause = match crate::http3::failure(&error) {
-                    "Timeout" => Termination::Timeout,
-                    "TlsFailure" => Termination::TlsFailure,
-                    _ => Termination::HttpFailure,
-                };
-                (cause, format!("{error:#}"))
-            })?;
+        let response =
+            crate::http3::probe_head(target.url.clone(), addresses, ca_file, peer_tls_error)
+                .await
+                .map_err(|error| {
+                    let cause = match crate::http3::failure(&error) {
+                        "Timeout" => Termination::Timeout,
+                        "TlsFailure" => Termination::TlsFailure,
+                        _ => Termination::HttpFailure,
+                    };
+                    (cause, format!("{error:#}"))
+                })?;
         row.remote_address = Some(response.remote.to_string());
         row.tls_ms = Some(response.handshake_ms);
         row.headers_ms = Some(response.headers_ms);
@@ -181,6 +189,7 @@ async fn execute(
             &mut row.tcp_attempts,
             &host,
             connector,
+            None,
             |connected| {
                 row.stage = if connected.is_some() {
                     Stage::Tls
@@ -258,7 +267,10 @@ where
         .header("connection", "close")
         .header("accept", "*/*")
         .header("user-agent", "zapret-rust-probe/0.1.0");
-    let full = matches!(target.job.mode, ProbeMode::FullGet | ProbeMode::RobloxIcon);
+    let full = matches!(
+        target.job.mode,
+        ProbeMode::FullGet | ProbeMode::Jwks | ProbeMode::RobloxIcon
+    );
     let request = if full {
         request.header("accept-encoding", "identity")
     } else {
@@ -279,10 +291,17 @@ where
         .map_err(|error| (Termination::HttpFailure, error.to_string()))?;
     row.headers_ms = Some(elapsed_ms(start));
     row.status_code = Some(response.status().as_u16());
+    if target.job.mode == ProbeMode::Jwks && response.status().as_u16() != 200 {
+        return Err((
+            Termination::HttpFailure,
+            format!("JWKS HTTP status {}", response.status()),
+        ));
+    }
     row.stage = Stage::Body;
     let mut body = response.into_body();
     let mut digest = full.then(Sha256::new);
-    let mut image = (target.job.mode == ProbeMode::RobloxIcon).then(Vec::new);
+    let mut payload =
+        matches!(target.job.mode, ProbeMode::RobloxIcon | ProbeMode::Jwks).then(Vec::new);
     while let Some(frame) = body.frame().await {
         let frame = frame.map_err(|error| (Termination::TransferError, error.to_string()))?;
         if let Some(data) = frame.data_ref() {
@@ -296,19 +315,42 @@ where
             if let Some(hash) = &mut digest {
                 hash.update(data);
             }
-            if let Some(bytes) = &mut image {
+            if let Some(bytes) = &mut payload {
                 bytes.extend_from_slice(data);
             }
         }
     }
-    if let Some(bytes) = image {
-        crate::roblox::validate(&bytes)
-            .map_err(|e| (Termination::TransferError, format!("Roblox PNG: {e:#}")))?;
+    if let Some(bytes) = payload {
+        if target.job.mode == ProbeMode::Jwks {
+            validate_jwks(&bytes).map_err(|e| (Termination::TransferError, e.to_string()))?;
+        } else {
+            crate::roblox::validate(&bytes)
+                .map_err(|e| (Termination::TransferError, format!("Roblox PNG: {e:#}")))?;
+        }
     }
     row.body_sha256 = digest.map(|hash| format!("{:x}", hash.finalize()));
     row.body_complete = true;
     row.stage = Stage::Complete;
     Ok(Termination::Complete)
+}
+
+/// Check the published key set without pinning key IDs or key material across rotations.
+pub fn validate_jwks(bytes: &[u8]) -> anyhow::Result<()> {
+    let data: serde_json::Value = serde_json::from_slice(bytes)?;
+    let usable = data["keys"].as_array().is_some_and(|keys| {
+        keys.iter().any(|key| {
+            let present = |field: &str| key[field].as_str().is_some_and(|s| !s.is_empty());
+            key.get("use").is_none_or(|usage| usage == "sig")
+                && match key["kty"].as_str() {
+                    Some("RSA") => present("n") && present("e"),
+                    Some("EC") => present("crv") && present("x") && present("y"),
+                    Some("OKP") => present("crv") && present("x"),
+                    _ => false,
+                }
+        })
+    });
+    anyhow::ensure!(usable, "JWKS contains no public signing key");
+    Ok(())
 }
 
 // Count what Hyper actually asks this request body to provide, including interrupted sends.
@@ -354,6 +396,68 @@ mod tests {
         .pop()
         .unwrap();
         Observation::queued(&target, Termination::Cancelled)
+    }
+
+    #[test]
+    fn login_check_accepts_rotated_public_keys_and_rejects_error_pages() {
+        for body in [
+            r#"{"keys":[{"kid":"new","kty":"RSA","n":"abc","e":"AQAB"}]}"#,
+            r#"{"keys":[{"use":"enc","kty":"oct"},{"use":"sig","kty":"EC","crv":"P-256","x":"a","y":"b"}]}"#,
+        ] {
+            assert!(validate_jwks(body.as_bytes()).is_ok());
+        }
+        for body in [
+            "<html>sign in</html>",
+            r#"{"error":"temporarily unavailable"}"#,
+            r#"{"keys":[]}"#,
+            r#"{"keys":[{"kty":"RSA","e":"AQAB"}]}"#,
+            r#"{"keys":[{"kty":"RSA","use":"enc","n":"abc","e":"AQAB"}]}"#,
+        ] {
+            assert!(validate_jwks(body.as_bytes()).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn jwks_http_check_cannot_pass_on_a_404_html_or_cut_off_reply() {
+        let keys = r#"{"keys":[{"kty":"RSA","n":"abc","e":"AQAB"}]}"#;
+        for (status, body, extra, expected) in [
+            (200, keys, 0, Termination::Complete),
+            (404, keys, 0, Termination::HttpFailure),
+            (
+                200,
+                "<html>temporarily unavailable</html>",
+                0,
+                Termination::TransferError,
+            ),
+            (200, keys, 4, Termination::TransferError),
+        ] {
+            let target = crate::protocol::read_jobs(br#"{"version":1,"id":"epic","url":"https://example.test/keys","method":"GET","mode":"jwks"}"#.as_slice()).unwrap().pop().unwrap();
+            let mut row = Observation::queued(&target, Termination::Cancelled);
+            let (client, mut server) = tokio::io::duplex(4096);
+            let response = format!(
+                "HTTP/1.1 {status} Test\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len() + extra
+            );
+            let peer = tokio::spawn(async move {
+                let mut request = vec![];
+                while !request.ends_with(b"\r\n\r\n") {
+                    request.push(server.read_u8().await.unwrap());
+                }
+                assert!(request.starts_with(b"GET /keys HTTP/1.1"));
+                server.write_all(response.as_bytes()).await.unwrap();
+            });
+            let result = exchange(
+                client,
+                &target,
+                &mut row,
+                Arc::new(AtomicUsize::new(0)),
+                None,
+            )
+            .await;
+            assert_eq!(result.unwrap_or_else(|(kind, _)| kind), expected);
+            assert_eq!(row.body_complete, expected == Termination::Complete);
+            peer.await.unwrap();
+        }
     }
 
     struct ActiveAttempt(Arc<AtomicUsize>);

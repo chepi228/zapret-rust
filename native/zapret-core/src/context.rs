@@ -34,7 +34,7 @@ impl InputHashes<'_> {
     }
 }
 
-pub const PACKAGE_VERSION: &str = "1.3";
+pub const PACKAGE_VERSION: &str = "1.4";
 // Frozen PowerShell signatures retain their historical release identity.
 const LEGACY_PACKAGE_VERSION: &str = "2.2";
 const SCORE_CODE: [&str; 20] = [

@@ -16,6 +16,7 @@ use std::{
     time::{Duration, Instant},
 };
 use windows_sys::Win32::NetworkManagement::Dns::*;
+use zapret_core::{EPIC_API_HOST, EPIC_JWKS_URL, JWKS_MAX_BYTES, NBA_CDN_HOST, NBA_STORE_IMAGE};
 
 const BEGIN: &str = "# zapret: серверы игр - начало (меню: Проверка обходов)";
 const END: &str = "# zapret: серверы игр - конец";
@@ -32,6 +33,8 @@ struct Check {
     peer_address: Option<String>,
     validation_host: String,
     certificate_validated: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    file_verified: Option<bool>,
     supported: bool,
     reason: String,
 }
@@ -55,6 +58,15 @@ fn public_v4(text: &str) -> bool {
 }
 fn hosts(root: &Path) -> Result<Vec<String>> {
     let mut names = BTreeSet::from(["api.quago.io".to_owned()]);
+    let settings = zapret_core::read_settings(root)?;
+    if settings.get("game").eq_ignore_ascii_case("selected")
+        && zapret_core::selected_game_names(settings.get("gameapps"))?
+            .iter()
+            .any(|name| name == "nba2k27")
+    {
+        names.insert(NBA_CDN_HOST.to_owned());
+        names.insert(EPIC_API_HOST.to_owned());
+    }
     let path = root.join("runtime/gamepins-user.txt");
     if path.exists() {
         let bytes = read_limited(&path, 32768)?;
@@ -72,9 +84,28 @@ fn hosts(root: &Path) -> Result<Vec<String>> {
     Ok(names.into_iter().collect())
 }
 fn targets(root: &Path, old: &[u8]) -> Result<Vec<Target>> {
-    let entries = crate::hosts::entries(std::str::from_utf8(old)?);
+    let text = std::str::from_utf8(old)?.trim_start_matches('\u{feff}');
+    let entries = crate::hosts::entries(text);
+    // Epic is shared with other games. Leave external hosts overrides under their owner's control.
+    let mut inside = false;
+    let manual_epic = text.lines().any(|line| {
+        match line {
+            BEGIN => inside = true,
+            END => inside = false,
+            _ if !inside => {
+                let mut parts = line.split('#').next().unwrap_or("").split_whitespace();
+                return parts
+                    .next()
+                    .is_some_and(|ip| ip.parse::<std::net::IpAddr>().is_ok())
+                    && parts.any(|alias| alias.eq_ignore_ascii_case(EPIC_API_HOST));
+            }
+            _ => {}
+        }
+        false
+    });
     hosts(root)?
         .into_iter()
+        .filter(|host| host != EPIC_API_HOST || !manual_epic)
         .map(|host| {
             let pinned = entries
                 .iter()
@@ -154,8 +185,20 @@ fn dns(host: &str) -> Result<Vec<String>> {
     ensure!(addresses.len() <= 16, "Game pin DNS address limit exceeded");
     Ok(addresses.into_iter().collect())
 }
+fn request(host: &str) -> (String, &'static str, usize) {
+    match host {
+        NBA_CDN_HOST => (
+            NBA_STORE_IMAGE.url.to_owned(),
+            "full_get",
+            NBA_STORE_IMAGE.bytes + 1,
+        ),
+        EPIC_API_HOST => (EPIC_JWKS_URL.to_owned(), "jwks", JWKS_MAX_BYTES + 1),
+        _ => (format!("https://{host}/"), "range", 1),
+    }
+}
 fn checks_from_json(bytes: &[u8], host: &str, addresses: &BTreeSet<String>) -> Result<Vec<Check>> {
     let expected = addresses.iter().collect::<Vec<_>>();
+    let (url, mode, limit) = request(host);
     let mut seen = BTreeSet::new();
     let mut checks = Vec::new();
     for line in std::str::from_utf8(bytes)?
@@ -174,7 +217,7 @@ fn checks_from_json(bytes: &[u8], host: &str, addresses: &BTreeSet<String>) -> R
         let address = expected[id];
         ensure!(
             row["version"] == 1
-                && row["url"] == format!("https://{host}/")
+                && row["url"] == url
                 && row["trust_source"] == "System"
                 && row["tls_backend"] == "Schannel"
                 && row["dns_source"] == "connect_ip override",
@@ -202,11 +245,40 @@ fn checks_from_json(bytes: &[u8], host: &str, addresses: &BTreeSet<String>) -> R
                 "Game pin worker did not prove a completed TLS handshake"
             );
         }
+        let file_verified = if mode != "range" {
+            ensure!(
+                row["mode"] == mode && row["body_limit"] == limit,
+                "Missing game service download observation"
+            );
+            let content_matches = if host == NBA_CDN_HOST {
+                NBA_STORE_IMAGE.matches(
+                    row["status_code"].as_u64(),
+                    row["body_bytes"].as_u64(),
+                    row["body_sha256"].as_str(),
+                )
+            } else {
+                // A completed jwks observation proves that the worker parsed a usable key set.
+                row["status_code"] == 200
+                    && row["body_bytes"]
+                        .as_u64()
+                        .is_some_and(|n| (1..=JWKS_MAX_BYTES as u64).contains(&n))
+            };
+            Some(
+                validated
+                    && row["termination"] == "Complete"
+                    && row["body_complete"] == true
+                    && row["target_reached"] == false
+                    && content_matches,
+            )
+        } else {
+            None
+        };
         checks.push(Check {
             address: address.clone(),
             peer_address: peer.map(|peer| peer.ip().to_string()),
             validation_host: host.into(),
             certificate_validated: validated,
+            file_verified,
             supported: true,
             reason: row["termination"]
                 .as_str()
@@ -220,17 +292,19 @@ fn checks_from_json(bytes: &[u8], host: &str, addresses: &BTreeSet<String>) -> R
     );
     Ok(checks)
 }
-fn tls(root: &Path, host: &str, addresses: &BTreeSet<String>) -> Result<Vec<Check>> {
+fn probe_addresses(root: &Path, host: &str, addresses: &BTreeSet<String>) -> Result<Vec<Check>> {
     if addresses.is_empty() {
         return Ok(Vec::new());
     }
     let mut input = Vec::new();
+    let (url, mode, limit) = request(host);
+    let method = if mode == "range" { "HEAD" } else { "GET" };
     for (id, address) in addresses.iter().enumerate() {
         serde_json::to_writer(
             &mut input,
             &json!({"version":1,"id":id.to_string(),
-            "url":format!("https://{host}/"),"connect_ip":address,"timeout_ms":4000,
-            "body_limit":1,"method":"HEAD","post_bytes":0}),
+            "url":url,"connect_ip":address,"timeout_ms":4000,"mode":mode,
+            "body_limit":limit,"method":method,"post_bytes":0}),
         )?;
         input.push(b'\n');
     }
@@ -272,7 +346,20 @@ pub(crate) fn probe(root: &Path, args: &Value) -> Result<Value> {
             .cloned()
             .collect::<BTreeSet<_>>();
         ensure!(addresses.len() <= 16, "Game pin candidate limit exceeded");
-        let checks = tls(root, &target.host, &addresses)?;
+        let mut checks = probe_addresses(root, &target.host, &addresses)?;
+        if target.host == EPIC_API_HOST {
+            let failed = checks
+                .iter()
+                .filter(|check| check.file_verified == Some(false))
+                .map(|check| check.address.clone())
+                .collect();
+            let retries = probe_addresses(root, &target.host, &failed)?;
+            for check in &mut checks {
+                if let Some(retry) = retries.iter().find(|r| r.address == check.address) {
+                    *check = retry.clone();
+                }
+            }
+        }
         rows.push(Row {
             host: target.host,
             dns_known,
@@ -318,9 +405,11 @@ fn plan(targets: &[Target], evidence: &Evidence) -> Result<BTreeMap<String, Vec<
         );
         let mut checked = BTreeSet::new();
         let mut good = BTreeSet::new();
+        let require_file = matches!(target.host.as_str(), NBA_CDN_HOST | EPIC_API_HOST);
         for check in &row.checks {
             ensure!(
                 check.supported
+                    && check.file_verified.is_some() == require_file
                     && candidates.contains(&check.address)
                     && checked.insert(check.address.clone())
                     && check.validation_host == target.host,
@@ -332,11 +421,32 @@ fn plan(targets: &[Target], evidence: &Evidence) -> Result<BTreeMap<String, Vec<
                         && public_v4(&check.address),
                     "Game pin TLS peer did not match the proposed address"
                 );
-                good.insert(check.address.clone());
+                if check.file_verified != Some(false) {
+                    good.insert(check.address.clone());
+                }
             }
         }
+        if target.host == EPIC_API_HOST
+            && ((!row.dns.is_empty() && row.dns.iter().all(|ip| good.contains(ip)))
+                || (good.is_empty() && target.pinned.is_empty()))
+        {
+            // Healthy DNS needs no pin. With no verified alternative, leave unpinned DNS alone.
+            continue;
+        }
+        // A retired test file or a temporary service outage cannot validate a replacement.
+        ensure!(
+            !require_file || !good.is_empty(),
+            "Ни один адрес {} не прошёл проверку содержимого. Записи hosts сохранены.",
+            target.host
+        );
         if !good.is_empty() {
-            pins.insert(target.host.clone(), good.into_iter().take(6).collect());
+            let mut addresses: Vec<_> = good.into_iter().collect();
+            if require_file && addresses.len() > 6 {
+                // Make room for verified addresses from the current DNS rotation.
+                addresses.sort_by_key(|ip| !row.dns.contains(ip));
+            }
+            addresses.truncate(6);
+            pins.insert(target.host.clone(), addresses);
         }
     }
     Ok(pins)
@@ -569,6 +679,7 @@ mod tests {
                         peer_address: Some((*address).into()),
                         validation_host: host.into(),
                         certificate_validated: true,
+                        file_verified: None,
                         supported: true,
                         reason: "fixture".into(),
                     })
@@ -576,6 +687,112 @@ mod tests {
             }],
         }
     }
+    #[test]
+    fn nba_pin_requires_the_full_store_file_from_the_selected_address() {
+        let addresses = BTreeSet::from(["8.8.8.8".to_owned()]);
+        let valid = json!({"id":"0","version":1,"url":NBA_STORE_IMAGE.url,
+            "mode":"full_get","body_limit":NBA_STORE_IMAGE.bytes+1,
+            "trust_source":"System","tls_backend":"Schannel","dns_source":"connect_ip override",
+            "certificate_validated":true,"remote_address":"8.8.8.8:443","tls_ms":12.0,
+            "termination":"Complete","status_code":200,"body_bytes":NBA_STORE_IMAGE.bytes,
+            "body_sha256":NBA_STORE_IMAGE.sha256,"body_complete":true,"target_reached":false});
+        let check = |row: &Value| {
+            checks_from_json(&serde_json::to_vec(row).unwrap(), NBA_CDN_HOST, &addresses)
+                .map(|checks| checks[0].file_verified)
+        };
+        assert_eq!(check(&valid).unwrap(), Some(true));
+        for (key, value) in [
+            ("status_code", json!(403)),
+            ("body_bytes", json!(16384)),
+            ("body_sha256", json!("0".repeat(64))),
+            ("body_complete", json!(false)),
+            ("target_reached", json!(true)),
+            ("termination", json!("Timeout")),
+            ("certificate_validated", json!(false)),
+        ] {
+            let mut bad = valid.clone();
+            bad[key] = value;
+            assert_eq!(check(&bad).unwrap(), Some(false), "{key}");
+        }
+        for (key, value) in [
+            ("url", json!(format!("https://{NBA_CDN_HOST}/"))),
+            ("mode", json!("range")),
+            ("remote_address", json!("1.1.1.1:443")),
+        ] {
+            let mut bad = valid.clone();
+            bad[key] = value;
+            assert!(check(&bad).is_err(), "{key}");
+        }
+    }
+
+    #[test]
+    fn nba_rotation_keeps_verified_dns_and_defers_writes_when_the_file_is_unavailable() {
+        let old_ips = [
+            "1.1.1.1", "1.1.1.2", "1.1.1.3", "1.1.1.4", "1.1.1.5", "1.1.1.6",
+        ];
+        let targets = [Target {
+            host: NBA_CDN_HOST.into(),
+            pinned: old_ips.iter().map(|s| (*s).to_owned()).collect(),
+        }];
+        let mut all_ips = old_ips.to_vec();
+        all_ips.push("8.8.8.8");
+        let mut report = evidence(NBA_CDN_HOST, &all_ips);
+        report.rows[0].dns = vec!["8.8.8.8".into()];
+        for check in &mut report.rows[0].checks {
+            check.file_verified = Some(true);
+        }
+        let pins = &plan(&targets, &report).unwrap()[NBA_CDN_HOST];
+        assert_eq!(pins.len(), 6);
+        assert!(pins.iter().any(|s| s == "8.8.8.8"));
+        report.rows[0].checks[0].file_verified = Some(false);
+        assert!(
+            !plan(&targets, &report).unwrap()[NBA_CDN_HOST]
+                .iter()
+                .any(|s| s == old_ips[0])
+        );
+        report.rows[0].checks[0].file_verified = None;
+        assert!(plan(&targets, &report).is_err());
+        for check in &mut report.rows[0].checks {
+            check.file_verified = Some(false);
+        }
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("hosts");
+        let old = format!("127.0.0.1 localhost\r\n{BEGIN}\r\n1.1.1.1 {NBA_CDN_HOST}\r\n{END}\r\n");
+        std::fs::write(&path, &old).unwrap();
+        assert!(commit(root.path(), &path, old.as_bytes(), &targets, &report).is_err());
+        assert_eq!(std::fs::read_to_string(path).unwrap(), old);
+    }
+
+    #[test]
+    fn epic_uses_normal_dns_until_a_verified_alternative_is_needed() {
+        let ips = ["1.1.1.1", "8.8.8.8"];
+        let mut requested = [Target {
+            host: EPIC_API_HOST.into(),
+            pinned: vec![],
+        }];
+        let mut report = evidence(EPIC_API_HOST, &ips);
+        assert!(plan(&requested, &report).is_err()); // An older TLS-only worker.
+        for check in &mut report.rows[0].checks {
+            check.file_verified = Some(true);
+        }
+        assert!(plan(&requested, &report).unwrap().is_empty());
+        report.rows[0].checks[0].file_verified = Some(false);
+        assert_eq!(
+            plan(&requested, &report).unwrap()[EPIC_API_HOST],
+            vec![ips[1]]
+        );
+        requested[0].pinned.push(ips[1].into());
+        report.rows[0].dns = vec![ips[0].into()];
+        assert_eq!(
+            plan(&requested, &report).unwrap()[EPIC_API_HOST],
+            vec![ips[1]]
+        );
+        report.rows[0].checks[1].file_verified = Some(false);
+        assert!(plan(&requested, &report).is_err());
+        report.rows[0].checks[0].file_verified = Some(true);
+        assert!(plan(&requested, &report).unwrap().is_empty());
+    }
+
     #[test]
     fn pins_require_full_dns_tls_hostname_and_exact_public_peer_evidence() {
         let targets = vec![Target {
@@ -642,6 +859,28 @@ mod tests {
             hosts(root.path()).unwrap(),
             vec!["api.quago.io", "game.example"]
         );
+        let mut settings = zapret_core::Settings::default();
+        settings.set("game", "selected").unwrap();
+        settings.set("gameapps", "NBA2K27.exe|Game.exe").unwrap();
+        zapret_core::save_settings(root.path(), &settings).unwrap();
+        assert_eq!(
+            hosts(root.path()).unwrap(),
+            vec![EPIC_API_HOST, "api.quago.io", "game.example", NBA_CDN_HOST]
+        );
+        let external = format!("127.0.0.1 local {EPIC_API_HOST} # manual\n");
+        assert!(
+            targets(root.path(), external.as_bytes())
+                .unwrap()
+                .iter()
+                .all(|t| t.host != EPIC_API_HOST)
+        );
+        let managed = format!("{BEGIN}\n8.8.8.8 {EPIC_API_HOST}\n{END}\n");
+        let epic = targets(root.path(), managed.as_bytes())
+            .unwrap()
+            .into_iter()
+            .find(|t| t.host == EPIC_API_HOST)
+            .unwrap();
+        assert_eq!(epic.pinned, vec!["8.8.8.8"]);
         assert!(
             render(
                 format!("{BEGIN}\n127.0.0.1 keep\n").as_bytes(),

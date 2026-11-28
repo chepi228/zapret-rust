@@ -54,6 +54,17 @@ pub(crate) fn hostname(url: &Url) -> String {
         Host::Ipv6(ip) => ip.to_string(),
     }
 }
+
+pub(crate) fn download_redirect(url: &Url, location: &str) -> Result<Url> {
+    let next = checked_url(
+        url.join(location).context("invalid redirect URL")?.as_str(),
+        false,
+    )?;
+    if url.scheme() == "https" && next.scheme() != "https" {
+        bail!("HTTPS redirect downgrade rejected")
+    }
+    Ok(next)
+}
 pub(crate) async fn response_accept(
     url: &Url,
     method: &str,
@@ -74,7 +85,7 @@ pub(crate) async fn response_accept(
     };
     let io: Box<dyn Io> = if url.scheme() == "https" {
         let (stream, _) =
-            crate::tcp::connect_tls(addresses, &mut Vec::new(), &host, connector, |_| {})
+            crate::tcp::connect_tls(addresses, &mut Vec::new(), &host, connector, None, |_| {})
                 .await
                 .map_err(|(cause, error)| {
                     anyhow::Error::msg(error).context(if cause == crate::Termination::TlsFailure {
@@ -157,12 +168,7 @@ pub(crate) async fn fetch_accept(
                     .context("redirect without Location")?
                     .to_str()
                     .context("invalid redirect Location")?;
-                let next = url.join(location).context("invalid redirect URL")?;
-                checked_url(next.as_str(), false)?;
-                if url.scheme() == "https" && next.scheme() != "https" {
-                    bail!("HTTPS redirect downgrade rejected")
-                }
-                url = next;
+                url = download_redirect(&url, location)?;
                 continue;
             }
             if !response.status().is_success() {

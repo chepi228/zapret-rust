@@ -10,7 +10,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     ffi::OsString,
     mem::{size_of, zeroed},
-    net::{Ipv4Addr, Ipv6Addr},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     path::{Path, PathBuf},
     ptr::{null, null_mut},
     time::{Duration, Instant},
@@ -39,8 +39,8 @@ struct Identity {
 struct Event {
     pid: u32,
     bytes: u32,
-    destination: String,
-    source: String,
+    destination: IpAddr,
+    source: IpAddr,
     destination_port: u16,
     source_port: u16,
     id: u16,
@@ -48,8 +48,8 @@ struct Event {
 }
 fn parse_event(id: u16, at: u64, data: &[u8]) -> Option<Event> {
     let v6 = match id {
-        10..=18 | 42 | 43 | 49 => false,
-        26..=34 | 58 | 59 | 65 => true,
+        10..=16 | 18 | 42 | 43 => false,
+        26..=32 | 34 | 58 | 59 => true,
         _ => return None,
     };
     let address_length = if v6 { 16 } else { 4 };
@@ -59,14 +59,11 @@ fn parse_event(id: u16, at: u64, data: &[u8]) -> Option<Event> {
     }
     let pid = u32::from_le_bytes(data[..4].try_into().ok()?);
     let bytes = u32::from_le_bytes(data[4..8].try_into().ok()?);
-    if bytes > 65535 {
-        return None;
-    }
-    let ip = |b: &[u8]| -> Option<String> {
+    let ip = |b: &[u8]| -> Option<IpAddr> {
         if v6 {
-            Some(Ipv6Addr::from(<[u8; 16]>::try_from(b).ok()?).to_string())
+            Some(IpAddr::V6(Ipv6Addr::from(<[u8; 16]>::try_from(b).ok()?)))
         } else {
-            Some(Ipv4Addr::from(<[u8; 4]>::try_from(b).ok()?).to_string())
+            Some(IpAddr::V4(Ipv4Addr::from(<[u8; 4]>::try_from(b).ok()?)))
         }
     };
     let destination = ip(&data[8..8 + address_length])?;
@@ -140,14 +137,38 @@ impl Gaps {
         })
     }
 }
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
+struct FlowKey {
+    pid: u32,
+    created: u64,
+    protocol: &'static str,
+    remote: SocketAddr,
+    local: SocketAddr,
+}
+#[derive(Default)]
+struct FlowCounts<'a> {
+    name: &'a str,
+    first: u64,
+    last: u64,
+    incoming: Gaps,
+    outgoing: Gaps,
+    bytes_in: u64,
+    bytes_out: u64,
+    retransmits: u64,
+    control: u64,
+    syn_attempts: u64,
+}
 fn flows(
     events: &[Event],
     identities: &[Identity],
-    local: &BTreeSet<String>,
+    local: &BTreeSet<IpAddr>,
     voice: bool,
 ) -> (Vec<Value>, bool, Value) {
-    let mut rows = BTreeMap::<String, Value>::new();
-    let mut timing = BTreeMap::<String, (Gaps, Gaps)>::new();
+    let mut rows = BTreeMap::<FlowKey, FlowCounts>::new();
+    let owners: Vec<_> = identities
+        .iter()
+        .filter(|p| identity_name_matches(p) && (!voice || discord_name(&p.name)))
+        .collect();
     let mut cross_flow = Gaps::default();
     let mut truncated = false;
     let limit = if voice { 128 } else { 512 };
@@ -155,97 +176,109 @@ fn flows(
         if voice && ![42, 43, 58, 59].contains(&event.id) {
             continue;
         }
-        let Some(identity) = identities.iter().find(|p| {
+        let Some(identity) = owners.iter().find(|p| {
             p.identity.pid == event.pid
                 && p.identity.created_filetime <= event.at
                 && p.observed_until >= event.at
-                && identity_name_matches(p)
-                && (!voice || discord_name(&p.name))
         }) else {
             continue;
         };
         let send = [10, 26, 42, 58].contains(&event.id);
         let receive = [11, 27, 43, 59].contains(&event.id);
-        let (address, port, local_address, local_port) =
-            if local.contains(&event.source) && !local.contains(&event.destination) {
-                (
-                    &event.destination,
-                    event.destination_port,
-                    &event.source,
-                    event.source_port,
-                )
-            } else if local.contains(&event.destination) && !local.contains(&event.source) {
-                (
-                    &event.source,
-                    event.source_port,
-                    &event.destination,
-                    event.destination_port,
-                )
-            } else {
-                continue;
-            };
-        if (send && !local.contains(&event.source))
-            || (receive && !local.contains(&event.destination))
+        let source_local = local.contains(&event.source);
+        let destination_local = local.contains(&event.destination);
+        let udp = matches!(event.id, 42 | 43 | 58 | 59);
+        // Kernel-Network TCP receive events can use the connection's local-to-remote
+        // endpoint order. The event ID specifies the transfer direction.
+        if source_local == destination_local
+            || (send && !source_local)
+            || (udp && receive && !destination_local)
         {
             continue;
         }
-        if !zapret_core::is_public_ip(address) {
+        let source = SocketAddr::new(event.source, event.source_port);
+        let destination = SocketAddr::new(event.destination, event.destination_port);
+        let (local_endpoint, remote) = if source_local {
+            (source, destination)
+        } else {
+            (destination, source)
+        };
+        if !zapret_core::is_public_address(remote.ip()) {
             continue;
         }
-        let protocol = if [42, 43, 49, 58, 59, 65].contains(&event.id) {
-            "udp"
-        } else {
-            "tcp"
+        let key = FlowKey {
+            pid: event.pid,
+            created: identity.identity.created_filetime,
+            protocol: if udp { "udp" } else { "tcp" },
+            remote,
+            local: local_endpoint,
         };
-        let key = format!(
-            "{}|{}|{protocol}|{address}|{port}|{local_address}|{local_port}",
-            event.pid, identity.identity.created_filetime
-        );
-        if !rows.contains_key(&key) {
-            if rows.len() >= limit {
+        let at_limit = rows.len() >= limit;
+        let row = match rows.entry(key) {
+            std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
+            std::collections::btree_map::Entry::Vacant(_) if at_limit => {
                 truncated = true;
                 continue;
             }
-            rows.insert(key.clone(),json!({"process_id":event.pid,"process_name":identity.name,"process_started_utc":utc(identity.identity.created_filetime),"process_created_filetime":identity.identity.created_filetime,"address":address,"port":port,"local_address":local_address,"local_port":local_port,"protocol":protocol,"out":0,"in":0,"bytes_out":0,"bytes_in":0,"retx":0,"syn_attempts":0,"ctl":0,"packets":0,"first_utc":utc(event.at),"last_utc":utc(event.at),"voice_port_configured":(19294..=19344).contains(&port)||(50000..=50100).contains(&port),"voice_attribution":"NotConfirmed","profile_hit":"NotObserved"}));
-        }
-        let (incoming, outgoing) = timing.entry(key.clone()).or_default();
-        let row = rows.get_mut(&key).unwrap();
-        let count = if send {
-            "out"
-        } else if receive {
-            "in"
-        } else if [14, 30].contains(&event.id) {
-            "retx"
-        } else {
-            "ctl"
+            std::collections::btree_map::Entry::Vacant(entry) => entry.insert(FlowCounts {
+                name: &identity.name,
+                first: event.at,
+                last: event.at,
+                ..Default::default()
+            }),
         };
-        row[count] = json!(row[count].as_u64().unwrap_or(0) + 1);
-        row["packets"] = json!(row["packets"].as_u64().unwrap_or(0) + 1);
-        if [12, 16, 28, 32].contains(&event.id) {
-            row["syn_attempts"] = json!(row["syn_attempts"].as_u64().unwrap_or(0) + 1);
-        }
-        if send || receive {
-            let counter = if send { "bytes_out" } else { "bytes_in" };
-            row[counter] = json!(row[counter].as_u64().unwrap_or(0) + u64::from(event.bytes));
-            if send {
-                outgoing.observe(event.at);
-            } else {
-                incoming.observe(event.at);
-            }
+        row.first = row.first.min(event.at);
+        row.last = row.last.max(event.at);
+        if send {
+            row.outgoing.observe(event.at);
+            row.bytes_out += u64::from(event.bytes);
             cross_flow.observe(event.at);
+        } else if receive {
+            row.incoming.observe(event.at);
+            row.bytes_in += u64::from(event.bytes);
+            cross_flow.observe(event.at);
+        } else if matches!(event.id, 14 | 30) {
+            row.retransmits += 1;
+        } else {
+            row.control += 1;
+            row.syn_attempts += u64::from(matches!(event.id, 12 | 16 | 28 | 32));
         }
-        row["last_utc"] = json!(utc(event.at));
     }
-    for (key, row) in &mut rows {
-        let (incoming, outgoing) = &timing[key];
-        row["timing"] = json!({"incoming":incoming.value(),"outgoing":outgoing.value()});
-    }
+    // Preserve the report order used by bounded follow-up probes.
+    let mut rows: Vec<_> = rows.into_iter().collect();
+    rows.sort_by_cached_key(|(k, _)| {
+        format!(
+            "{}|{}|{}|{}|{}|{}|{}",
+            k.pid,
+            k.created,
+            k.protocol,
+            k.remote.ip(),
+            k.remote.port(),
+            k.local.ip(),
+            k.local.port()
+        )
+    });
+    let rows = rows.into_iter().map(|(key, row)| {
+        let port = key.remote.port();
+        json!({
+            "process_id":key.pid, "process_name":row.name, "process_created_filetime":key.created,
+            "process_started_utc":utc(key.created),"address":key.remote.ip(),"port":port,
+            "local_address":key.local.ip(),"local_port":key.local.port(),"protocol":key.protocol,
+            "in":row.incoming.events,"out":row.outgoing.events,"bytes_in":row.bytes_in,"bytes_out":row.bytes_out,
+            "retx":row.retransmits,"ctl":row.control,"syn_attempts":row.syn_attempts,
+            "packets":row.incoming.events+row.outgoing.events+row.retransmits+row.control,
+            "first_utc":utc(row.first),"last_utc":utc(row.last),
+            "timing":{"incoming":row.incoming.value(),"outgoing":row.outgoing.value()},
+            "voice_port_configured":(19294..=19344).contains(&port)||(50000..=50100).contains(&port),
+            "voice_attribution":"NotConfirmed","profile_hit":"NotObserved"
+        })
+    }).collect();
     let mut context = cross_flow.value();
     context["observed_data_events"] = json!(cross_flow.events);
     context["scope"] = json!("RetainedAttributedFlows");
     context["clock"] = json!("EtwFiletime");
     context["cause"] = json!("NotEstablished");
-    (rows.into_values().collect(), truncated, context)
+    (rows, truncated, context)
 }
 fn wildcard(name: &str, pattern: &str) -> bool {
     let name = name.to_lowercase();
@@ -328,7 +361,7 @@ fn observe(
     }
     Ok(incomplete)
 }
-fn local_addresses() -> Result<BTreeSet<String>> {
+fn local_addresses() -> Result<BTreeSet<IpAddr>> {
     let adapters = crate::system::adapters()?;
     Ok(adapters
         .as_array()
@@ -337,7 +370,7 @@ fn local_addresses() -> Result<BTreeSet<String>> {
         .filter_map(|a| a["addresses"].as_array())
         .flatten()
         .filter_map(|a| a["address"].as_str())
-        .map(String::from)
+        .filter_map(|address| address.parse().ok())
         .collect())
 }
 struct Properties {
@@ -824,7 +857,6 @@ pub(crate) fn dispatch(root: &Path, action: &str, args: &Value) -> Result<Value>
                     v.as_str()
                         .context("Local address string required")?
                         .parse::<std::net::IpAddr>()
-                        .map(|address| address.to_string())
                         .context("Invalid local IP address")
                 })
                 .collect::<Result<BTreeSet<_>>>()?;
@@ -904,12 +936,70 @@ mod tests {
         let e = parse_event(42, 100, &packet(123)).expect("supported UDP event");
         assert_eq!(e.pid, 123);
         assert_eq!(e.bytes, 160);
-        assert_eq!(e.destination, "203.0.113.8");
-        assert_eq!(e.source, "192.168.1.2");
+        assert_eq!(e.destination, "203.0.113.8".parse::<IpAddr>().unwrap());
+        assert_eq!(e.source, "192.168.1.2".parse::<IpAddr>().unwrap());
         assert_eq!(e.destination_port, 50001);
         assert_eq!(e.source_port, 55000);
         assert!(parse_event(42, 100, &[0; 19]).is_none());
+        for id in [17, 33, 49, 65] {
+            assert!(parse_event(id, 100, &packet(123)).is_none());
+        }
         assert!(parse_event(999, 100, &packet(123)).is_none());
+    }
+    #[test]
+    fn tcp_receive_keeps_both_endpoint_layouts_and_coalesced_byte_counts() {
+        let owner = Identity {
+            identity: ProcessIdentity {
+                pid: 123,
+                created_filetime: 100,
+                executable: "C:/Game.exe".into(),
+            },
+            name: "Game".into(),
+            observed_until: 200,
+        };
+        for (send, receive, local, peer) in [
+            (10, 11, "192.168.1.2", "203.0.113.8"),
+            (26, 27, "fd00::2", "2001:db8::8"),
+        ] {
+            let local: IpAddr = local.parse().unwrap();
+            let peer: IpAddr = peer.parse().unwrap();
+            let encode = |id, bytes: u32, source: IpAddr, dest: IpAddr, sport: u16, dport: u16| {
+                let mut payload = 123u32.to_le_bytes().to_vec();
+                payload.extend(bytes.to_le_bytes());
+                for address in [dest, source] {
+                    match address {
+                        IpAddr::V4(ip) => payload.extend(ip.octets()),
+                        IpAddr::V6(ip) => payload.extend(ip.octets()),
+                    }
+                }
+                payload.extend(dport.to_be_bytes());
+                payload.extend(sport.to_be_bytes());
+                parse_event(id, 150, &payload).unwrap()
+            };
+            let events = [
+                encode(send, 270, local, peer, 50000, 443),
+                encode(receive, 90000, local, peer, 50000, 443),
+                encode(receive, 1100, peer, local, 443, 50000),
+                encode(receive, 999, local, local, 50000, 443),
+                encode(receive, 999, peer, peer, 50000, 443),
+                encode(send, 999, peer, local, 443, 50000),
+            ];
+            let (flows, truncated, _) = flows(
+                &events,
+                std::slice::from_ref(&owner),
+                &BTreeSet::from([local]),
+                false,
+            );
+            assert!(!truncated);
+            assert_eq!(flows.len(), 1);
+            let flow = &flows[0];
+            assert_eq!(flow["address"], peer.to_string());
+            assert_eq!(flow["port"], 443);
+            assert_eq!(flow["in"], 2);
+            assert_eq!(flow["out"], 1);
+            assert_eq!(flow["bytes_in"], 91100);
+            assert_eq!(flow["bytes_out"], 270);
+        }
     }
     #[test]
     fn pid_reuse_and_unconfirmed_direction_cannot_be_voice_evidence() {
@@ -922,7 +1012,7 @@ mod tests {
             name: "Discord".into(),
             observed_until: 200,
         };
-        let local = BTreeSet::from(["192.168.1.2".into()]);
+        let local = BTreeSet::from(["192.168.1.2".parse::<IpAddr>().unwrap()]);
         let event = parse_event(42, 150, &packet(123)).unwrap();
         let (out, _, _) = flows(
             std::slice::from_ref(&event),
@@ -1019,7 +1109,7 @@ mod tests {
             ..identity
         };
         assert!(validate_identities(std::slice::from_ref(&foreign)).is_err());
-        let local = BTreeSet::from(["192.168.1.2".into()]);
+        let local = BTreeSet::from(["192.168.1.2".parse::<IpAddr>().unwrap()]);
         let event = parse_event(42, 150, &packet(123)).unwrap();
         assert!(flows(&[event], &[foreign], &local, true).0.is_empty());
     }
@@ -1034,7 +1124,7 @@ mod tests {
             name: "Discord".into(),
             observed_until: 200,
         };
-        let local = BTreeSet::from(["192.168.1.2".into()]);
+        let local = BTreeSet::from(["192.168.1.2".parse::<IpAddr>().unwrap()]);
         let event = parse_event(42, 150, &packet(123)).unwrap();
         let mut wrong = event.clone();
         std::mem::swap(&mut wrong.source, &mut wrong.destination);

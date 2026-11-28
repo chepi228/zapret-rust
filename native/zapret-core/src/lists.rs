@@ -118,9 +118,9 @@ pub fn normalize_ip_network(text: &str) -> Result<String> {
 }
 /// Legacy public-address policy used by the game scanner; documentation ranges remain representable.
 pub fn is_public_ip(text: &str) -> bool {
-    let Ok(ip) = text.parse::<IpAddr>() else {
-        return false;
-    };
+    text.parse::<IpAddr>().is_ok_and(is_public_address)
+}
+pub fn is_public_address(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(ip) => {
             let b = ip.octets();

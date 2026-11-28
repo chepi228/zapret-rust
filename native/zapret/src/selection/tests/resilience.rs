@@ -29,6 +29,23 @@ fn dns_failure(target: &Target) -> Row {
 }
 
 #[test]
+fn only_the_winning_preferred_tls_peer_keeps_its_latency_sample() {
+    let mut raw = json!({
+        "certificate_validated":true, "remote_address":"[::1]:443",
+        "tcp_attempts":[{"address":"[::1]:443","error":null},
+                        {"address":"127.0.0.1:443","error":null,"tls_error":"cancelled"}]
+    });
+    assert!(!endpoints::tls_peer_retry(&raw));
+    raw["remote_address"] = json!("127.0.0.1:443");
+    assert!(endpoints::tls_peer_retry(&raw));
+    raw["remote_address"] = json!("[::1]:443");
+    raw["tcp_attempts"][0]["tls_error"] = json!("handshake rejected");
+    assert!(endpoints::tls_peer_retry(&raw));
+    raw["certificate_validated"] = json!(false);
+    assert!(endpoints::tls_peer_retry(&raw));
+}
+
+#[test]
 fn standby_replaces_only_a_failure_observed_before_the_profile_starts() {
     let targets: Vec<_> = ["one", "two", "three", "spare"]
         .into_iter()
@@ -288,11 +305,10 @@ fn retries_keep_one_real_peer_and_clock_instead_of_component_minima() {
 }
 
 fn exited_child() -> OwnedChild {
-    let shell = PathBuf::from(std::env::var_os("SystemRoot").unwrap())
-        .join("System32/WindowsPowerShell/v1.0/powershell.exe");
-    let args = ["-NoProfile", "-NonInteractive", "-Command", "exit 19"].map(OsString::from);
-    let child = OwnedChild::spawn(&shell, &args, &RunOptions::default()).unwrap();
-    child.wait_for_exit(Duration::from_secs(5)).unwrap();
+    let mut child = trial_fixture::spawn("exit-19", RunOptions::default()).unwrap();
+    while child.is_running().unwrap() {
+        child.wait_for_exit(Duration::from_millis(50)).unwrap();
+    }
     child
 }
 

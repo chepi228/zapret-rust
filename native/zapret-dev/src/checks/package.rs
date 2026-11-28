@@ -153,7 +153,7 @@ pub(crate) fn run(archive: &Path, output: &Path) -> Result<()> {
             serde_json::from_slice::<Value>(&check.stdout)?["console_window"] == false,
             "background host starts without a console",
         )?;
-        for (screen, last) in [("main", 9), ("settings", 11), ("tools", 12), ("test", 5)] {
+        for (screen, last) in [("main", 9), ("settings", 11), ("tools", 13), ("test", 5)] {
             let missing = stage.join("missing-root");
             let preview = invoke(
                 executable,

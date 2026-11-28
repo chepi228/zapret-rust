@@ -32,6 +32,8 @@ pub(crate) use network_monitor::last_interruption;
 mod quick;
 mod retries;
 mod startup;
+#[cfg(test)]
+mod trial_fixture;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct ExpectedResponse {
@@ -53,9 +55,10 @@ impl ExpectedResponse {
         };
         let mode = match *method {
             "GET" => ProbeMode::FullGet,
+            "JWKS" => ProbeMode::Jwks,
             "ROBLOX_ICON" => ProbeMode::RobloxIcon,
             "H3" => ProbeMode::Http3Head,
-            _ => bail!("Допустимы GET, ROBLOX_ICON и H3"),
+            _ => bail!("Допустимы GET, JWKS, ROBLOX_ICON и H3"),
         };
         let status = status.parse()?;
         let (min_bytes, max_bytes) = size.split_once("..").unwrap_or((size, size));
@@ -76,6 +79,8 @@ impl ExpectedResponse {
             (200..300).contains(&status)
                 && min_bytes <= max_bytes
                 && max_bytes < zapret_net::MAX_BODY_LIMIT
+                && (mode != ProbeMode::Jwks
+                    || (status == 200 && max_bytes <= zapret_net::JWKS_MAX_BYTES))
                 && (mode != ProbeMode::Http3Head || max_bytes == 0),
             "Неверный HTTP-код или диапазон размеров ответа"
         );
@@ -127,7 +132,7 @@ impl Target {
         let mode = self.probe_mode();
         let method = match mode {
             ProbeMode::Http3Head => "HEAD",
-            ProbeMode::FullGet | ProbeMode::RobloxIcon => "GET",
+            ProbeMode::FullGet | ProbeMode::Jwks | ProbeMode::RobloxIcon => "GET",
             ProbeMode::Range if control => "HEAD",
             ProbeMode::Range if self.post => "POST",
             ProbeMode::Range => "GET",
@@ -271,10 +276,11 @@ pub(crate) fn read_targets_with_suite(root: &Path, suite: &Path) -> Result<Vec<T
         let expected = ExpectedResponse::parse(&fields.collect::<Vec<_>>())
             .with_context(|| format!("tools/targets.txt, {group}.{name}"))?;
         ensure!(
-            expected.as_ref().is_none_or(
-                |e| e.mode != ProbeMode::Http3Head || url.trim().starts_with("https://")
-            ),
-            "HTTP/3 требует HTTPS для {group}.{name}"
+            expected.as_ref().is_none_or(|e| !matches!(
+                e.mode,
+                ProbeMode::Http3Head | ProbeMode::Jwks
+            ) || url.trim().starts_with("https://")),
+            "Для проверки {group}.{name} требуется HTTPS"
         );
         targets.push(Target {
             group: group.into(),
@@ -1250,7 +1256,7 @@ fn probe_details(rows: &[Row]) -> Vec<Value> {
     rows.iter()
         .map(|r| {
             json!({"group":r.group,"name":r.name,"state":r.state,"code":r.code,
-        "tls_peer_retry":endpoints::multiple_tls_peers(&r.raw),
+        "tls_peer_retry":endpoints::tls_peer_retry(&r.raw),
         "url":r.url,"remote_address":r.raw["remote_address"],"certificate_validated":r.raw["certificate_validated"],"media_url":r.raw["media_url"],"error":r.raw["error"],
         "mode":r.raw["mode"],"dns_source":r.raw["dns_source"],"dns_ms":r.dns_ms,"tcp_ms":if r.raw["mode"] == "http3_head" {None}else{Some(r.conn_ms)},"tls_ms":r.tls_ms,"first_byte_ms":r.first_byte_ms,"total_ms":r.total_ms,
         "body_bytes":r.body_bytes,"body_limit":r.body_limit,"body_complete":r.body_complete,"body_sha256":r.raw["body_sha256"],"target_reached":r.target_reached,"post_bytes":r.raw["post_bytes"],

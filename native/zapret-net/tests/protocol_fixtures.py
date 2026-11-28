@@ -41,6 +41,7 @@ class HttpHandler(http.server.BaseHTTPRequestHandler):
         with self.server.lock:
             self.server.requests.append((self.path, dict(self.headers)))
         body = b"<!doctype html><title>loopback fixture</title><p>native browser proof</p>"
+        content_type = "text/html; charset=utf-8"
         status = 200
         if self.path.startswith("/doh"):
             assert self.headers["Accept"] == "application/dns-json"
@@ -51,6 +52,14 @@ class HttpHandler(http.server.BaseHTTPRequestHandler):
             body = b'{"success":false,"message":"fixture"}'
         elif self.path.startswith("/fallback"):
             body = b'{"ip":"203.0.113.12","country":"RU","city":"Fixture","org":"AS64501 Fallback ISP","loc":"55.7,37.6"}'
+        elif self.path == "/reload-video":
+            body = b'<!doctype html><script>setTimeout(() => location.replace("/playback"), 400)</script>'
+        elif self.path == "/playback":
+            body = b'<!doctype html><video muted autoplay playsinline src="/playback.webm"></video>'
+        elif self.path == "/playback.webm":
+            # Eight seconds of synthetic VP8 video. No external media or codec tools are needed.
+            body = Path(__file__).with_name("playback.webm").read_bytes()
+            content_type = "video/webm"
         elif self.path.startswith("/http-error"):
             status = 403
         elif self.path.startswith("/redirect"):
@@ -82,7 +91,7 @@ class HttpHandler(http.server.BaseHTTPRequestHandler):
             self.close_connection = True
             return
         self.send_response(status)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
@@ -120,7 +129,7 @@ class H2Handler(socketserver.BaseRequestHandler):
             with self.server.tls.wrap_socket(self.request, server_side=True) as stream:
                 stream.settimeout(3)
                 if stream.selected_alpn_protocol() != "h2":
-                    stream.recv(4096)
+                    self.server.other_protocol_data.append(stream.recv(4096))
                     return
                 conn = H2Connection(config=H2Configuration(client_side=False, header_encoding="utf-8"))
                 conn.initiate_connection()
@@ -142,13 +151,15 @@ class H2Handler(socketserver.BaseRequestHandler):
 
 
 @contextlib.contextmanager
-def h2_fixture(tls):
+def h2_fixture(tls, host="127.0.0.1", port=0):
     class Server(socketserver.ThreadingTCPServer):
         allow_reuse_address = True
         daemon_threads = True
-    server = Server(("127.0.0.1", 0), H2Handler)
+        address_family = socket.AF_INET6 if ":" in host else socket.AF_INET
+    server = Server((host, port), H2Handler)
     server.tls = tls
     server.requests = []
+    server.other_protocol_data = []
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
@@ -203,6 +214,22 @@ def main():
                 mismatch = invoke(args.binary, "webcheck", {**options, "url": f"https://127.0.0.1:{server.server_address[1]}/", "ca_file": str(cert)})["rows"][0]
                 check(mismatch["reason"] == "ProtocolMismatch" and not mismatch["protocol_confirmed"]
                       and not mismatch["complete"], "native H2 does not invent support when server ALPN differs")
+            peers = list(dict.fromkeys(
+                addr[0] for _, _, _, _, addr in socket.getaddrinfo("localhost", 0, type=socket.SOCK_STREAM)
+            ))
+            if {"::1", "127.0.0.1"}.issubset(peers):
+                h2_tls = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+                h2_tls.load_cert_chain(cert, key)
+                h2_tls.set_alpn_protocols(["h2"])
+                alternate = "127.0.0.1" if peers[0] == "::1" else "::1"
+                with h2_fixture(tls, peers[0]) as first, h2_fixture(h2_tls, alternate, first.server_address[1]) as second:
+                    url = f"https://localhost:{first.server_address[1]}/good"
+                    row = invoke(args.binary, "webcheck", {**options, "url": url, "ca_file": str(cert)})["rows"][0]
+                    check(row["complete"] and row["observed_protocol"] == "h2" and row["status_code"] == 503
+                          and first.other_protocol_data == [b""] and len(second.requests) == 1,
+                          "a trusted TLS peer without h2 leaves the HEAD request to the alternate address")
+            else:
+                skipped.append("mixed HTTP/2 fixture needs dual-stack localhost")
         with http_fixture() as server:
             base = f"http://127.0.0.1:{server.server_port}"
             dns = invoke(args.binary, "dns", {"host": "127.0.0.1", "compare": True, "no_hosts": False,
@@ -229,6 +256,23 @@ def main():
                 for path, expected in [("/http-error", "HTTP_ERROR"), ("/redirect", "OK"), ("/truncated", "FAIL")]:
                     row = invoke(args.binary, "webcheck", {**options, "url": base + path, "modes": ["BrowserTcp"], "visits": 1})["rows"][0]
                     check(row["state"] == expected and row["cleanup_complete"], "actual browser " + path + " preserves state and owned cleanup")
+                playback = {**options, "modes": ["BrowserPlayback"], "visits": 1}
+                row = invoke(args.binary, "webcheck", {**playback, "url": base + "/playback", "timeout_ms": 16000})["rows"][0]
+                check(row["state"] == "OK" and row["complete"] and row["cleanup_complete"]
+                      and row["reason"] == "PlaybackObserved" and row["playback"]["played_ms"] >= 5000
+                      and row["playback"]["presented_frames"] >= 10 and not row["protocol_confirmed"],
+                      "actual browser plays five seconds of decoded video in an isolated profile")
+                row = invoke(args.binary, "webcheck", {**playback, "timeout_ms": 2800})["rows"][0]
+                check(row["state"] == "UNKNOWN" and row["reason"] == "NoVideo" and not row["complete"]
+                      and row["playback"]["presented_frames"] == 0 and row["cleanup_complete"],
+                      "a completed page without video never passes the playback check")
+                row = invoke(args.binary, "webcheck", {**playback, "url": base + "/http-error"})["rows"][0]
+                check(row["state"] == "HTTP_ERROR" and row["status_code"] == 403 and not row["complete"],
+                      "a fully downloaded HTTP error never completes a playback observation")
+                row = invoke(args.binary, "webcheck", {**playback, "url": base + "/reload-video", "timeout_ms": 16000})["rows"][0]
+                check(row["state"] == "OK" and row["complete"] and row["cleanup_complete"]
+                      and row["playback"]["document_url"] == base + "/playback",
+                      "a client-side navigation restarts the video measurement on its final document")
                 started = time.monotonic()
                 row = invoke(args.binary, "webcheck", {**options, "url": base + "/stall", "modes": ["BrowserTcp"], "visits": 1})["rows"][0]
                 check(row["state"] == "FAIL" and not row["complete"] and row["cleanup_complete"]

@@ -1,8 +1,8 @@
-# zapret-rust 1.3
+# zapret-rust 1.4
 
 **YouTube, Discord and Telegram Desktop on Windows 10/11 x64.** If your ISP restricts access through deep packet inspection (DPI), zapret-rust helps you choose a strategy for your connection. One menu lets you start the bypass, test Discord attachments and connect Telegram to a local bridge.
 
-**[Download the Windows x64 ZIP](https://github.com/chepi228/zapret-rust/releases/download/v1.3/zapret-rust-v1.3-windows-x64.zip)** · [All release files](https://github.com/chepi228/zapret-rust/releases/tag/v1.3) · [What's new in 1.3](CHANGELOG.md) · [Русский](README.md)
+**[Download the Windows x64 ZIP](https://github.com/chepi228/zapret-rust/releases/download/v1.4/zapret-rust-v1.4-windows-x64.zip)** · [All release files](https://github.com/chepi228/zapret-rust/releases/tag/v1.4) · [What's new in 1.4](CHANGELOG.md) · [Русский](README.md)
 
 ## Start on Windows
 
@@ -39,7 +39,7 @@ Both projects help users reach services affected by DPI and test strategies on t
 
 ## Read the results
 
-The first row is the baseline with the bypass off. Quick selection tests up to **18 strategies**. It measures the current profile against all **88 targets** and screens challengers on a common subset, including a Discord media file, a Roblox game icon and services that failed on this connection. The three leading challengers advance to the full panel, along with additional profiles that cover the remaining observed service recoveries. A verified standby can replace an unstable control. If the short screen cannot confirm two controls, all remaining candidates advance to the full panel. Choose **3 → 2** to run all strategies.
+The first row is the baseline with the bypass off. Quick selection tests up to **18 strategies**. It measures the current profile against the full set of targets and screens challengers on a common subset, including a Discord media file, a Roblox game icon and services that failed on this connection. The three leading challengers advance to the full panel, along with additional profiles that cover the remaining observed service recoveries. A verified standby can replace an unstable control. If the short screen cannot confirm two controls, all remaining candidates advance to the full panel. Choose **3 → 2** to run all strategies.
 
 | During a trial | Meaning |
 | --- | --- |
@@ -79,33 +79,35 @@ Choose **4 → 1**, then accept the proxy link in Telegram Desktop. The bridge l
 
 ### Troubleshooting
 
+- If YouTube opens but video stalls, choose **8 → 13**. A temporary browser profile plays a public video with the sound muted. The check requires five seconds of playback and ten presented frames. The report includes the playback time, frame count and stalls lasting at least a second.
+- To compare home broadband with a mobile connection, run **8 → 13** and **8 → 12** on each network. For Discord, take turns saying and repeating a phrase with a second participant. The `runtime` directory keeps a separate `youtube-check-<id>.txt` and `voice-check-<id>.txt` for each run.
 - If images load on one ISP and disappear on another, choose **6**. It compares IPv4 and IPv6 answers from Windows and DNS over HTTPS, including the Roblox thumbnail host. If Windows returns no address, the check reports the hostname when TLS validation succeeds at an alternative address.
 - If Discord opens but images stall, choose **6** to download and verify a complete Discord media file. If the DNS address fails and the alternative works, the menu offers to pin the media hostname to the verified address. See **3 → 5** for strategy test results or **8 → 12** for Discord voice diagnostics.
 - If the browser behaves differently from the quick test, **8 → 10** checks the browser's actual HTTP/2 and HTTP/3 connections. Use **6** to see whether a VPN or proxy is active.
 - If the original connection briefly drops and returns, Auto Pick starts its measurements over once. If you switch networks, run **3 → 1** on the new connection. **3 → 5** shows the last network interruption and **8 → 4** includes it in the diagnostic report.
 - Auto Pick needs successful responses from two distinct control hosts before selecting a profile. It repeats the baseline when too few controls respond, then reports the number of DNS failures if the check fails again. If an alternative profile's engine exits during screening, the report records the profile and its exit code.
-- If a CDN address accepts TCP but rejects TLS, the probe and built-in downloader try the remaining DNS addresses. Each connection verifies the original hostname. Auto Pick pins a peer after a successful baseline and uses requests with multiple TLS connections to measure availability.
+- If a site works on only some of its DNS addresses, HTTPS checks, list downloads and the Telegram bridge can try a second address after 250 ms while the first connection is still setting up. An explicit failure starts the next attempt immediately. Each connection verifies the original hostname, and the request is sent once over the first ready connection. Auto Pick counts a recovery from stalled TLS toward availability. When the preferred address wins, its sample remains eligible for latency comparisons.
 - After more than 16 failed requests, Auto Pick retries a sample across services with fewer concurrent requests. If two distinct services recover, it rechecks the remaining addresses that timed out or failed to connect over TCP. The report includes the number of expanded retries.
 
-The Windows guide covers all menu options, custom lists and recovery after an interrupted update. [Windows guide in Russian](https://github.com/chepi228/zapret-rust/blob/v1.3/docs/windows.md)
+The Windows guide covers all menu options, custom lists and recovery after an interrupted update. [Windows guide in Russian](https://github.com/chepi228/zapret-rust/blob/v1.4/docs/windows.md)
 
 ## Downloads and Linux
 
-The ZIP, 7z and RAR for manual installation contain the same `zapret-rust` folder. Windows can open the ZIP directly. [ZIP](https://github.com/chepi228/zapret-rust/releases/download/v1.3/zapret-rust-v1.3-windows-x64.zip) · [7z](https://github.com/chepi228/zapret-rust/releases/download/v1.3/zapret-rust-v1.3-windows-x64.7z) · [RAR](https://github.com/chepi228/zapret-rust/releases/download/v1.3/zapret-rust-v1.3-windows-x64.rar) · [SHA-256 checksums](https://github.com/chepi228/zapret-rust/releases/download/v1.3/SHA256SUMS.txt)
+The ZIP, 7z and RAR for manual installation contain the same `zapret-rust` folder. Windows can open the ZIP directly. [ZIP](https://github.com/chepi228/zapret-rust/releases/download/v1.4/zapret-rust-v1.4-windows-x64.zip) · [7z](https://github.com/chepi228/zapret-rust/releases/download/v1.4/zapret-rust-v1.4-windows-x64.7z) · [RAR](https://github.com/chepi228/zapret-rust/releases/download/v1.4/zapret-rust-v1.4-windows-x64.rar) · [SHA-256 checksums](https://github.com/chepi228/zapret-rust/releases/download/v1.4/SHA256SUMS.txt)
 
-The separate Linux installer downloads upstream **zapret2 v1.0.7**, verifies its SHA-256 and opens its interactive setup. Add `--prepare-only` to prepare the files without installing the system service. [Linux installer](https://github.com/chepi228/zapret-rust/releases/download/v1.3/zapret-rust-v1.3-linux-install.sh) · [Linux guide in Russian](https://github.com/chepi228/zapret-rust/blob/v1.3/docs/linux.md)
+The separate Linux installer downloads upstream **zapret2 v1.0.7**, verifies its SHA-256 and opens its interactive setup. Add `--prepare-only` to prepare the files without installing the system service. [Linux installer](https://github.com/chepi228/zapret-rust/releases/download/v1.4/zapret-rust-v1.4-linux-install.sh) · [Linux guide in Russian](https://github.com/chepi228/zapret-rust/blob/v1.4/docs/linux.md)
 
 ```sh
-sh zapret-rust-v1.3-linux-install.sh
+sh zapret-rust-v1.4-linux-install.sh
 ```
 
 ## Components and credits
 
-The standard Windows x64 package runs the project's Rust controller, worker, packet engine, ring library and Telegram bridge. Standard profiles are built in. Luna Core runs custom Lua scripts. Windows packet capture uses the third-party WinDivert driver and Windows system APIs. The source tree also contains test references and compatibility builds. [Engine and package variants](https://github.com/chepi228/zapret-rust/blob/v1.3/native/zapret-ring-ffi/README.md#native-windows-engine)
+The standard Windows x64 package runs the project's Rust controller, worker, packet engine, ring library and Telegram bridge. Standard profiles are built in. Luna Core runs custom Lua scripts. Windows packet capture uses the third-party WinDivert driver and Windows system APIs. The source tree also contains test references and compatibility builds. [Engine and package variants](https://github.com/chepi228/zapret-rust/blob/v1.4/native/zapret-ring-ffi/README.md#native-windows-engine)
 
 The project builds on zapret2 and work by Flowseal. Project code is licensed under MIT, and bundled third-party components retain their respective licenses. [zapret2](https://github.com/bol-van/zapret2) · [Flowseal strategies](https://github.com/Flowseal/zapret-discord-youtube) · [TG WS Proxy](https://github.com/Flowseal/tg-ws-proxy) · [MIT](licenses/LICENSE) · [Third-party notices](licenses/THIRD-PARTY-NOTICES.md)
 
-The GitHub language chart follows the repository's `.gitattributes`. [Language chart rules](https://github.com/chepi228/zapret-rust/blob/v1.3/.gitattributes)
+The GitHub language chart follows the repository's `.gitattributes`. [Language chart rules](https://github.com/chepi228/zapret-rust/blob/v1.4/.gitattributes)
 
 ## Contact and support
 

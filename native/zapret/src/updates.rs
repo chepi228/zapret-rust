@@ -21,6 +21,7 @@ const MAX_FILE: u64 = 96 * 1024 * 1024;
 const MAX_ENTRIES: usize = 500;
 const CATALOG: &str = "package-manifest.json";
 const PACKAGE_FILES: &str = include_str!("../../../dev/native-package-files.txt");
+mod download;
 
 pub fn recover(root: &Path) -> Result<Value> {
     let trust = SystemTrust;
@@ -86,26 +87,22 @@ pub fn update(
     expected_sha256: Option<&str>,
 ) -> Result<Value> {
     let work = tempfile::tempdir()?;
-    let downloaded = work.path().join("release.zip");
-    let (archive, expected_tag, expected_digest) = if let Some(path) = from {
+    let ((archive_bytes, digest), expected_tag) = if let Some(path) = from {
+        let archive = std::path::absolute(path)?;
+        no_reparse(&archive)?;
         (
-            std::path::absolute(path)?,
+            download::verified_archive(read_bounded(&archive, MAX_ARCHIVE)?, expected_sha256)?,
             None,
-            expected_sha256.map(str::to_owned),
         )
     } else {
-        let metadata: Value = serde_json::from_slice(&zapret_net::fetch(
-            "https://api.github.com/repos/chepi228/zapret-rust/releases/latest",
-            2 * 1024 * 1024,
-            20000,
-        )?)?;
-        let Some(release) = parse_release(&metadata)? else {
+        let (route, (tag, release)) = download::latest()?;
+        let Some(release) = release else {
             ensure!(
                 !install,
                 "В последнем релизе ещё нет проверяемого native архива"
             );
             return Ok(
-                json!({"available":false,"latest_tag":metadata["tag_name"],"text":"В последнем релизе ещё нет native архива."}),
+                json!({"available":false,"latest_tag":tag,"text":"В последнем релизе ещё нет native архива."}),
             );
         };
         let available = version_newer(&release.tag, &format!("v{}", crate::VERSION));
@@ -116,19 +113,8 @@ pub fn update(
             available,
             "Уже установлена эта или более новая версия zapret-rust"
         );
-        zapret_net::download(&release.url, &downloaded, MAX_ARCHIVE as usize, 300000)?;
-        (downloaded, Some(release.tag), Some(release.sha256))
+        (download::archive(&release, route)?, Some(release.tag))
     };
-    no_reparse(&archive)?;
-    let archive_bytes = read_bounded(&archive, MAX_ARCHIVE)?;
-    let digest = sha256(&archive_bytes);
-    if let Some(expected) = expected_digest {
-        let expected = expected.strip_prefix("sha256:").unwrap_or(&expected);
-        ensure!(
-            hash_valid(expected) && digest.eq_ignore_ascii_case(expected),
-            "SHA256 архива не совпала; обновление отменено до остановки обхода"
-        );
-    }
     // Keep a complete inspected copy. No executable from TEMP is ever run.
     let inspected = work.path().join("inspected.zip");
     atomic_write(&inspected, &archive_bytes)?;

@@ -16,7 +16,7 @@ use std::{
     time::Duration,
 };
 use tokio::{
-    sync::oneshot,
+    sync::{oneshot, watch},
     time::{Instant, timeout, timeout_at},
 };
 use url::Url;
@@ -24,6 +24,10 @@ use url::Url;
 const MAX_HEADER_BYTES: u64 = 64 * 1024;
 pub(crate) const MAX_REDIRECTS: usize = 5;
 const ALPN: &[u8] = b"h3";
+
+// Certificate checks run on the isolated QUIC runtime. Retain a confirmed
+// rejection for the caller if another DNS address stays silent until timeout.
+pub(crate) type PeerTlsError = watch::Sender<Option<ConnectionError>>;
 
 pub(crate) struct ResponseHeaders {
     pub(crate) status: u16,
@@ -94,6 +98,7 @@ async fn connect(
     url: &Url,
     config: &quinn::ClientConfig,
     addresses: &[SocketAddr],
+    peer_tls_error: &PeerTlsError,
 ) -> Result<Connection> {
     let host = http::hostname(url);
     let alternatives = addresses.len().saturating_sub(2);
@@ -125,9 +130,12 @@ async fn connect(
     let mut error = None;
     while let Some(attempt) = attempts.next().await {
         match attempt {
-            Ok(connection) => return Ok(connection),
+            Ok(connection) => {
+                peer_tls_error.send_replace(None);
+                return Ok(connection);
+            }
             Err(cause) if failure(&cause) == "TlsFailure" => {
-                return Err(cause);
+                peer_tls_error.send_replace(cause.downcast_ref::<ConnectionError>().cloned());
             }
             Err(cause)
                 if error.as_ref().is_none_or(|previous| {
@@ -141,7 +149,12 @@ async fn connect(
             Err(_) => {}
         }
     }
-    Err(error.unwrap_or_else(|| anyhow::anyhow!("Resolver returned no addresses")))
+    Err(peer_tls_error
+        .borrow()
+        .clone()
+        .map(anyhow::Error::from)
+        .or(error)
+        .unwrap_or_else(|| anyhow::anyhow!("Resolver returned no addresses")))
 }
 
 pub(crate) struct HeadResult {
@@ -155,9 +168,10 @@ async fn head(
     url: &Url,
     config: &quinn::ClientConfig,
     addresses: &[SocketAddr],
+    peer_tls_error: &PeerTlsError,
 ) -> Result<HeadResult> {
     let start = Instant::now();
-    let connection = connect(url, config, addresses).await?;
+    let connection = connect(url, config, addresses, peer_tls_error).await?;
     let handshake_ms = crate::probe::elapsed_ms(start);
     let remote = connection.remote_address();
     let start = Instant::now();
@@ -194,10 +208,16 @@ async fn head(
     }
 }
 
-async fn request_headers(mut url: Url, ca_file: Option<&Path>) -> Result<ResponseHeaders> {
+async fn request_headers(
+    mut url: Url,
+    ca_file: Option<&Path>,
+    peer_tls_error: &PeerTlsError,
+) -> Result<ResponseHeaders> {
     let config = client_config(ca_file).context("Configure QUIC TLS")?;
     for redirects in 0..=MAX_REDIRECTS {
-        let headers = head(&url, &config, &addresses(&url).await?).await?.headers;
+        let headers = head(&url, &config, &addresses(&url).await?, peer_tls_error)
+            .await?
+            .headers;
         let status = headers.status().as_u16();
         if matches!(status, 301 | 302 | 303 | 307 | 308) {
             ensure!(redirects < MAX_REDIRECTS, "HTTP/3 redirect limit exceeded");
@@ -227,23 +247,33 @@ pub(crate) async fn request(
     ensure!(url.scheme() == "https", "HTTP/3 requires HTTPS");
     let deadline = Instant::now() + Duration::from_millis(timeout_ms);
     let ca_file = ca_file.map(Path::to_owned);
+    let peer_tls_error = PeerTlsError::new(None);
+    let observed = peer_tls_error.clone();
     // OS certificate verification can block inside the QUIC driver. Keep the
     // calling runtime free to enforce the deadline and respond to cancellation.
     timeout_at(
         deadline,
-        isolated(async move { request_headers(url, ca_file.as_deref()).await }),
+        isolated(async move { request_headers(url, ca_file.as_deref(), &observed).await }),
     )
-    .await?
+    .await
+    .map_err(|timeout| {
+        peer_tls_error
+            .borrow()
+            .clone()
+            .map(anyhow::Error::from)
+            .unwrap_or_else(|| timeout.into())
+    })?
 }
 
 pub(crate) async fn probe_head(
     url: Url,
     addresses: Vec<SocketAddr>,
     ca_file: Option<PathBuf>,
+    peer_tls_error: PeerTlsError,
 ) -> Result<HeadResult> {
     isolated(async move {
         let config = client_config(ca_file.as_deref())?;
-        head(&url, &config, &addresses).await
+        head(&url, &config, &addresses, &peer_tls_error).await
     })
     .await
 }
@@ -349,6 +379,7 @@ mod tests {
         let h2_ca = dir.path().join("h2.pem");
         let h2_server = fixture(&h2_ca, b"h2")?;
         let h2_port = h2_server.local_addr()?.port();
+        let untrusted = fixture(&dir.path().join("other-ca.pem"), ALPN)?;
         let mut requests = tokio::task::JoinSet::new();
         let url = |host, path| Url::parse(&format!("https://{host}:{port}{path}")).unwrap();
         let client = async {
@@ -370,14 +401,25 @@ mod tests {
                 "{wrong_protocol:#}"
             );
             let config = client_config(Some(&ca))?;
+            let peer_tls_error = PeerTlsError::new(None);
             let alternate = head(
                 &url("localhost", "/"),
                 &config,
                 &[h2_server.local_addr()?, server.local_addr()?],
+                &peer_tls_error,
             )
             .await?;
             assert_eq!(alternate.remote, server.local_addr()?);
             assert_eq!(alternate.headers.status(), 200);
+            let peers = [untrusted.local_addr()?, server.local_addr()?];
+            let alternate = timeout(
+                Duration::from_secs(5),
+                head(&url("localhost", "/"), &config, &peers, &peer_tls_error),
+            )
+            .await??;
+            assert_eq!(alternate.remote, server.local_addr()?);
+            assert_eq!(alternate.headers.status(), 200);
+            assert!(peer_tls_error.borrow().is_none());
             let redirect = request(url("localhost", "/redirect"), 5000, Some(&ca)).await?;
             assert_eq!(
                 (
@@ -416,6 +458,30 @@ mod tests {
             assert_eq!(row.termination, crate::Termination::Complete);
             assert_eq!(row.remote_address, Some(format!("127.0.0.1:{port}")));
             assert!(row.certificate_validated && row.tcp_ms.is_none() && row.tls_ms.is_some());
+            let invalid_job = crate::Job {
+                version: 1,
+                id: "untrusted".into(),
+                url: url("localhost", "/").into(),
+                timeout_ms: 2000,
+                body_limit: 1,
+                post_bytes: 0,
+                method: Some("HEAD".into()),
+                mode: crate::ProbeMode::Http3Head,
+                connect_ip: None,
+            };
+            let row = tokio::task::spawn_blocking(move || {
+                crate::probe(&[invalid_job], &crate::BatchOptions::default())
+            })
+            .await??
+            .pop()
+            .unwrap();
+            assert_eq!(
+                row.termination,
+                crate::Termination::TlsFailure,
+                "{:?}",
+                row.error
+            );
+            assert!(!row.certificate_validated && row.status_code.is_none());
             for (path, message) in [
                 ("/downgrade", "redirect must use https"),
                 ("/loop", "redirect limit exceeded"),
@@ -455,6 +521,7 @@ mod tests {
                 result = &mut client => return result,
                 Some(incoming) = server.accept() => { requests.spawn(serve(incoming)); }
                 Some(incoming) = h2_server.accept() => { requests.spawn(serve(incoming)); }
+                Some(incoming) = untrusted.accept() => { requests.spawn(serve(incoming)); }
                 Some(result) = requests.join_next(), if !requests.is_empty() => {
                     // TLS rejections and request cancellations close fixture
                     // connections. A panic (e.g. wrong method) still fails.

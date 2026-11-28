@@ -43,6 +43,7 @@ pub fn for_action(action: &Action) -> Context {
         Action::Autotune { .. } => "autotune",
         Action::ConnectionCheck(_) => "connection",
         Action::Webcheck(_) => "web",
+        Action::YoutubeCheck => "youtube",
         Action::Voicecheck(_) => "voice",
         Action::Latency(_) => "latency",
         Action::ProviderCheck(_) => "provider-check",

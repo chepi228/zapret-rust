@@ -102,7 +102,7 @@ pub(crate) fn run(archive: &Path, output: &Path) -> Result<()> {
                 format!("{arch} opens the native launcher"),
             )?;
         }
-        for (screen, last) in [("main", 9), ("settings", 11), ("tools", 12), ("test", 5)] {
+        for (screen, last) in [("main", 9), ("settings", 11), ("tools", 13), ("test", 5)] {
             for width in [55, 80] {
                 let human = text(&run_launcher(
                     &runner,

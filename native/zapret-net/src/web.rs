@@ -25,6 +25,7 @@ use tokio_tungstenite::{
     tungstenite::{Message, protocol::WebSocketConfig},
 };
 use zapret_platform::{OwnedChild, RunOptions, run_owned, terminate_owned};
+mod playback;
 
 #[derive(Debug, Clone, Serialize)]
 struct Row {
@@ -50,6 +51,8 @@ struct Row {
     cleanup_complete: Option<bool>,
     tls_backend: String,
     trust_source: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    playback: Option<playback::Sample>,
 }
 fn row(
     target: &Target,
@@ -74,7 +77,7 @@ fn row(
         "BrowserTcp" => matches!(protocol, "http/1.0" | "http/1.1" | "h2"),
         _ => matches!(protocol, "http/1.0" | "http/1.1" | "h2" | "h3"),
     };
-    let confirmed = (100..=599).contains(&status) && valid;
+    let confirmed = mode != "BrowserPlayback" && (100..=599).contains(&status) && valid;
     let (state, reason) = if failure == "Unavailable" {
         ("UNAVAILABLE", failure)
     } else if matches!(
@@ -113,7 +116,10 @@ fn row(
         sample: 1,
         encoded_bytes: None,
         session_restarted: false,
-        evidence: if mode.starts_with("Browser") {
+        playback: None,
+        evidence: if mode == "BrowserPlayback" {
+            "PresentedVideoFrames"
+        } else if mode.starts_with("Browser") {
             "MainDocument"
         } else {
             "Headers"
@@ -123,6 +129,7 @@ fn row(
             "Http1" => "Rust direct HTTP/1.1 native-tls",
             "Http2" => "Rust direct HTTP/2 native-tls ALPN",
             "Http3" => "HTTP/3 HEAD",
+            "BrowserPlayback" => "Chromium CDP video playback",
             _ => "Chromium CDP actual main-document navigation",
         }
         .into(),
@@ -262,56 +269,51 @@ fn capabilities(root: &Path, args: &Value, http3: bool, extra_ca: bool) -> Resul
 }
 async fn http1(target: &Target, timeout_ms: u64, ca_file: Option<&Path>) -> Result<Row> {
     let url = http::checked_url(&target.url, false)?;
-    let dns = d::resolve(&http::hostname(&url), timeout_ms.min(1500)).await;
-    let Some(address) = d::select_addresses(&dns.addresses).first().copied() else {
-        let mut result = row(
-            target,
-            "Http1",
-            "",
-            0,
-            false,
-            dns.elapsed_ms,
-            if dns.reason == "Timeout" {
-                "Timeout"
-            } else {
-                "RequestFailed"
-            },
+    let connector = crate::tls_connector(ca_file, &["http/1.1"])?;
+    let started = Instant::now();
+    let deadline = started + Duration::from_millis(timeout_ms);
+    let host = http::hostname(&url);
+    let port = url.port_or_known_default().context("HTTP port")?;
+    let mut cancel = d::cancellation();
+    let request = async {
+        let addresses = timeout(
+            Duration::from_millis(timeout_ms.min(1500)),
+            crate::connection::resolve_addresses(&host, port),
+        )
+        .await??;
+        anyhow::ensure!(!addresses.is_empty(), "DNS returned no addresses");
+        let (response, _driver) =
+            http::response_accept(&url, "HEAD", &connector, "*/*", &addresses).await?;
+        anyhow::ensure!(
+            response.status().as_u16() != 101,
+            "Unsupported HTTP upgrade"
         );
-        result.error = dns.error;
-        return Ok(result);
+        let protocol = match response.version() {
+            hyper::Version::HTTP_10 => "http/1.0",
+            hyper::Version::HTTP_11 => "http/1.1",
+            _ => anyhow::bail!("Unexpected HTTP version"),
+        };
+        Ok::<_, anyhow::Error>((protocol, response.status().as_u16()))
     };
-    let remaining = timeout_ms
-        .saturating_sub(dns.elapsed_ms.ceil() as u64)
-        .max(1);
-    let result = crate::connection::one(
-        url,
-        address,
-        1,
-        remaining,
-        crate::tls_connector(ca_file, &["http/1.1"])?,
-        d::cancellation(),
-        ca_file.is_some(),
-    )
-    .await;
-    let failure = if result.headers_complete {
-        ""
-    } else if result.reason == "Timeout" {
-        "Timeout"
-    } else if result.reason == "Cancelled" {
-        "Cancelled"
-    } else {
-        "RequestFailed"
+    let (protocol, status, failure, error) = tokio::select! {
+        biased;
+        _ = cancel.changed() => ("", 0, "Cancelled", String::new()),
+        result = timeout_at(deadline, request) => match result {
+            Ok(Ok((protocol, status))) => (protocol, status, "", String::new()),
+            Ok(Err(error)) if !error.is::<tokio::time::error::Elapsed>() => ("", 0, "RequestFailed", format!("{error:#}")),
+            _ => ("", 0, "Timeout", String::new()),
+        }
     };
     let mut answer = row(
         target,
         "Http1",
-        &format!("http/{}", result.http_version),
-        result.status_code,
-        result.headers_complete,
-        result.elapsed_ms + dns.elapsed_ms,
+        protocol,
+        status,
+        failure.is_empty(),
+        started.elapsed().as_secs_f64() * 1000.,
         failure,
     );
-    answer.error = result.error;
+    answer.error = error;
     Ok(answer)
 }
 async fn http2(target: &Target, timeout_ms: u64, ca_file: Option<&Path>) -> Result<Row> {
@@ -331,21 +333,33 @@ async fn http2(target: &Target, timeout_ms: u64, ca_file: Option<&Path>) -> Resu
             phase = "DNS";
             let addresses = crate::connection::resolve_addresses(&host, port).await?;
             phase = "TCP";
-            let (stream, _) = crate::tcp::connect_tls(
+            let mut attempts = Vec::new();
+            let negotiated = crate::tcp::connect_tls(
                 &addresses,
-                &mut Vec::new(),
+                &mut attempts,
                 &host,
                 &connector,
+                Some(b"h2"),
                 |connected| {
                     phase = if connected.is_some() { "TLS" } else { "TCP" };
                 },
             )
-            .await
-            .map_err(|(_, error)| anyhow::Error::msg(error))?;
-            let protocol = stream.get_ref().negotiated_alpn()?;
-            if protocol.as_deref() != Some(b"h2") {
-                return Ok(false);
-            }
+            .await;
+            let (stream, _) = match negotiated {
+                Ok(winner) => winner,
+                Err(_)
+                    if attempts
+                        .iter()
+                        .any(|a| a.tls_error.as_deref() == Some(crate::tcp::ALPN_MISMATCH))
+                        && attempts
+                            .iter()
+                            .filter_map(|a| a.tls_error.as_deref())
+                            .all(|e| e == crate::tcp::ALPN_MISMATCH) =>
+                {
+                    return Ok(false);
+                }
+                Err((_, error)) => return Err(anyhow::Error::msg(error)),
+            };
             observed = "h2".into();
             phase = "HTTP/2";
             let (mut sender, connection) = http2::Builder::new(TokioExecutor::new())
@@ -566,6 +580,24 @@ async fn http3(
 }
 
 type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
+#[derive(Debug)]
+struct CdpError {
+    method: String,
+    code: i64,
+    message: String,
+}
+
+impl std::fmt::Display for CdpError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "DevTools rejected {} ({}): {}",
+            self.method, self.code, self.message
+        )
+    }
+}
+impl std::error::Error for CdpError {}
+
 struct Cdp {
     socket: Socket,
     sequence: u64,
@@ -589,6 +621,16 @@ impl Cdp {
         }
     }
     async fn command(&mut self, method: &str, params: Value, deadline: Instant) -> Result<Value> {
+        self.rpc(method, params, deadline, true).await
+    }
+
+    async fn rpc(
+        &mut self,
+        method: &str,
+        params: Value,
+        deadline: Instant,
+        keep_events: bool,
+    ) -> Result<Value> {
         self.sequence += 1;
         let mut message = json!({"id":self.sequence,"method":method,"params":params});
         if !self.session.is_empty() {
@@ -607,11 +649,16 @@ impl Cdp {
                 .with_context(|| format!("DevTools {method}"))?;
             if message["id"].as_u64() == Some(self.sequence) {
                 if let Some(error) = message.get("error") {
-                    bail!("DevTools rejected {method}: {error}")
+                    return Err(CdpError {
+                        method: method.into(),
+                        code: error["code"].as_i64().unwrap_or_default(),
+                        message: error["message"].as_str().unwrap_or("unknown error").into(),
+                    }
+                    .into());
                 }
                 return Ok(message["result"].clone());
             }
-            if message.get("method").is_some() {
+            if keep_events && message.get("method").is_some() {
                 if self.events.len() >= 2048 {
                     bail!("DevTools event queue exceeded 2048 entries")
                 }
@@ -756,6 +803,9 @@ async fn browser(
     if mode == "BrowserTcp" {
         args.push("--disable-quic".into())
     }
+    if mode == "BrowserPlayback" {
+        args.push("--mute-audio".into());
+    }
     args.push("about:blank".into());
     let (identity_send, identity_receive) = std::sync::mpsc::channel();
     let worker = thread::spawn(move || {
@@ -890,6 +940,17 @@ async fn browser(
             answer.error = navigation.failure.clone();
             answer.sample = visit;
             answer.encoded_bytes = navigation.encoded;
+            if mode == "BrowserPlayback" {
+                answer.complete = false;
+                if answer.state == "OK" {
+                    let media = playback::measure(connection, &target.url, deadline).await?;
+                    answer.complete = media.confirmed();
+                    answer.state = if answer.complete { "OK" } else { "UNKNOWN" }.into();
+                    answer.reason = media.reason.clone();
+                    answer.elapsed_ms = visit_start.elapsed().as_secs_f64() * 1000.;
+                    answer.playback = Some(media);
+                }
+            }
             rows.push(answer);
         }
         Ok::<(), anyhow::Error>(())
@@ -1000,11 +1061,11 @@ pub(crate) fn run(root: &Path, args: &Value) -> Result<Value> {
             "BrowserTcp".into(),
         ]
     };
-    if modes.len() > 5
+    if modes.len() > 6
         || modes.iter().any(|m| {
             !matches!(
                 m.as_str(),
-                "Http1" | "Http2" | "Http3" | "BrowserAuto" | "BrowserTcp"
+                "Http1" | "Http2" | "Http3" | "BrowserAuto" | "BrowserTcp" | "BrowserPlayback"
             )
         })
     {

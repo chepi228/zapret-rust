@@ -89,6 +89,44 @@ fn invoke_jobs(
     Ok((rows, metrics))
 }
 
+fn stalled_tls_post(
+    binary: &Path,
+    prefix: &[OsString],
+    peers: [std::net::SocketAddr; 2],
+    tls: std::sync::Arc<rustls::ServerConfig>,
+    ca: &str,
+) -> Result<bool> {
+    // The preferred listener completes TCP but never consumes the ClientHello.
+    let [first, mut alternate] = peers;
+    let stalled = TcpListener::bind(first)?;
+    alternate.set_port(stalled.local_addr()?.port());
+    let healthy = http::Fixture::at(alternate, Some(tls))?;
+    let url = format!("https://localhost:{}", alternate.port());
+    let mut post = job("stalled-tls", &url, "/small");
+    post["timeout_ms"] = json!(2500);
+    post["post_bytes"] = json!(128);
+    let (rows, _) = invoke_jobs(binary, prefix, &[post], &["--ca-file", ca])?;
+    let row = &rows["stalled-tls"];
+    let requests = healthy.requests.lock().unwrap();
+    let cancelled = &row["tcp_attempts"][0];
+    Ok(row["body_complete"] == true
+        && row["certificate_validated"] == true
+        && row["remote_address"] == alternate.to_string()
+        && cancelled.get("error") == Some(&Value::Null)
+        && cancelled["tls_error"]
+            .as_str()
+            .is_some_and(|s| s.contains("cancelled"))
+        && requests.len() == 1
+        && requests[0]["method"] == "POST"
+        && requests[0]["post_bytes"] == 128
+        && healthy
+            .names
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|name| name == "localhost"))
+}
+
 pub(crate) fn run(
     root: &Path,
     binary: &Path,
@@ -388,6 +426,12 @@ pub(crate) fn run(
             if let [first, second] = local.as_slice()
                 && first.is_ipv6() != second.is_ipv6()
             {
+                let recovered =
+                    stalled_tls_post(&binary, &prefix, [*first, *second], tls.clone(), ca)?;
+                evidence.check(
+                    recovered,
+                    "stalled TLS falls back and sends the verified POST once",
+                )?;
                 let rejected = http::Fixture::at(*first, Some(http::tls()?.0))?;
                 let mut alt = *second;
                 alt.set_port(rejected.address.port());

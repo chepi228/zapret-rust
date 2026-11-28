@@ -351,6 +351,7 @@ fn tools_frame(view: &MenuView, viewport: Viewport) -> Frame {
         (10, "Браузер, HTTP/2 и HTTP/3"),
         (11, "DNS, TCP, TLS и HTTP"),
         (12, "Discord Voice"),
+        (13, "Воспроизведение YouTube"),
     ] {
         frame.item(key, text, Tone::Text);
     }
@@ -960,6 +961,7 @@ fn tools(app: &App) -> Result<()> {
                 "10" => Action::Webcheck(network_arguments()),
                 "11" => Action::ConnectionCheck(network_arguments()),
                 "12" => return voice_dialog(app),
+                "13" => Action::YoutubeCheck,
                 _ => {
                     return shortcut(app, &choice).unwrap_or_else(|| {
                         Err(anyhow::anyhow!(
@@ -985,8 +987,16 @@ fn network_arguments() -> NetworkArgs {
 fn voice_dialog(app: &App) -> Result<Outcome> {
     let mut frame = dialog("Discord Voice");
     frame.row(
-        "  Подключитесь к голосовому каналу Discord и поговорите во время наблюдения.",
+        "  Войдите в голосовой канал Discord вместе с собеседником.",
         Tone::Accent,
+    );
+    frame.row(
+        "  Во время проверки скажите фразу и попросите собеседника повторить её.",
+        Tone::Text,
+    );
+    frame.row(
+        "  Затем повторите его фразу и уточните, услышал ли он ответ.",
+        Tone::Text,
     );
     frame.show()?;
     let Some(start) = input("Enter — начать, 0 — назад")? else {
@@ -999,7 +1009,7 @@ fn voice_dialog(app: &App) -> Result<Outcome> {
         start.is_empty(),
         "Нажмите Enter для начала или 0 для возврата."
     );
-    let mut result = app.execute(Action::Voicecheck(network_arguments()))?;
+    let mut result = zapret_net::diagnostics(&app.root, "voice", &json!({"timeout_ms": 5000}))?;
     let mut frame = dialog("Как работал звук");
     for (index, text) in [
         "Слышны оба участника",
@@ -1025,7 +1035,11 @@ fn voice_dialog(app: &App) -> Result<Outcome> {
         _ => "Unknown",
     };
     result["audio_observation"] = json!(audio);
-    result["audio_reported_utc_ms"] = json!(chrono::Utc::now().timestamp_millis().to_string());
+    result["audio_reported_utc_ms"] = if audio == "Unknown" {
+        Value::Null
+    } else {
+        json!(chrono::Utc::now().timestamp_millis().to_string())
+    };
     result["assessment"] = zapret_net::assess_voice(
         &result["capture"],
         &result["control"],
@@ -1189,7 +1203,7 @@ mod tests {
         let settings = settings_frame(&view, viewport, "выкл", "локальные копии").plain();
         assert!(settings.contains("локальные копии"));
         let tools = tools_frame(&view, viewport).plain();
-        for (text, count) in [(&settings, 11), (&tools, 12)] {
+        for (text, count) in [(&settings, 11), (&tools, 13)] {
             for key in 0..=count {
                 assert!(text.contains(&format!(" {key:>2}  ")));
             }
@@ -1222,6 +1236,7 @@ mod tests {
             "telegram",
             "latency",
             "webcheck",
+            "youtube-check",
             "connection-check",
             "voicecheck",
             "service",

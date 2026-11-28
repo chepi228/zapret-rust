@@ -29,7 +29,7 @@ fn pin(target: &Target, peer: SocketAddr) -> Target {
     }
 }
 
-pub(super) fn multiple_tls_peers(raw: &Value) -> bool {
+fn multiple_tls_peers(raw: &Value) -> bool {
     raw["tcp_attempts"].as_array().is_some_and(|attempts| {
         attempts
             .iter()
@@ -37,6 +37,20 @@ pub(super) fn multiple_tls_peers(raw: &Value) -> bool {
             .nth(1)
             .is_some()
     })
+}
+
+pub(super) fn tls_peer_retry(raw: &Value) -> bool {
+    if !multiple_tls_peers(raw) {
+        return false;
+    }
+    // A speculative handshake on another address does not delay a successful
+    // preferred peer. Older sequential retries have an error on their first attempt.
+    let first = &raw["tcp_attempts"][0];
+    !(raw["certificate_validated"] == true
+        && first["address"].is_string()
+        && first["address"] == raw["remote_address"]
+        && first.get("error") == Some(&Value::Null)
+        && first["tls_error"].is_null())
 }
 
 pub(super) fn for_round(targets: &[Target], baseline: &[Row]) -> Vec<Target> {

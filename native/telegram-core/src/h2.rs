@@ -60,8 +60,7 @@ impl Drop for Lane {
 }
 impl Lane {
     pub(crate) async fn connect(host: String, buffer: usize) -> Result<Arc<Self>> {
-        let tcp = transport::open_tcp(&host, 443, buffer).await?;
-        let io = transport::tls(tcp, &host, true).await?;
+        let io = transport::open_tls(&host, 443, buffer, &host, true).await?;
         let lane = Self::from_io(host, io).await?;
         lane.preflight().await?;
         Ok(lane)

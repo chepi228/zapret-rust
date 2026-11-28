@@ -97,22 +97,22 @@ const VALVE_NETWORKS: [&str; 32] = [
     "2a01:bc80:c::/48",
 ];
 
-const DISCORD_MEDIA_URL: &str = "https://media.discordapp.net/stickers/781291442961383434.png";
-const DISCORD_MEDIA_BYTES: usize = 229034;
-const DISCORD_MEDIA_SHA256: &str =
-    "8dbecf7b6d7da8a9c761ad89a73066838d89f3cda4a1313976c9533ac88a3fb3";
-const SERVICE_PROBES: [(&str, &str); 8] = [
+const SERVICE_PROBES: [(&str, &str); 9] = [
     ("YouTube", "https://www.youtube.com/generate_204"),
     (
         "видео YouTube",
         "https://redirector.googlevideo.com/report_mapping",
     ),
     ("Discord", "https://discord.com/api/v9/gateway"),
-    (zapret_platform::DISCORD_MEDIA_GROUP, DISCORD_MEDIA_URL),
+    (
+        zapret_platform::DISCORD_MEDIA_GROUP,
+        zapret_core::DISCORD_MEDIA_FILE.url,
+    ),
     ("Steam", "https://store.steampowered.com/"),
     ("GitHub", "https://github.com/"),
-    ("NBA 2K27: вход (Epic)", "https://api.epicgames.dev/"),
+    ("NBA 2K27 — сервис входа Epic", zapret_net::EPIC_JWKS_URL),
     ("NBA 2K27: запись матча", "https://api.quago.io/"),
+    ("NBA 2K27 — файл магазина", zapret_core::NBA_STORE_IMAGE.url),
 ];
 
 const HOSTS_PROBES: [(&str, &str, &str); 4] = [
@@ -231,10 +231,21 @@ pub fn pc_check(app: &App) -> Result<Value> {
                             })
                     })
         });
-    let (provider, services, dns, ipv6, pins) = thread::scope(|scope| {
+    let (provider, services, dns, ipv6, pins, nba_windows) = thread::scope(|scope| {
         let provider = scope
             .spawn(|| zapret_net::diagnostics(&app.root, "provider", &json!({"timeout_ms":5000})));
         let services = scope.spawn(service_observations);
+        let proxy = &network["proxy"];
+        let nba_windows = (proxy["auto_detect"] == true
+            || ["proxy", "pac"]
+                .iter()
+                .any(|key| proxy[key].as_str().is_some_and(|s| !s.is_empty())))
+        .then(|| {
+            (
+                scope.spawn(nba_store_via_windows),
+                scope.spawn(epic_keys_via_windows),
+            )
+        });
         let dns = scope.spawn(|| {
             if vpn {
                 Ok(json!({"status":"Skipped","reason":"TunnelActive"}))
@@ -257,13 +268,18 @@ pub fn pc_check(app: &App) -> Result<Value> {
             joined_observation(dns.join()),
             joined_observation(ipv6.join()),
             joined_observation(pins.join()),
+            nba_windows.map(|(store, epic)| {
+                json!({
+                    "store":joined_observation(store.join()),"epic":joined_observation(epic.join())
+                })
+            }),
         )
     });
     crate::interrupt::check()?;
     let mut result = json!({"integrity":observation_result(integrity(&app.root)),"bypass":observation_result(app.platform("status",json!({}))),
         "conflicts":conflicts,"network":network,"hosts":observation_result(app.platform("hosts-status",json!({}))),
         "priority":observation_result(app.platform("priority",json!({}))),"ipv4_preference":observation_result(app.platform("prefer-ipv4",json!({}))),
-        "provider":provider,"services":services,"dns":dns,"ipv6":ipv6,"hosts_pins":pins,
+        "provider":provider,"services":services,"nba_windows":nba_windows,"dns":dns,"ipv6":ipv6,"hosts_pins":pins,
         "proxy_apps":observation_result(proxy_app_observations(app)),
         "boosters":observation_result(booster_observations(app)),
         "certificates":observation_result(app.platform("certificates",json!({}))),
@@ -295,24 +311,29 @@ fn joined_observation(result: thread::Result<Result<Value>>) -> Value {
 }
 
 fn service_job(id: String, url: String, connect_ip: Option<IpAddr>) -> zapret_net::Job {
-    let media = url == DISCORD_MEDIA_URL;
+    let (mode, limit) = if url == zapret_net::EPIC_JWKS_URL {
+        (zapret_net::ProbeMode::Jwks, zapret_net::JWKS_MAX_BYTES + 1)
+    } else if let Some(file) = zapret_core::ReferenceDownload::for_url(&url) {
+        (zapret_net::ProbeMode::FullGet, file.bytes + 1)
+    } else {
+        (zapret_net::ProbeMode::Range, 65536)
+    };
     zapret_net::Job {
         version: 1,
         id,
         url,
         timeout_ms: 6000,
-        body_limit: if media {
-            DISCORD_MEDIA_BYTES + 1
-        } else {
-            65536
-        },
+        body_limit: limit,
         post_bytes: 0,
-        method: Some(if media { "GET" } else { "HEAD" }.into()),
-        mode: if media {
-            zapret_net::ProbeMode::FullGet
-        } else {
-            zapret_net::ProbeMode::Range
-        },
+        method: Some(
+            if mode == zapret_net::ProbeMode::Range {
+                "HEAD"
+            } else {
+                "GET"
+            }
+            .into(),
+        ),
+        mode,
         connect_ip,
     }
 }
@@ -324,10 +345,46 @@ fn probe_reached(row: &zapret_net::Observation) -> bool {
             .status_code
             .is_some_and(|code| (200..=599).contains(&code))
         && row.termination == zapret_net::Termination::Complete
-        && (row.url != DISCORD_MEDIA_URL
-            || (row.status_code == Some(200)
-                && row.body_bytes == DISCORD_MEDIA_BYTES
-                && row.body_sha256.as_deref() == Some(DISCORD_MEDIA_SHA256)))
+        && (row.url != zapret_net::EPIC_JWKS_URL
+            || (row.mode == zapret_net::ProbeMode::Jwks
+                && row.status_code == Some(200)
+                && !row.target_reached))
+        && zapret_core::ReferenceDownload::for_url(&row.url).is_none_or(|file| {
+            row.mode == zapret_net::ProbeMode::FullGet
+                && !row.target_reached
+                && file.matches(
+                    row.status_code.map(u64::from),
+                    Some(row.body_bytes as u64),
+                    row.body_sha256.as_deref(),
+                )
+        })
+}
+
+fn nba_store_via_windows() -> Result<Value> {
+    let file = &zapret_core::NBA_STORE_IMAGE;
+    let started = Instant::now();
+    let body = zapret_net::fetch_via_windows(file.url, file.bytes + 1, 6000, "*/*")?;
+    let digest = sha256(&body).to_ascii_lowercase();
+    // The Windows downloader requires HTTP 200 and reads through EOF.
+    Ok(
+        json!({"url":file.url,"ok":file.matches(Some(200),Some(body.len() as u64),Some(&digest)),
+        "body_bytes":body.len(),"body_sha256":digest,"total_ms":started.elapsed().as_millis() as u64}),
+    )
+}
+
+fn epic_keys_via_windows() -> Result<Value> {
+    let started = Instant::now();
+    let body = zapret_net::fetch_via_windows(
+        zapret_net::EPIC_JWKS_URL,
+        zapret_net::JWKS_MAX_BYTES,
+        6000,
+        "application/json",
+    )?;
+    zapret_net::validate_jwks(&body)?;
+    Ok(
+        json!({"ok":true,"url":zapret_net::EPIC_JWKS_URL,"body_bytes":body.len(),
+        "total_ms":started.elapsed().as_millis() as u64}),
+    )
 }
 
 fn service_observations() -> Result<Value> {
@@ -353,7 +410,7 @@ fn service_observations() -> Result<Value> {
         output.push(json!({"name":name,"url":url,"ok":probe_reached(row),"observation":row}));
     }
     Ok(
-        json!({"rows":output,"evidence":"Validated TLS and HTTP responses, including a complete Discord media file with SHA-256"}),
+        json!({"rows":output,"evidence":"Validated TLS and HTTP responses, with full downloads and SHA-256 for Discord media and the NBA 2K27 store image"}),
     )
 }
 
@@ -572,10 +629,25 @@ fn pc_check_text(result: &Value) -> String {
     lines.push("HTTPS сейчас:".into());
     if let Some(rows) = result["services"]["rows"].as_array() {
         for row in rows {
+            let file = row["url"]
+                .as_str()
+                .and_then(zapret_core::ReferenceDownload::for_url);
             lines.push(format!(
                 "  {}: {}",
                 row["name"].as_str().unwrap_or("?"),
-                if row["ok"] == true {
+                if file.is_some() {
+                    if row["ok"] == true {
+                        "файл скачан напрямую, SHA-256 совпал"
+                    } else {
+                        "загрузка файла напрямую не подтверждена"
+                    }
+                } else if row["url"] == zapret_net::EPIC_JWKS_URL {
+                    if row["ok"] == true {
+                        "публичные ключи получены напрямую"
+                    } else {
+                        "публичные ключи напрямую получить не удалось"
+                    }
+                } else if row["ok"] == true {
                     "HTTP-ответ получен"
                 } else {
                     "доступность не подтверждена"
@@ -584,6 +656,31 @@ fn pc_check_text(result: &Value) -> String {
         }
     } else {
         lines.push("  Проверка недоступна".into());
+    }
+    if result["nba_windows"].is_object() {
+        for (key, name, success, failure) in [
+            (
+                "epic",
+                "сервис входа Epic",
+                "публичные ключи получены",
+                "не удалось получить публичные ключи",
+            ),
+            (
+                "store",
+                "файл магазина",
+                "файл скачан, SHA-256 совпал",
+                "загрузка файла не подтверждена",
+            ),
+        ] {
+            let state = if result["nba_windows"][key]["ok"] == true {
+                success
+            } else {
+                failure
+            };
+            lines.push(format!(
+                "  NBA 2K27 — {name} через настройки Windows: {state}"
+            ));
+        }
     }
     lines.push(format!(
         "DNS: {}",
@@ -982,8 +1079,14 @@ fn capture_text(capture: &Value, voice: bool) -> String {
         }
     )];
     for flow in capture["flows"].as_array().into_iter().flatten() {
+        let transfer = match (flow["bytes_in"].as_u64(), flow["bytes_out"].as_u64()) {
+            (Some(incoming), Some(outgoing)) => {
+                format!(" · получено {incoming} Б, отправлено {outgoing} Б")
+            }
+            _ => String::new(),
+        };
         lines.push(format!(
-            "  {} {}:{} · {} · пакеты {}/{} · по настройкам: {} ({})",
+            "  {} {}:{} · {} · пакеты {}/{}{transfer} · по настройкам: {} ({})",
             flow["protocol"]
                 .as_str()
                 .unwrap_or("?")
@@ -1626,6 +1729,7 @@ pub fn report(app: &App, output: Option<&Path>) -> Result<Value> {
         "network-watch-native-events.log",
         "connection-check-last.json",
         "web-check-last.json",
+        "youtube-check-last.json",
         "voice-check-last.json",
         "provider-check-last.json",
         "latency-check-last.json",
@@ -2604,6 +2708,47 @@ mod tests {
     use std::cell::{Cell, RefCell};
 
     #[test]
+    fn diagnostic_downloads_match_the_strategy_targets_and_keep_routes_independent() {
+        for file in [
+            &zapret_core::NBA_STORE_IMAGE,
+            &zapret_core::DISCORD_MEDIA_FILE,
+        ] {
+            let targets = include_str!("../../../tools/targets.txt");
+            let entry = targets
+                .lines()
+                .find(|line| line.ends_with(file.url))
+                .unwrap();
+            let fields: Vec<_> = entry.split_whitespace().collect();
+            assert_eq!(
+                &fields[1..],
+                &[
+                    "GET",
+                    "200",
+                    &file.bytes.to_string(),
+                    file.sha256,
+                    "=",
+                    file.url
+                ]
+            );
+            assert!(SERVICE_PROBES.iter().any(|(_, url)| *url == file.url));
+            let job = service_job("file".into(), file.url.into(), None);
+            assert_eq!(job.method.as_deref(), Some("GET"));
+            assert_eq!(job.mode, zapret_net::ProbeMode::FullGet);
+            assert_eq!(job.body_limit, file.bytes + 1);
+        }
+        let report = json!({"services":{"rows":[{"name":"NBA 2K27","url":zapret_core::NBA_STORE_IMAGE.url,"ok":false}]},
+            "nba_windows":{"store":{"ok":true},"epic":{"ok":false}}});
+        let text = pc_check_text(&report);
+        assert!(text.contains("напрямую не подтверждена"));
+        assert!(text.contains("через настройки Windows: файл скачан, SHA-256 совпал"));
+        assert!(text.contains("через настройки Windows: не удалось получить публичные ключи"));
+        let job = service_job("epic".into(), zapret_net::EPIC_JWKS_URL.into(), None);
+        assert_eq!(job.method.as_deref(), Some("GET"));
+        assert_eq!(job.mode, zapret_net::ProbeMode::Jwks);
+        assert_eq!(job.body_limit, zapret_net::JWKS_MAX_BYTES + 1);
+    }
+
+    #[test]
     fn scanner_never_applies_partial_or_changed_observations() {
         let complete = json!({"status":"Captured","configuration_stable":true,"cleanup_confirmed":true,"truncated":false,"events_lost":0,"decode_errors":0});
         assert!(scan_is_eligible(&complete));
@@ -2642,11 +2787,14 @@ mod tests {
         let rendered = capture_text(
             &json!({"status":"Partial","truncated":true,"configuration_stable":true,
             "flows":[{"protocol":"tcp","address":"8.8.8.8","port":443,"process_name":"fixture",
-                "out":1,"in":2,"configured_bypass":false,"bypass_reason":"Lists"}]}),
+                "out":1,"in":2,"bytes_in":91100,"bytes_out":270,"configured_bypass":false,"bypass_reason":"Lists"}]}),
             false,
         );
         assert!(rendered.contains("частичная запись"));
         assert!(rendered.contains("адрес не включён в списки"));
+        assert!(rendered.contains("получено 91100 Б, отправлено 270 Б"));
+        let older = capture_text(&json!({"flows":[{"out":1,"in":2}]}), false);
+        assert!(older.contains("пакеты 1/2") && !older.contains("получено"));
         assert!(!rendered.contains("Partial") && !rendered.contains("(Lists)"));
     }
 
