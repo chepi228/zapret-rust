@@ -55,7 +55,11 @@ class HttpHandler(http.server.BaseHTTPRequestHandler):
         elif self.path == "/reload-video":
             body = b'<!doctype html><script>setTimeout(() => location.replace("/playback"), 400)</script>'
         elif self.path == "/playback":
-            body = b'<!doctype html><video muted autoplay playsinline src="/playback.webm"></video>'
+            body = b'<!doctype html><video playsinline src="/playback.webm"></video>'
+        elif self.path == "/short-playback":
+            body = b'<!doctype html><video playsinline src="/playback.webm#t=0,1"></video>'
+        elif self.path == "/broken-playback":
+            body = b'<!doctype html><video src="/small"></video>'
         elif self.path == "/playback.webm":
             # Eight seconds of synthetic VP8 video. No external media or codec tools are needed.
             body = Path(__file__).with_name("playback.webm").read_bytes()
@@ -266,6 +270,13 @@ def main():
                 check(row["state"] == "UNKNOWN" and row["reason"] == "NoVideo" and not row["complete"]
                       and row["playback"]["presented_frames"] == 0 and row["cleanup_complete"],
                       "a completed page without video never passes the playback check")
+                row = invoke(args.binary, "webcheck", {**playback, "url": base + "/short-playback", "timeout_ms": 4200})["rows"][0]
+                check(row["reason"] == "PlaybackUnconfirmed" and not row["complete"] and row["cleanup_complete"]
+                      and 0 < row["playback"]["played_ms"] < 2500 and row["playback"]["presented_frames"] > 0,
+                      "starting a one-second media fragment does not confirm five seconds of playback")
+                row = invoke(args.binary, "webcheck", {**playback, "url": base + "/broken-playback", "timeout_ms": 6000})["rows"][0]
+                check(row["reason"] == "MediaError" and not row["complete"] and row["cleanup_complete"],
+                      "a video element with an invalid media file reports the browser's decode or source error")
                 row = invoke(args.binary, "webcheck", {**playback, "url": base + "/http-error"})["rows"][0]
                 check(row["state"] == "HTTP_ERROR" and row["status_code"] == 403 and not row["complete"],
                       "a fully downloaded HTTP error never completes a playback observation")

@@ -962,7 +962,9 @@ async fn browser(
             if mode == "BrowserPlayback" {
                 answer.complete = false;
                 if answer.state == "OK" {
-                    let media = playback::measure(connection, &target.url, deadline).await?;
+                    let media =
+                        playback::measure(connection, &target.url, &navigation.frame, deadline)
+                            .await?;
                     answer.complete = media.confirmed();
                     answer.state = if answer.complete { "OK" } else { "UNKNOWN" }.into();
                     answer.reason = media.reason.clone();
