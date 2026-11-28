@@ -814,6 +814,8 @@ fn capture(root: &Path, args: &Value, voice: bool) -> Result<Value> {
         "Trace session cleanup is unconfirmed: {cleanup}"
     );
     stop_owner.0.take();
+    // Only extend the ownership window through the trace tail for identities still observed.
+    identities_incomplete |= observe(&mut identities, pattern, voice, selected).unwrap_or(true);
     let (events, info) = replay(&path)?;
     let (flows, flow_limit, timing_context) = flows(&events, &identities, &local, voice);
     let lost =

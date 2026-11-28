@@ -770,6 +770,25 @@ async fn endpoint(
         tokio::time::sleep(Duration::from_millis(40)).await;
     }
 }
+async fn close_browser_profile(mut profile: tempfile::TempDir) -> bool {
+    // Windows can briefly keep a profile file open after the browser job exits.
+    for delay_ms in [25, 50, 100, 200, 400] {
+        match std::fs::remove_dir_all(profile.path()) {
+            Ok(()) => {
+                profile.disable_cleanup(true);
+                return true;
+            }
+            Err(error)
+                if cfg!(windows) && matches!(error.raw_os_error(), Some(5 | 32 | 33 | 145)) =>
+            {
+                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+            }
+            Err(_) => break,
+        }
+    }
+    profile.close().is_ok()
+}
+
 async fn browser(
     target: &Target,
     mode: &str,
@@ -1017,7 +1036,7 @@ async fn browser(
             }
         }
     }
-    let cleaned = profile.close().is_ok();
+    let cleaned = close_browser_profile(profile).await;
     for row in &mut rows {
         row.cleanup_complete = Some(cleaned);
     }
@@ -1035,6 +1054,35 @@ async fn browser(
     }
     Ok(rows)
 }
+
+#[cfg(all(test, windows))]
+#[tokio::test]
+async fn browser_profile_cleanup_waits_for_a_locked_file() {
+    use std::{fs::OpenOptions, os::windows::fs::OpenOptionsExt};
+    let parent = tempfile::tempdir().unwrap();
+    let profile = tempfile::tempdir_in(parent.path()).unwrap();
+    let profile_path = profile.path().to_owned();
+    let sibling = parent.path().join("unrelated");
+    std::fs::write(&sibling, b"keep").unwrap();
+    let locked = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .share_mode(0)
+        .open(profile_path.join("cache"))
+        .unwrap();
+    let cleanup = close_browser_profile(profile);
+    tokio::pin!(cleanup);
+    assert!(
+        timeout(Duration::from_millis(15), &mut cleanup)
+            .await
+            .is_err()
+    );
+    drop(locked);
+    assert!(cleanup.await);
+    assert!(!profile_path.exists());
+    assert_eq!(std::fs::read(sibling).unwrap(), b"keep");
+}
+
 pub(crate) fn run(root: &Path, args: &Value) -> Result<Value> {
     if args["capabilities_only"] == true {
         return Ok(serde_json::to_value(capabilities(
